@@ -548,7 +548,10 @@ compressed_rel_setup_reltarget(RelOptInfo *compressed_rel, CompressionInfo *info
 
 			Assert(column_info != NULL);
 
-			compressed_reltarget_add_var_for_column(compressed_rel, compressed_relid, column_name, &attrs_used);
+			compressed_reltarget_add_var_for_column(compressed_rel,
+													compressed_relid,
+													column_name,
+													&attrs_used);
 
 			/* if the column is an orderby, add it's metadata columns too */
 			if (column_info->orderby_column_index > 0)
@@ -591,8 +594,9 @@ compressed_rel_setup_reltarget(RelOptInfo *compressed_rel, CompressionInfo *info
 	{
 		for (int i = 1; i <= info->chunk_rel->max_attr; i++)
 		{
-			char *column_name = get_attname(info->chunk_rte->relid, i,
-				/* missing_ok = */ false);
+			char *column_name = get_attname(info->chunk_rte->relid,
+											i,
+											/* missing_ok = */ false);
 			AttrNumber chunk_attno = get_attnum(info->chunk_rte->relid, column_name);
 			if (chunk_attno == InvalidAttrNumber)
 			{
@@ -600,12 +604,13 @@ compressed_rel_setup_reltarget(RelOptInfo *compressed_rel, CompressionInfo *info
 				continue;
 			}
 
-			AttrNumber compressed_attno = get_attnum(info->compressed_rte->relid,
-				column_name);
+			AttrNumber compressed_attno = get_attnum(info->compressed_rte->relid, column_name);
 			if (compressed_attno == InvalidAttrNumber)
 			{
-				elog(ERROR, "column '%s' not found in the compressed chunk '%s'",
-					column_name, get_rel_name(info->compressed_rte->relid));
+				elog(ERROR,
+					 "column '%s' not found in the compressed chunk '%s'",
+					 column_name,
+					 get_rel_name(info->compressed_rte->relid));
 			}
 
 			if (bms_is_member(compressed_attno, attrs_used))
@@ -613,8 +618,10 @@ compressed_rel_setup_reltarget(RelOptInfo *compressed_rel, CompressionInfo *info
 				continue;
 			}
 
-			compressed_reltarget_add_var_for_column(compressed_rel, compressed_relid,
-				column_name, &attrs_used);
+			compressed_reltarget_add_var_for_column(compressed_rel,
+													compressed_relid,
+													column_name,
+													&attrs_used);
 		}
 	}
 }
