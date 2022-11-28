@@ -35,6 +35,10 @@ select count(*) from show_chunks('metric_dist');
 -- dictionary
 create table metric_name(id int primary key, name text);
 insert into metric_name values (1, 'cpu1'), (3, 'cpu3'),  (7, 'cpu7');
+insert into metric_name select x, 'other' || x
+    from generate_series(1000, 10000) x
+;
+create unique index on metric_name(name);
 analyze metric_name;
 
 -- for predictable plans
@@ -46,7 +50,7 @@ set enable_hashagg to off;
 select id, max(value), count(*)
 from metric_dist
 where id in (select id from metric_name where name like 'cpu%')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 order by id
 ;
@@ -55,17 +59,41 @@ explain (costs off, verbose)
 select id, max(value), count(*)
 from metric_dist
 where id in (select id from metric_name where name like 'cpu%')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 order by id
 ;
+
+
+-- Check that the GUC to disable these plans works. Our cost model is very
+-- heuristic and may be often wrong, so there needs to be a way to disable them.
+set timescaledb.enable_parameterized_data_node_scan to false;
+
+select id, max(value), count(*)
+from metric_dist
+where id in (select id from metric_name where name like 'cpu%')
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
+group by id
+order by id
+;
+
+explain (costs off, verbose)
+select id, max(value), count(*)
+from metric_dist
+where id in (select id from metric_name where name like 'cpu%')
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
+group by id
+order by id
+;
+
+reset timescaledb.enable_parameterized_data_node_scan;
 
 
 -- Shippable EC join
 select name, max(value), count(*)
 from metric_dist join metric_name using (id)
 where name like 'cpu%'
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -74,17 +102,37 @@ explain (costs off, verbose)
 select name, max(value), count(*)
 from metric_dist join metric_name using (id)
 where name like 'cpu%'
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
 
+-- Shipping still might make sense if the local table is outer.
+explain (costs off, verbose)
+select name, max(value), count(*)
+from metric_dist right join metric_name using (id)
+where name like 'cpu%'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
+group by name
+order by name
+;
+
+-- Shipping doesn't make sense if the distributed table is outer.
+explain (costs off, verbose)
+select name, max(value), count(*)
+from metric_dist
+left join (select * from metric_name where name like 'cpu%') t using (id)
+where ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
+group by name
+order by name
+;
 
 -- Non-shippable EC join
 explain (costs off, verbose)
 select name, max(value), count(*)
 from metric_dist join metric_name on name = concat('cpu', metric_dist.id)
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+where metric_name.name like 'cpu%'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -97,7 +145,8 @@ order by name
 select name, max(value), count(*)
 from metric_dist join metric_name
     on texteq('cpu' || textin(int4out(metric_dist.id)), name)
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+where metric_name.name like 'cpu%'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -106,7 +155,8 @@ explain (costs off, verbose)
 select name, max(value), count(*)
 from metric_dist join metric_name
     on texteq('cpu' || textin(int4out(metric_dist.id)), name)
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+where metric_name.name like 'cpu%'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -117,7 +167,8 @@ explain (costs off, verbose)
 select name, max(value), count(*)
 from metric_dist join metric_name
     on texteq(concat('cpu', textin(int4out(metric_dist.id))), name)
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+where metric_name.name like 'cpu%'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -128,7 +179,7 @@ select distinct on (id)
     id, ts, value
 from metric_dist
 where id in (select id from metric_name where name like 'cpu%')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 order by id, ts, value
 limit 1
 ;
@@ -138,7 +189,7 @@ select distinct on (id)
     id, ts, value
 from metric_dist
 where id in (select id from metric_name where name like 'cpu%')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 order by id, ts, value
 limit 1
 ;
@@ -149,7 +200,7 @@ select distinct on (name)
     name, ts, value
 from metric_dist join metric_name using (id)
 where name like 'cpu%'
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 order by name, ts, value
 limit 1
 ;
@@ -159,26 +210,21 @@ select distinct on (name)
     name, ts, value
 from metric_dist join metric_name using (id)
 where name like 'cpu%'
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 order by name, ts, value
 limit 1
 ;
 
 
--- If the local table is very big, the parameterized nested loop might download
--- the entire dist table or even more than that (in case of not equi-join).
+-- If there are a lot of rows chosen from the local table, the parameterized
+-- nested loop might download the entire dist table or even more than that (in
+-- case of not equi-join or duplicate join keys).
 -- Check that the parameterized plan is not chosen in this case.
-create table metric_name_big as select * from metric_name;
-insert into metric_name_big select x, 'other' || x
-    from generate_series(1000, 10000) x
-;
-analyze metric_name_big;
-
 explain (costs off, verbose)
 select name, max(value), count(*)
 from metric_dist
-join metric_name_big using (id)
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+join metric_name using (id)
+where ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by name
 order by name
 ;
@@ -192,7 +238,7 @@ explain (costs off, verbose)
 select id, max(value)
 from metric_dist
 where id = any((select array_agg(id) from metric_name where name like 'cpu%')::int[])
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 order by id
 ;
@@ -206,7 +252,7 @@ analyze metric_location;
 select id, max(value)
 from metric_dist natural join metric_location natural join metric_name
 where name like 'cpu%' and texteq(location, 'Yerevan')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 ;
 
@@ -214,7 +260,7 @@ explain (costs off, verbose)
 select id, max(value)
 from metric_dist natural join metric_location natural join metric_name
 where name like 'cpu%' and texteq(location, 'Yerevan')
-    and ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+    and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 ;
 
@@ -222,7 +268,7 @@ group by id
 -- stats.
 create table max_value_times as
 select distinct on (id) id, ts from metric_dist
-where ts between '2022-02-02 02:02:02+03' and '2022-02-03 02:02:02+03'
+where ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 order by id, value desc
 ;
 analyze max_value_times;
