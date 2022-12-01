@@ -33,18 +33,20 @@ analyze metric_dist;
 select count(*) from show_chunks('metric_dist');
 
 -- dictionary
-create table metric_name(id int primary key, name text);
+create table metric_name(id int primary key, name text unique);
 insert into metric_name values (1, 'cpu1'), (3, 'cpu3'),  (7, 'cpu7');
 insert into metric_name select x, 'other' || x
     from generate_series(1000, 10000) x
 ;
-create unique index on metric_name(name);
 analyze metric_name;
 
 -- for predictable plans
-set enable_hashjoin to off;
-set enable_mergejoin to off;
 set enable_hashagg to off;
+set enable_hashjoin to off;
+set enable_material to off;
+set enable_memoize to off;
+set enable_mergejoin to off;
+set enable_seqscan to off;
 
 -- Subquery + IN
 select id, max(value), count(*)
