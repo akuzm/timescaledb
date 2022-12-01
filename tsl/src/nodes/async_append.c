@@ -389,7 +389,7 @@ path_process(PlannerInfo *root, Path **path)
 			path_process(root, &castNode(SortPath, subp)->subpath);
 			return;
 		case T_IncrementalSortPath:
-			path_process(root, &castNode(IncrementalSortPath, subp)->spath);
+			path_process(root, &castNode(IncrementalSortPath, subp)->spath.subpath);
 			return;
 		case T_UpperUniquePath:
 			path_process(root, &castNode(UpperUniquePath, subp)->subpath);
