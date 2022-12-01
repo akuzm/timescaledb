@@ -314,33 +314,31 @@ SET timescaledb.remote_data_fetcher = 'cursor';
   GROUP BY :GROUPING, timec
   HAVING avg(temperature) > 20
   ORDER BY :GROUPING, timec;
-                                                                                                          QUERY PLAN                                                                                                          
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Sort
+                                                                                                                                  QUERY PLAN                                                                                                                                   
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (AsyncAppend)
    Output: location, timec
-   Sort Key: location, timec
-   ->  Custom Scan (AsyncAppend)
-         Output: location, timec
-         ->  Append
-               ->  Custom Scan (DataNodeScan)
-                     Output: conditions.location, conditions.timec
-                     Relations: Aggregate on (public.conditions)
-                     Data node: db_dist_partial_agg_1
-                     Chunks: _dist_hyper_1_1_chunk, _dist_hyper_1_2_chunk, _dist_hyper_1_3_chunk, _dist_hyper_1_4_chunk
-                     Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision))
-               ->  Custom Scan (DataNodeScan)
-                     Output: conditions_1.location, conditions_1.timec
-                     Relations: Aggregate on (public.conditions)
-                     Data node: db_dist_partial_agg_2
-                     Chunks: _dist_hyper_1_9_chunk, _dist_hyper_1_10_chunk, _dist_hyper_1_11_chunk, _dist_hyper_1_12_chunk
-                     Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision))
-               ->  Custom Scan (DataNodeScan)
-                     Output: conditions_2.location, conditions_2.timec
-                     Relations: Aggregate on (public.conditions)
-                     Data node: db_dist_partial_agg_3
-                     Chunks: _dist_hyper_1_5_chunk, _dist_hyper_1_6_chunk, _dist_hyper_1_7_chunk, _dist_hyper_1_8_chunk
-                     Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision))
-(24 rows)
+   ->  Merge Append
+         Sort Key: conditions.location, conditions.timec
+         ->  Custom Scan (DataNodeScan)
+               Output: conditions.location, conditions.timec
+               Relations: Aggregate on (public.conditions)
+               Data node: db_dist_partial_agg_1
+               Chunks: _dist_hyper_1_1_chunk, _dist_hyper_1_2_chunk, _dist_hyper_1_3_chunk, _dist_hyper_1_4_chunk
+               Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision)) ORDER BY location ASC NULLS LAST, timec ASC NULLS LAST
+         ->  Custom Scan (DataNodeScan)
+               Output: conditions_1.location, conditions_1.timec
+               Relations: Aggregate on (public.conditions)
+               Data node: db_dist_partial_agg_2
+               Chunks: _dist_hyper_1_9_chunk, _dist_hyper_1_10_chunk, _dist_hyper_1_11_chunk, _dist_hyper_1_12_chunk
+               Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision)) ORDER BY location ASC NULLS LAST, timec ASC NULLS LAST
+         ->  Custom Scan (DataNodeScan)
+               Output: conditions_2.location, conditions_2.timec
+               Relations: Aggregate on (public.conditions)
+               Data node: db_dist_partial_agg_3
+               Chunks: _dist_hyper_1_5_chunk, _dist_hyper_1_6_chunk, _dist_hyper_1_7_chunk, _dist_hyper_1_8_chunk
+               Remote SQL: SELECT location, timec FROM public.conditions WHERE _timescaledb_internal.chunks_in(public.conditions.*, ARRAY[1, 2, 3, 4]) GROUP BY 1, 2 HAVING ((avg(temperature) > 20::double precision)) ORDER BY location ASC NULLS LAST, timec ASC NULLS LAST
+(22 rows)
 
 \set GROUPING 'region, temperature'
 \ir 'include/aggregate_queries.sql'
