@@ -301,7 +301,7 @@ CREATE OR REPLACE FUNCTION test.make_tablespace_path(prefix TEXT, test_name TEXT
 $BODY$
 DECLARE
     dirPath TEXT := format('%s%s', prefix, test_name);
-    createDir TEXT := format('mkdir %s', dirPath);
+    createDir TEXT := format('mkdir -p %s', dirPath);
 BEGIN
     EXECUTE format('COPY (SELECT 1) TO PROGRAM %s', quote_literal(createDir));
     RETURN dirPath;
