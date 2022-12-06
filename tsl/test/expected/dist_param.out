@@ -45,7 +45,9 @@ select count(*) from show_chunks('metric_dist');
 (1 row)
 
 -- dictionary
-create table metric_name(id int primary key, name text unique);
+create table metric_name(id int, name text,
+    constraint metric_name_id primary key (id),
+    constraint metric_name_name unique (name));
 insert into metric_name values (1, 'cpu1'), (3, 'cpu3'),  (7, 'cpu7');
 insert into metric_name select x, 'other' || x
     from generate_series(1000, 10000) x
@@ -55,7 +57,8 @@ analyze metric_name;
 set enable_hashagg to off;
 set enable_hashjoin to off;
 set enable_material to off;
-set enable_memoize to off;
+-- not present on PG 12
+select 'set enable_memoize to off' from pg_settings where name = 'enable_memoize' \gexec
 set enable_mergejoin to off;
 set enable_seqscan to off;
 -- Subquery + IN
@@ -88,7 +91,7 @@ order by id
    Group Key: metric_dist.id
    ->  Nested Loop
          Output: metric_dist.id, metric_dist.value
-         ->  Index Scan using metric_name_pkey on public.metric_name
+         ->  Index Scan using metric_name_id on public.metric_name
                Output: metric_name.id, metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -131,7 +134,7 @@ order by id
    ->  Nested Loop
          Output: metric_dist.id, metric_dist.value
          Join Filter: (metric_dist.id = metric_name.id)
-         ->  Index Scan using metric_name_pkey on public.metric_name
+         ->  Index Scan using metric_name_id on public.metric_name
                Output: metric_name.id, metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -172,7 +175,7 @@ order by name
    Group Key: metric_name.name
    ->  Nested Loop
          Output: metric_name.name, metric_dist.value
-         ->  Index Scan using metric_name_name_key on public.metric_name
+         ->  Index Scan using metric_name_name on public.metric_name
                Output: metric_name.id, metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -198,7 +201,7 @@ order by name
    Group Key: metric_name.name
    ->  Nested Loop
          Output: metric_name.name, metric_dist.value
-         ->  Index Scan using metric_name_name_key on public.metric_name
+         ->  Index Scan using metric_name_name on public.metric_name
                Output: metric_name.id, metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -233,7 +236,7 @@ order by name
                      Data node: data_node_1
                      Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_16_chunk, _dist_hyper_1_20_chunk, _dist_hyper_1_37_chunk, _dist_hyper_1_52_chunk
                      Remote SQL: SELECT id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone))
-               ->  Index Scan using metric_name_pkey on public.metric_name
+               ->  Index Scan using metric_name_id on public.metric_name
                      Output: metric_name.id, metric_name.name
                      Index Cond: (metric_name.id = metric_dist.id)
                      Filter: (metric_name.name ~~ 'cpu%'::text)
@@ -256,7 +259,7 @@ order by name
    ->  Nested Loop
          Output: metric_name.name, metric_dist.value
          Join Filter: (concat('cpu', metric_dist.id) = metric_name.name)
-         ->  Index Only Scan using metric_name_name_key on public.metric_name
+         ->  Index Only Scan using metric_name_name on public.metric_name
                Output: metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -301,7 +304,7 @@ order by name
    Group Key: metric_name.name
    ->  Nested Loop
          Output: metric_name.name, metric_dist.value
-         ->  Index Only Scan using metric_name_name_key on public.metric_name
+         ->  Index Only Scan using metric_name_name on public.metric_name
                Output: metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -329,7 +332,7 @@ order by name
    ->  Nested Loop
          Output: metric_name.name, metric_dist.value
          Join Filter: texteq(concat('cpu', textin(int4out(metric_dist.id))), metric_name.name)
-         ->  Index Only Scan using metric_name_name_key on public.metric_name
+         ->  Index Only Scan using metric_name_name on public.metric_name
                Output: metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -373,7 +376,7 @@ limit 1
                Sort Key: metric_dist.id, metric_dist.ts, metric_dist.value
                ->  Nested Loop
                      Output: metric_dist.id, metric_dist.ts, metric_dist.value
-                     ->  Index Scan using metric_name_pkey on public.metric_name
+                     ->  Index Scan using metric_name_id on public.metric_name
                            Output: metric_name.id, metric_name.name
                            Filter: (metric_name.name ~~ 'cpu%'::text)
                      ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -417,7 +420,7 @@ limit 1
                Sort Key: metric_name.name, metric_dist.ts, metric_dist.value
                ->  Nested Loop
                      Output: metric_name.name, metric_dist.ts, metric_dist.value
-                     ->  Index Scan using metric_name_name_key on public.metric_name
+                     ->  Index Scan using metric_name_id on public.metric_name
                            Output: metric_name.id, metric_name.name
                            Filter: (metric_name.name ~~ 'cpu%'::text)
                      ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -455,7 +458,7 @@ order by name
                      Data node: data_node_1
                      Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_16_chunk, _dist_hyper_1_20_chunk, _dist_hyper_1_37_chunk, _dist_hyper_1_52_chunk
                      Remote SQL: SELECT id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone))
-               ->  Index Scan using metric_name_pkey on public.metric_name
+               ->  Index Scan using metric_name_id on public.metric_name
                      Output: metric_name.id, metric_name.name
                      Index Cond: (metric_name.id = metric_dist.id)
 (17 rows)
@@ -522,7 +525,7 @@ group by id
          ->  Nested Loop
                Output: metric_location.id, metric_name.id
                Join Filter: (metric_location.id = metric_name.id)
-               ->  Index Scan using metric_name_pkey on public.metric_name
+               ->  Index Scan using metric_name_id on public.metric_name
                      Output: metric_name.id, metric_name.name
                      Filter: (metric_name.name ~~ 'cpu%'::text)
                ->  Seq Scan on public.metric_location
@@ -556,7 +559,7 @@ order by 1
    ->  Nested Loop
          Output: max_value_times.ts, max_value_times.id, metric_name.id
          Join Filter: (max_value_times.id = metric_name.id)
-         ->  Index Scan using metric_name_pkey on public.metric_name
+         ->  Index Scan using metric_name_id on public.metric_name
                Output: metric_name.id, metric_name.name
                Filter: (metric_name.name ~~ 'cpu%'::text)
          ->  Seq Scan on public.max_value_times
