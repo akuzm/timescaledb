@@ -388,7 +388,7 @@ path_process(PlannerInfo *root, Path **path)
 		case T_SortPath:
 			path_process(root, &castNode(SortPath, subp)->subpath);
 			return;
-#ifdef PG13_GE
+#if PG13_GE
 		case T_IncrementalSortPath:
 			path_process(root, &castNode(IncrementalSortPath, subp)->spath.subpath);
 			return;
