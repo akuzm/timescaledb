@@ -1237,7 +1237,7 @@ copyfrom(CopyChunkState *ccstate, List *range_table, Hypertable *ht, MemoryConte
 		heap_sync(ccstate->rel);
 #else
 	if (!RelationNeedsWAL(ccstate->rel))
-		smgrimmedsync(ccstate->rel->rd_smgr, MAIN_FORKNUM);
+		smgrimmedsync(RelationGetSmgr(ccstate->rel), MAIN_FORKNUM);
 #endif
 
 	return processed;
