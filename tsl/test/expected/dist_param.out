@@ -57,10 +57,9 @@ analyze metric_name;
 set enable_hashagg to off;
 set enable_hashjoin to off;
 set enable_material to off;
--- not present on PG 12
-select 'set enable_memoize to off' from pg_settings where name = 'enable_memoize' \gexec
 set enable_mergejoin to off;
-set enable_seqscan to off;
+-- not present on PG 12
+\set ECHO errors
 -- Subquery + IN
 select id, max(value), count(*)
 from metric_dist
@@ -420,7 +419,7 @@ limit 1
                Sort Key: metric_name.name, metric_dist.ts, metric_dist.value
                ->  Nested Loop
                      Output: metric_name.name, metric_dist.ts, metric_dist.value
-                     ->  Index Scan using metric_name_id on public.metric_name
+                     ->  Index Scan using metric_name_name on public.metric_name
                            Output: metric_name.id, metric_name.name
                            Filter: (metric_name.name ~~ 'cpu%'::text)
                      ->  Custom Scan (DataNodeScan) on public.metric_dist
@@ -515,28 +514,32 @@ where name like 'cpu%' and texteq(location, 'Yerevan')
     and ts between '2022-02-02 02:02:02+03' and '2022-03-03 02:02:02+03'
 group by id
 ;
-                                                                                                                                                     QUERY PLAN                                                                                                                                                      
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                        QUERY PLAN                                                                                                                                                         
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Output: metric_dist.id, max(metric_dist.value)
    Group Key: metric_dist.id
-   ->  Nested Loop
+   ->  Sort
          Output: metric_dist.id, metric_dist.value
+         Sort Key: metric_dist.id
          ->  Nested Loop
-               Output: metric_location.id, metric_name.id
-               Join Filter: (metric_location.id = metric_name.id)
-               ->  Index Scan using metric_name_id on public.metric_name
-                     Output: metric_name.id, metric_name.name
-                     Filter: (metric_name.name ~~ 'cpu%'::text)
-               ->  Seq Scan on public.metric_location
-                     Output: metric_location.id, metric_location.location
-                     Filter: texteq(metric_location.location, 'Yerevan'::text)
-         ->  Custom Scan (DataNodeScan) on public.metric_dist
                Output: metric_dist.id, metric_dist.value
-               Data node: data_node_1
-               Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_16_chunk, _dist_hyper_1_20_chunk, _dist_hyper_1_37_chunk, _dist_hyper_1_52_chunk
-               Remote SQL: SELECT id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone)) AND (($1::integer = id))
-(19 rows)
+               ->  Nested Loop
+                     Output: metric_location.id, metric_name.id
+                     Inner Unique: true
+                     ->  Seq Scan on public.metric_location
+                           Output: metric_location.id, metric_location.location
+                           Filter: texteq(metric_location.location, 'Yerevan'::text)
+                     ->  Index Scan using metric_name_id on public.metric_name
+                           Output: metric_name.id, metric_name.name
+                           Index Cond: (metric_name.id = metric_location.id)
+                           Filter: (metric_name.name ~~ 'cpu%'::text)
+               ->  Custom Scan (DataNodeScan) on public.metric_dist
+                     Output: metric_dist.id, metric_dist.value
+                     Data node: data_node_1
+                     Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_16_chunk, _dist_hyper_1_20_chunk, _dist_hyper_1_37_chunk, _dist_hyper_1_52_chunk
+                     Remote SQL: SELECT id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone)) AND (($1::integer = id))
+(23 rows)
 
 -- Multiple joins on different variables. Use a table instead of a CTE for saner
 -- stats.

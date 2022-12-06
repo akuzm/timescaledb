@@ -46,10 +46,11 @@ analyze metric_name;
 set enable_hashagg to off;
 set enable_hashjoin to off;
 set enable_material to off;
--- not present on PG 12
-select 'set enable_memoize to off' from pg_settings where name = 'enable_memoize' \gexec
 set enable_mergejoin to off;
-set enable_seqscan to off;
+-- not present on PG 12
+\set ECHO errors
+select 'set enable_memoize to off' from pg_settings where name = 'enable_memoize' \gexec
+\set ECHO all
 
 -- Subquery + IN
 select id, max(value), count(*)
