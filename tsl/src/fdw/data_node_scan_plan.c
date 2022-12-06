@@ -576,6 +576,8 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 		/* Compute the output targetlist. */
 		run_cost += data_node_rel->reltarget->cost.per_tuple * rows;
 
+		rows = clamp_row_est(rows);
+
 		/*
 		 * ppi_rows currently won't get looked at by anything, but still we
 		 * may as well ensure that it matches our idea of the rowcount.

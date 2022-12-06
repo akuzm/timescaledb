@@ -130,7 +130,7 @@ get_upper_rel_estimate(PlannerInfo *root, RelOptInfo *rel, CostEstimate *ce)
 	num_group_cols = list_length(root->parse->groupClause);
 	if (fpinfo->type == TS_FDW_RELINFO_HYPERTABLE_DATA_NODE)
 	{
-		num_groups = input_rows / 10.;
+		num_groups = clamp_row_est(input_rows / 10.);
 	}
 	else
 	{
