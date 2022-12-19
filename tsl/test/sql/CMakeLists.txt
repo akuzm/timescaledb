@@ -44,6 +44,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     compression_errors.sql
     compression_hypertable.sql
     compression_merge.sql
+    compression_indexscan.sql
     compression_segment_meta.sql
     compression.sql
     compress_table.sql
@@ -55,19 +56,11 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     cagg_drop_chunks.sql
     cagg_dump.sql
     cagg_errors_deprecated.sql
-    cagg_migrate_integer.sql
-    cagg_migrate_integer_dist_ht.sql
-    cagg_migrate_timestamp.sql
-    cagg_migrate_timestamp_dist_ht.sql
-    cagg_migrate_timestamptz.sql
-    cagg_migrate_timestamptz_dist_ht.sql
+    cagg_migrate.sql
+    cagg_migrate_dist_ht.sql
     cagg_multi.sql
-    cagg_on_cagg_integer.sql
-    cagg_on_cagg_integer_dist_ht.sql
-    cagg_on_cagg_timestamp.sql
-    cagg_on_cagg_timestamp_dist_ht.sql
-    cagg_on_cagg_timestamptz.sql
-    cagg_on_cagg_timestamptz_dist_ht.sql
+    cagg_on_cagg.sql
+    cagg_on_cagg_dist_ht.sql
     continuous_aggs_deprecated.sql
     cagg_tableam.sql
     cagg_usage.sql
