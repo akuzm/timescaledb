@@ -180,6 +180,11 @@ order by name
 ;
 
 
+-- Disable seq scan for the following two queries, because PG12 prefers it over
+-- index scan for some reason.
+set enable_seqscan to off;
+
+
 -- distinct on, order by, limit 1, with subquery
 select distinct on (id)
     id, ts, value
@@ -220,6 +225,9 @@ where name like 'cpu%'
 order by name, ts, value
 limit 1
 ;
+
+
+reset enable_seqscan;
 
 
 -- If there are a lot of rows chosen from the local table, the parameterized
