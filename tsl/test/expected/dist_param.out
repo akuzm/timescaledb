@@ -350,9 +350,6 @@ order by name
                Remote SQL: SELECT id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone))
 (15 rows)
 
--- Disable seq scan for the following two queries, because PG12 prefers it over
--- index scan for some reason.
-set enable_seqscan to off;
 -- distinct on, order by, limit 1, with subquery
 select distinct on (id)
     id, ts, value
@@ -443,7 +440,6 @@ limit 1
                            Remote SQL: SELECT ts, id, value FROM public.metric_dist WHERE _timescaledb_internal.chunks_in(public.metric_dist.*, ARRAY[3, 16, 20, 37, 52]) AND ((ts >= '2022-02-01 15:02:02-08'::timestamp with time zone)) AND ((ts <= '2022-03-02 15:02:02-08'::timestamp with time zone)) AND (($1::integer = id))
 (18 rows)
 
-reset enable_seqscan;
 -- If there are a lot of rows chosen from the local table, the parameterized
 -- nested loop might download the entire dist table or even more than that (in
 -- case of not equi-join or duplicate join keys).
