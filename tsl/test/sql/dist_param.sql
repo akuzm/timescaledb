@@ -34,8 +34,8 @@ select count(*) from show_chunks('metric_dist');
 
 -- dictionary
 create table metric_name(id int, name text,
-    constraint metric_name_id primary key (id),
-    constraint metric_name_name unique (name));
+    constraint metric_name_name unique (name),
+    constraint metric_name_id primary key (id));
 insert into metric_name values (1, 'cpu1'), (3, 'cpu3'),  (7, 'cpu7');
 insert into metric_name select x, 'other' || x
     from generate_series(1000, 10000) x
