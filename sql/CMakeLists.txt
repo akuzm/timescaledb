@@ -40,7 +40,8 @@ set(MOD_FILES
     updates/2.7.1--2.7.2.sql
     updates/2.7.2--2.8.0.sql
     updates/2.8.0--2.8.1.sql
-    updates/2.8.1--2.9.0.sql)
+    updates/2.8.1--2.9.0.sql
+    updates/2.9.0--2.9.1.sql)
 
 # The downgrade file to generate a downgrade script for the current version, as
 # specified in version.config
@@ -63,7 +64,8 @@ set(OLD_REV_FILES
     2.7.2--2.7.1.sql
     2.8.0--2.7.2.sql
     2.8.1--2.8.0.sql
-    2.9.0--2.8.1.sql)
+    2.9.0--2.8.1.sql
+    2.9.1--2.9.0.sql)
 
 set(MODULE_PATHNAME "$libdir/timescaledb-${PROJECT_VERSION_MOD}")
 set(LOADER_PATHNAME "$libdir/timescaledb")

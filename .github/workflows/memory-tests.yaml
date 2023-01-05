@@ -1,10 +1,8 @@
 name: Memory tests
 on:
-  schedule:
-    # run daily 20:00 on main branch
-    - cron: '0 20 * * *'
   push:
     branches:
+      - main
       - prerelease_test
       - memory_test
 jobs:
@@ -13,7 +11,7 @@ jobs:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
-        pg: [12, 13, 14]
+        pg: [12, 13, 14, 15]
       fail-fast: false
 
     steps:
