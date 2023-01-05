@@ -44,7 +44,6 @@ analyze metric_name;
 
 -- for predictable plans
 set enable_hashagg to off;
-set enable_hashjoin to off;
 set enable_material to off;
 set enable_mergejoin to off;
 -- not present on PG 12
@@ -284,4 +283,15 @@ select id, value
 from metric_dist natural join max_value_times natural join metric_name
 where name like 'cpu%'
 order by 1
+;
+
+-- Two distributed hypertables, each joined to reference and all joined together.
+-- The query finds the percentage of time points where one metric is higher than
+-- another, and also tweaked not to use initplans.Requires hash join.
+explain (analyze, verbose, costs off, timing off, summary off)
+select count(*) filter (where m1.value > m2.value) / count(*)
+from metric_dist m1
+join metric_dist m2 using (ts)
+where m1.id in (select id from metric_name where name = 'cpu1')
+    and m2.id in (select id from metric_name where name = 'cpu3')
 ;
