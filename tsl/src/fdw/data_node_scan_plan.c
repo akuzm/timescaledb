@@ -508,7 +508,7 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 
 				/*
 				 * We have an index path with a matching parameterization for
-				 * the hyperatble rel. This means that we also have a matching
+				 * the hypertable rel. This means that we also have a matching
 				 * index on the data nodes. As a hack, try to cost this path not
 				 * as a seq scan, but as an imaginary index scan that's cheaper
 				 * by a constant factor.
