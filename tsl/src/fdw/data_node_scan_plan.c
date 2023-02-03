@@ -549,11 +549,16 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 		cost_qual_eval(&remote_join_cost, param_info->ppi_clauses, root);
 
 		/*
-		 * We don't have up to date per-column statistics for distributed
-		 * hypertables currently, so the join estimates are going to be way off.
-		 * The worst is when they are too low and we end up transferring much
-		 * more rows from the data node that we expected. Just hardcode it at
-		 * 0.1 per clause for now.
+		 * We don't have up to date per-column statistics for the root
+		 * distributed hypertable currently, so the join estimates are going to
+		 * be way off. The worst is when they are too low and we end up
+		 * transferring much more rows from the data node that we expected. Just
+		 * hardcode it at 0.1 per clause for now.
+		 * In the future, we could make use of per-chunk per-column statistics
+		 * that we do have, by injecting them into the Postgres cost functions
+		 * through the get_relation_stats_hook. For a data node scan, we would
+		 * combine statistics for all participating chunks on the given data
+		 * node.
 		 */
 		const double remote_join_sel = pow(0.1, list_length(param_info->ppi_clauses));
 
