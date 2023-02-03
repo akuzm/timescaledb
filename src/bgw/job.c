@@ -26,6 +26,7 @@
 #include <utils/elog.h>
 #include <utils/jsonb.h>
 #include <utils/snapmgr.h>
+#include <unistd.h>
 
 #include "job.h"
 #include "config.h"
@@ -45,6 +46,7 @@
 
 #include <cross_module_fn.h>
 #include "jsonb_utils.h"
+#include "debug_assert.h"
 
 #define TELEMETRY_INITIAL_NUM_RUNS 12
 
@@ -67,6 +69,7 @@ ts_bgw_job_start(BgwJob *job, Oid user_oid)
 		.job_id = Int32GetDatum(job->fd.id),
 		.user_oid = user_oid,
 	};
+
 	strlcpy(bgw_params.bgw_main, job_entrypoint_function_name, sizeof(bgw_params.bgw_main));
 
 	return ts_bgw_start_worker(NameStr(job->fd.application_name), &bgw_params);
@@ -334,7 +337,7 @@ bgw_job_filter_scheduled(const TupleInfo *ti, void *data)
 {
 	bool isnull;
 	Datum scheduled = slot_getattr(ti->slot, Anum_bgw_job_scheduled, &isnull);
-	Assert(!isnull);
+	Ensure(!isnull, "scheduled column was null");
 
 	return DatumGetBool(scheduled);
 }
@@ -555,30 +558,33 @@ init_scan_by_job_id(ScanIterator *iterator, int32 job_id)
 								   Int32GetDatum(job_id));
 }
 
-/* Lock a job tuple using an advisory lock. Advisory job locks are
- * used to lock the job row while a job is running to prevent a job from being
+/* Lock a job tuple using an advisory lock. Advisory job locks are used to
+ * lock the job row while a job is running to prevent a job from being
  * modified while in the middle of a run. This lock should be taken before
  * bgw_job table lock to avoid deadlocks.
  *
- * We use an advisory lock instead of a tuple lock because we want the lock on the job id
- * and not on the tid of the row (in case it is vacuumed or updated in some way). We don't
- * want the job modified while it is running for safety reasons. Finally, we use this lock
- * to be able to send a signal to the PID of the running job. This is used by delete because,
- * a job deletion sends a SIGINT to the running job to cancel it.
+ * We use an advisory lock instead of a tuple lock because we want the lock on
+ * the job id and not on the tid of the row (in case it is vacuumed or updated
+ * in some way). We don't want the job modified while it is running for safety
+ * reasons. Finally, we use this lock to be able to send a signal to the PID
+ * of the running job. This is used by delete because, a job deletion sends a
+ * SIGINT to the running job to cancel it.
  *
- * We acquire a SHARE lock on the job during scheduling and when the job is running so that it
- * cannot be deleted during those times and an EXCLUSIVE lock when deleting.
+ * We acquire a SHARE lock on the job during scheduling and when the job is
+ * running so that it cannot be deleted during those times and an EXCLUSIVE
+ * lock when deleting.
  *
- * returns whether or not the lock was obtained (false return only possible if block==false)
+ * returns whether or not the lock was obtained (false return only possible if
+ * block==false)
  */
 
-static bool
-lock_job(int32 job_id, LOCKMODE mode, JobLockLifetime lock_type, LOCKTAG *tag, bool block)
+bool
+ts_lock_job_id(int32 job_id, LOCKMODE mode, bool session_lock, LOCKTAG *tag, bool block)
 {
 	/* Use a special pseudo-random field 4 value to avoid conflicting with user-advisory-locks */
 	TS_SET_LOCKTAG_ADVISORY(*tag, MyDatabaseId, job_id, 0);
 
-	return LockAcquire(tag, mode, lock_type == SESSION_LOCK, !block) != LOCKACQUIRE_NOT_AVAIL;
+	return LockAcquire(tag, mode, session_lock, !block) != LOCKACQUIRE_NOT_AVAIL;
 }
 
 static BgwJob *
@@ -593,7 +599,8 @@ ts_bgw_job_find_with_lock(int32 bgw_job_id, MemoryContext mctx, LOCKMODE tuple_l
 	LOCKTAG tag;
 
 	/* take advisory lock before relation lock */
-	if (!(*got_lock = lock_job(bgw_job_id, tuple_lock_mode, lock_type, &tag, block)))
+	if (!(*got_lock =
+			  ts_lock_job_id(bgw_job_id, tuple_lock_mode, lock_type == SESSION_LOCK, &tag, block)))
 	{
 		/* return NULL if lock could not be acquired */
 		Assert(!block);
@@ -625,6 +632,9 @@ ts_bgw_job_find_with_lock(int32 bgw_job_id, MemoryContext mctx, LOCKMODE tuple_l
 							   job->fd.scheduled ? "true" : "false")));
 		}
 	}
+
+	/* We don't care about duplicate jobs in release builds and will take the
+	 * last job */
 	Assert(list_length(jobs) <= 1);
 
 	return job;
@@ -646,8 +656,7 @@ ts_bgw_job_get_share_lock(int32 bgw_job_id, MemoryContext mctx)
 											mctx,
 											RowShareLock,
 											TXN_LOCK,
-											true /* block */
-											,
+											true, /* block */
 											&got_lock);
 	if (job != NULL)
 	{
@@ -694,11 +703,11 @@ get_job_lock_for_delete(int32 job_id)
 
 	/* Try getting an exclusive lock on the tuple in a non-blocking manner. Note this is the
 	 * equivalent of a row-based FOR UPDATE lock */
-	got_lock = lock_job(job_id,
-						AccessExclusiveLock,
-						TXN_LOCK,
-						&tag,
-						/* block */ false);
+	got_lock = ts_lock_job_id(job_id,
+							  AccessExclusiveLock,
+							  /* session_lock */ false,
+							  &tag,
+							  /* block */ false);
 	if (!got_lock)
 	{
 		/* If I couldn't get a lock, try killing the background worker that's running the job.
@@ -720,24 +729,24 @@ get_job_lock_for_delete(int32 job_id)
 		}
 
 		/* We have to grab this lock before proceeding so grab it in a blocking manner now */
-		got_lock = lock_job(job_id,
-							AccessExclusiveLock,
-							TXN_LOCK,
-							&tag,
-							/* block */ true);
+		got_lock = ts_lock_job_id(job_id,
+								  AccessExclusiveLock,
+								  /* session_lock */ false,
+								  &tag,
+								  /* block */ true);
 	}
-	Assert(got_lock);
+	Ensure(got_lock, "unable to lock job id %d", job_id);
 }
 
 static ScanTupleResult
 bgw_job_tuple_delete(TupleInfo *ti, void *data)
 {
 	CatalogSecurityContext sec_ctx;
-	bool isnull;
-	Datum datum = slot_getattr(ti->slot, Anum_bgw_job_id, &isnull);
+	bool isnull_job_id;
+	Datum datum = slot_getattr(ti->slot, Anum_bgw_job_id, &isnull_job_id);
 	int32 job_id = DatumGetInt32(datum);
 
-	Assert(!isnull);
+	Ensure(!isnull_job_id, "job id was null");
 
 	/* Also delete the bgw_stat entry */
 	ts_bgw_job_stat_delete(job_id);
@@ -1118,7 +1127,10 @@ ts_bgw_job_entrypoint(PG_FUNCTION_ARGS)
 	bool got_lock;
 
 	memcpy(&params, MyBgworkerEntry->bgw_extra, sizeof(BgwParams));
-	Assert(params.user_oid != 0 && params.job_id != 0);
+	Ensure(params.user_oid != 0 && params.job_id != 0,
+		   "job id or user oid was zero - job_id: %d, user_oid: %d",
+		   params.job_id,
+		   params.user_oid);
 
 	BackgroundWorkerBlockSignals();
 	/* Setup any signal handlers here */
@@ -1312,6 +1324,7 @@ ts_bgw_job_run_and_set_next_start(BgwJob *job, job_main_func func, int64 initial
 	return ret;
 }
 
+/* Insert a new job in the bgw_job relation */
 int
 ts_bgw_job_insert_relation(Name application_name, Interval *schedule_interval,
 						   Interval *max_runtime, int32 max_retries, Interval *retry_period,

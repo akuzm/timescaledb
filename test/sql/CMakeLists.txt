@@ -30,12 +30,12 @@ set(TEST_FILES
     insert_returning.sql
     lateral.sql
     misc.sql
+    null_exclusion.sql
     partition.sql
     partitioning.sql
     pg_dump_unprivileged.sql
     pg_join.sql
     plain.sql
-    plan_hashagg.sql
     plan_ordered_append.sql
     relocate_extension.sql
     reloptions.sql
@@ -65,6 +65,7 @@ set(TEST_TEMPLATES
     delete.sql.in
     partitionwise.sql.in
     plan_expand_hypertable.sql.in
+    plan_hashagg.sql.in
     plan_hypertable_inline.sql.in
     rowsecurity.sql.in
     update.sql.in

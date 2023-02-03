@@ -72,7 +72,10 @@ WARNING:  column type "timestamp without time zone" used for "time" does not fol
 (1 row)
 
 ALTER TABLE records SET (timescaledb.compress = true);
-ALTER TABLE records ADD COLUMN col boolean DEFAULT false NOT NULL;
+ALTER TABLE records ADD COLUMN col1 boolean DEFAULT false NOT NULL;
+-- NULL constraints are useless and it is safe allow adding this
+-- column with NULL constraint to a compressed hypertable (Issue #5151)
+ALTER TABLE records ADD COLUMN col2 BOOLEAN NULL;
 DROP table records CASCADE;
 -- TABLESPACES
 -- For tablepaces with compressed chunks the semantics are the following:
@@ -749,11 +752,11 @@ psql:include/compression_alter.sql:8: NOTICE:  adding not-null constraint to col
  test1
 (1 row)
 
-INSERT INTO test1 
+INSERT INTO test1
 SELECT t,  gen_rand_minstd(), gen_rand_minstd(), gen_rand_minstd()::text
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-05 1:00', '1 hour') t;
-INSERT INTO test1 
-SELECT '2018-03-04 2:00', 100, 200, 'hello' ; 
+INSERT INTO test1
+SELECT '2018-03-04 2:00', 100, 200, 'hello' ;
 ALTER TABLE test1 set (timescaledb.compress, timescaledb.compress_segmentby = 'bntcol', timescaledb.compress_orderby = '"Time" DESC');
 SELECT COUNT(*) AS count_compressed
 FROM
@@ -772,7 +775,7 @@ AS sub;
 -- TEST: ALTER TABLE add column tests --
 ALTER TABLE test1 ADD COLUMN new_coli integer;
 ALTER TABLE test1 ADD COLUMN new_colv varchar(30);
-SELECT * FROM _timescaledb_catalog.hypertable_compression 
+SELECT * FROM _timescaledb_catalog.hypertable_compression
 ORDER BY attname;
  hypertable_id | attname  | compression_algorithm_id | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
 ---------------+----------+--------------------------+------------------------+----------------------+-------------+--------------------
@@ -796,7 +799,7 @@ SELECT count(*) from test1 where new_colv is null;
     74
 (1 row)
 
---decompress 1 chunk and query again 
+--decompress 1 chunk and query again
 SELECT COUNT(*) AS count_compressed
 FROM
 (
@@ -826,7 +829,7 @@ SELECT count(*) from test1 where new_colv is null;
 
 --compress all chunks and query ---
 --create new chunk and fill in data --
-INSERT INTO test1 SELECT t,  gen_rand_minstd(), gen_rand_minstd(), gen_rand_minstd()::text , 100, '101t' 
+INSERT INTO test1 SELECT t,  gen_rand_minstd(), gen_rand_minstd(), gen_rand_minstd()::text , 100, '101t'
 FROM generate_series('2018-03-08 1:00'::TIMESTAMPTZ, '2018-03-09 1:00', '1 hour') t;
 SELECT count(*) from test1 where new_coli  = 100;
  count 
@@ -868,7 +871,7 @@ SELECT count(*) from test1 where new_colv  = '101t';
 
 CREATE INDEX new_index ON test1(new_colv);
 -- TEST 2:  ALTER TABLE rename column
-SELECT * FROM _timescaledb_catalog.hypertable_compression  
+SELECT * FROM _timescaledb_catalog.hypertable_compression
 WHERE attname = 'new_coli' and hypertable_id = (SELECT id from _timescaledb_catalog.hypertable
                        WHERE table_name = 'test1' );
  hypertable_id | attname  | compression_algorithm_id | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
@@ -877,7 +880,7 @@ WHERE attname = 'new_coli' and hypertable_id = (SELECT id from _timescaledb_cata
 (1 row)
 
 ALTER TABLE test1 RENAME new_coli TO coli;
-SELECT * FROM _timescaledb_catalog.hypertable_compression  
+SELECT * FROM _timescaledb_catalog.hypertable_compression
 WHERE attname = 'coli' and hypertable_id = (SELECT id from _timescaledb_catalog.hypertable
                        WHERE table_name = 'test1' );
  hypertable_id | attname | compression_algorithm_id | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
@@ -893,7 +896,7 @@ SELECT count(*) from test1 where coli  = 100;
 
 --rename segment by column name
 ALTER TABLE test1 RENAME bntcol TO  bigintcol  ;
-SELECT * FROM _timescaledb_catalog.hypertable_compression  
+SELECT * FROM _timescaledb_catalog.hypertable_compression
 WHERE attname = 'bigintcol' and hypertable_id = (SELECT id from _timescaledb_catalog.hypertable
                        WHERE table_name = 'test1' );
  hypertable_id |  attname  | compression_algorithm_id | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
@@ -901,7 +904,7 @@ WHERE attname = 'bigintcol' and hypertable_id = (SELECT id from _timescaledb_cat
             12 | bigintcol |                        0 |                      1 |                      |             | 
 (1 row)
 
---query by segment by column name 
+--query by segment by column name
 SELECT * from test1 WHERE bigintcol = 100;
  Time | intcol | bigintcol | txtcol | coli | new_colv 
 ------+--------+-----------+--------+------+----------
@@ -914,7 +917,7 @@ SELECT * from test1 WHERE bigintcol = 200;
 (1 row)
 
 -- add a new chunk and compress
-INSERT INTO test1 SELECT '2019-03-04 2:00', 99, 800, 'newchunk' ; 
+INSERT INTO test1 SELECT '2019-03-04 2:00', 99, 800, 'newchunk' ;
 SELECT COUNT(*) AS count_compressed
 FROM
 (
@@ -930,7 +933,7 @@ WHERE hypertable.table_name = 'test1' and chunk.compressed_chunk_id IS NULL ORDE
 
 --check if all chunks have new column names
 --both counts should be equal
-SELECT count(*) FROM _timescaledb_catalog.chunk 
+SELECT count(*) FROM _timescaledb_catalog.chunk
 WHERE hypertable_id =  ( SELECT id FROM _timescaledb_catalog.hypertable
                          WHERE table_name = 'test1' );
  count 
@@ -938,10 +941,10 @@ WHERE hypertable_id =  ( SELECT id FROM _timescaledb_catalog.hypertable
      7
 (1 row)
 
-SELECT count(*) 
-FROM ( SELECT attrelid::regclass, attname FROM pg_attribute 
-       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits 
-                          where inhparent = 'test1'::regclass) 
+SELECT count(*)
+FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
+       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits
+                          where inhparent = 'test1'::regclass)
        and attname = 'bigintcol' ) q;
  count 
 -------
@@ -949,13 +952,13 @@ FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
 (1 row)
 
 --check count on internal compression table too i.e. all the chunks have
---the correct column name 
+--the correct column name
 SELECT format('%I.%I', cht.schema_name, cht.table_name) AS "COMPRESSION_TBLNM"
 FROM _timescaledb_catalog.hypertable ht, _timescaledb_catalog.hypertable cht
 WHERE ht.table_name = 'test1' and cht.id = ht.compressed_hypertable_id \gset
-SELECT count(*) 
-FROM ( SELECT attrelid::regclass, attname FROM pg_attribute 
-       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits 
+SELECT count(*)
+FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
+       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits
                           where inhparent = :'COMPRESSION_TBLNM'::regclass )
        and attname = 'bigintcol' ) q;
  count 
@@ -965,19 +968,19 @@ FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
 
 -- check column name truncation with renames
 -- check if the name change is reflected for settings
-ALTER TABLE test1 RENAME  bigintcol TO 
+ALTER TABLE test1 RENAME  bigintcol TO
 ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccabdeeeeeeccccccccccccc;
 psql:include/compression_alter.sql:135: NOTICE:  identifier "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccabdeeeeeeccccccccccccc" will be truncated to "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccca"
-SELECT * from timescaledb_information.compression_settings 
+SELECT * from timescaledb_information.compression_settings
 WHERE hypertable_name = 'test1' and attname like 'ccc%';
  hypertable_schema | hypertable_name |                             attname                             | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
 -------------------+-----------------+-----------------------------------------------------------------+------------------------+----------------------+-------------+--------------------
  public            | test1           | cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccca |                      1 |                      |             | 
 (1 row)
 
-SELECT count(*) 
-FROM ( SELECT attrelid::regclass, attname FROM pg_attribute 
-       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits 
+SELECT count(*)
+FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
+       WHERE attrelid in (SELECT inhrelid::regclass from pg_inherits
                           where inhparent = :'COMPRESSION_TBLNM'::regclass )
        and attname like 'ccc%a' ) q;
  count 
@@ -985,11 +988,11 @@ FROM ( SELECT attrelid::regclass, attname FROM pg_attribute
      7
 (1 row)
 
-ALTER TABLE test1 RENAME 
+ALTER TABLE test1 RENAME
 ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccabdeeeeeeccccccccccccc
 TO bigintcol;
 psql:include/compression_alter.sql:148: NOTICE:  identifier "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccabdeeeeeeccccccccccccc" will be truncated to "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccca"
-SELECT * from timescaledb_information.compression_settings 
+SELECT * from timescaledb_information.compression_settings
 WHERE hypertable_name = 'test1' and attname = 'bigintcol' ;
  hypertable_schema | hypertable_name |  attname  | segmentby_column_index | orderby_column_index | orderby_asc | orderby_nullsfirst 
 -------------------+-----------------+-----------+------------------------+----------------------+-------------+--------------------
@@ -1228,3 +1231,45 @@ SELECT timescaledb_post_restore();
 (1 row)
 
 DROP TABLE issue4140;
+-- github issue 5104
+CREATE TABLE metric(
+	time TIMESTAMPTZ NOT NULL,
+	value DOUBLE PRECISION NOT NULL,
+	series_id BIGINT NOT NULL);
+SELECT create_hypertable('metric', 'time',
+	chunk_time_interval => interval '1 h',
+	create_default_indexes => false);
+  create_hypertable   
+----------------------
+ (22,public,metric,t)
+(1 row)
+
+-- enable compression
+ALTER TABLE metric set(timescaledb.compress,
+    timescaledb.compress_segmentby = 'series_id, value',
+    timescaledb.compress_orderby = 'time'
+);
+SELECT
+      comp_hypertable.schema_name AS "COMP_SCHEMA_NAME",
+      comp_hypertable.table_name AS "COMP_TABLE_NAME"
+FROM _timescaledb_catalog.hypertable uc_hypertable
+INNER JOIN _timescaledb_catalog.hypertable comp_hypertable ON (comp_hypertable.id = uc_hypertable.compressed_hypertable_id)
+WHERE uc_hypertable.table_name like 'metric' \gset
+-- get definition of compressed hypertable and notice the index
+\d :COMP_SCHEMA_NAME.:COMP_TABLE_NAME
+                    Table "_timescaledb_internal._compressed_hypertable_23"
+        Column         |                 Type                  | Collation | Nullable | Default 
+-----------------------+---------------------------------------+-----------+----------+---------
+ time                  | _timescaledb_internal.compressed_data |           |          | 
+ value                 | double precision                      |           |          | 
+ series_id             | bigint                                |           |          | 
+ _ts_meta_count        | integer                               |           |          | 
+ _ts_meta_sequence_num | integer                               |           |          | 
+ _ts_meta_min_1        | timestamp with time zone              |           |          | 
+ _ts_meta_max_1        | timestamp with time zone              |           |          | 
+Indexes:
+    "_compressed_hypertable_23_series_id_value__ts_meta_sequence_idx" btree (series_id, value, _ts_meta_sequence_num)
+Triggers:
+    ts_insert_blocker BEFORE INSERT ON _timescaledb_internal._compressed_hypertable_23 FOR EACH ROW EXECUTE FUNCTION _timescaledb_internal.insert_blocker()
+
+DROP TABLE metric CASCADE;

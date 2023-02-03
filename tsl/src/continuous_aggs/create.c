@@ -56,6 +56,7 @@
 #include <utils/ruleutils.h>
 #include <utils/syscache.h>
 #include <utils/typcache.h>
+#include <optimizer/prep.h>
 
 #include "create.h"
 
@@ -90,6 +91,7 @@
 #define INTERNAL_TO_DATE_FUNCTION "to_date"
 #define INTERNAL_TO_TSTZ_FUNCTION "to_timestamp"
 #define INTERNAL_TO_TS_FUNCTION "to_timestamp_without_timezone"
+#define CONTINUOUS_AGG_MAX_JOIN_RELATIONS 2
 
 #define PRINT_MATCOLNAME(colbuf, type, original_query_resno, colno)                                \
 	do                                                                                             \
@@ -126,6 +128,7 @@
 		(selquery)->resultRelation = 0;                                                            \
 		(selquery)->hasAggs = true;                                                                \
 		(selquery)->hasRowSecurity = false;                                                        \
+		(selquery)->rtable = NULL;                                                                 \
 	} while (0);
 
 typedef struct MatTableColumnInfo
@@ -151,14 +154,16 @@ typedef struct FinalizeQueryInfo
 
 typedef struct CAggTimebucketInfo
 {
-	int32 htid;				/* hypertable id */
-	Oid htoid;				/* hypertable oid */
-	AttrNumber htpartcolno; /* primary partitioning column of raw hypertable */
-							/* This should also be the column used by time_bucket */
+	int32 htid;						/* hypertable id */
+	int32 parent_mat_hypertable_id; /* parent materialization hypertable id */
+	Oid htoid;						/* hypertable oid */
+	AttrNumber htpartcolno;			/* primary partitioning column of raw hypertable */
+									/* This should also be the column used by time_bucket */
 	Oid htpartcoltype;
 	int64 htpartcol_interval_len; /* interval length setting for primary partitioning column */
-	int64 bucket_width;			  /* bucket_width of time_bucket, stores BUCKET_WIDHT_VARIABLE for
+	int64 bucket_width;			  /* bucket_width of time_bucket, stores BUCKET_WIDTH_VARIABLE for
 									 variable-sized buckets */
+	Oid bucket_width_type;		  /* type of bucket_width */
 	Interval *interval;			  /* stores the interval, NULL if not specified */
 	const char *timezone;		  /* the name of the timezone, NULL if not specified */
 
@@ -194,8 +199,7 @@ static void mattablecolumninfo_init(MatTableColumnInfo *matcolinfo, List *groupl
 static Var *mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input,
 										int original_query_resno, bool finalized,
 										bool *skip_adding);
-static void mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo,
-										   RangeTblEntry *usertbl_rte, int32 usertbl_htid);
+static void mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo);
 static int32 mattablecolumninfo_create_materialization_table(
 	MatTableColumnInfo *matcolinfo, int32 hypertable_id, RangeVar *mat_rel,
 	CAggTimebucketInfo *origquery_tblinfo, bool create_addl_index, char *tablespacename,
@@ -206,13 +210,14 @@ static Query *mattablecolumninfo_get_partial_select_query(MatTableColumnInfo *ma
 static void caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id,
 									Oid hypertable_oid, AttrNumber hypertable_partition_colno,
 									Oid hypertable_partition_coltype,
-									int64 hypertable_partition_col_interval);
+									int64 hypertable_partition_col_interval,
+									int32 parent_mat_hypertable_id);
 static void caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause,
 									List *targetList);
 static void finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query,
 							   MatTableColumnInfo *mattblinfo);
 static Query *finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
-											 ObjectAddress *mattbladdress);
+											 ObjectAddress *mattbladdress, char *relname);
 static bool function_allowed_in_cagg_definition(Oid funcid);
 
 static Const *cagg_boundary_make_lower_bound(Oid type);
@@ -227,7 +232,8 @@ static void
 create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, const char *user_schema,
 						  const char *user_view, const char *partial_schema,
 						  const char *partial_view, int64 bucket_width, bool materialized_only,
-						  const char *direct_schema, const char *direct_view, const bool finalized)
+						  const char *direct_schema, const char *direct_view, const bool finalized,
+						  const int32 parent_mat_hypertable_id)
 {
 	Catalog *catalog = ts_catalog_get();
 	Relation rel;
@@ -249,6 +255,15 @@ create_cagg_catalog_entry(int32 matht_id, int32 rawht_id, const char *user_schem
 	memset(values, 0, sizeof(values));
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_mat_hypertable_id)] = matht_id;
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_raw_hypertable_id)] = rawht_id;
+
+	if (parent_mat_hypertable_id == INVALID_HYPERTABLE_ID)
+		nulls[AttrNumberGetAttrOffset(Anum_continuous_agg_parent_mat_hypertable_id)] = true;
+	else
+	{
+		values[AttrNumberGetAttrOffset(Anum_continuous_agg_parent_mat_hypertable_id)] =
+			parent_mat_hypertable_id;
+	}
+
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_user_view_schema)] =
 		NameGetDatum(&user_schnm);
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_user_view_name)] =
@@ -626,7 +641,7 @@ mattablecolumninfo_get_partial_select_query(MatTableColumnInfo *mattblinfo, Quer
 	return partial_selquery;
 }
 
-/* create a  view for the query using the SELECt stmt sqlquery
+/* create a view for the query using the SELECt stmt sqlquery
  * and view name from RangeVar viewrel
  */
 static ObjectAddress
@@ -678,17 +693,19 @@ create_view_for_query(Query *selquery, RangeVar *viewrel)
 static void
 caggtimebucketinfo_init(CAggTimebucketInfo *src, int32 hypertable_id, Oid hypertable_oid,
 						AttrNumber hypertable_partition_colno, Oid hypertable_partition_coltype,
-						int64 hypertable_partition_col_interval)
+						int64 hypertable_partition_col_interval, int32 parent_mat_hypertable_id)
 {
 	src->htid = hypertable_id;
+	src->parent_mat_hypertable_id = parent_mat_hypertable_id;
 	src->htoid = hypertable_oid;
 	src->htpartcolno = hypertable_partition_colno;
 	src->htpartcoltype = hypertable_partition_coltype;
 	src->htpartcol_interval_len = hypertable_partition_col_interval;
-	src->bucket_width = 0;			/* invalid value */
-	src->interval = NULL;			/* not specified by default */
-	src->timezone = NULL;			/* not specified by default */
-	TIMESTAMP_NOBEGIN(src->origin); /* origin is not specified by default */
+	src->bucket_width = 0;				 /* invalid value */
+	src->bucket_width_type = InvalidOid; /* invalid oid */
+	src->interval = NULL;				 /* not specified by default */
+	src->timezone = NULL;				 /* not specified by default */
+	TIMESTAMP_NOBEGIN(src->origin);		 /* origin is not specified by default */
 }
 
 static Const *
@@ -730,6 +747,7 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 	{
 		SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
 		TargetEntry *tle = get_sortgroupclause_tle(sgc, targetList);
+
 		if (IsA(tle->expr, FuncExpr))
 		{
 			FuncExpr *fe = ((FuncExpr *) tle->expr);
@@ -757,7 +775,7 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 
 			tbinfo->bucket_func = fe;
 
-			/*only column allowed : time_bucket('1day', <column> ) */
+			/* only column allowed : time_bucket('1day', <column> ) */
 			col_arg = lsecond(fe->args);
 
 			if (!(IsA(col_arg, Var)) || ((Var *) col_arg)->varattno != tbinfo->htpartcolno)
@@ -857,6 +875,8 @@ caggtimebucket_validate(CAggTimebucketInfo *tbinfo, List *groupClause, List *tar
 			if (IsA(width_arg, Const))
 			{
 				Const *width = castNode(Const, width_arg);
+				tbinfo->bucket_width_type = width->consttype;
+
 				if (width->consttype == INTERVALOID)
 				{
 					tbinfo->interval = DatumGetIntervalP(width->constvalue);
@@ -957,8 +977,28 @@ cagg_agg_validate(Node *node, void *context)
  *   added.
  */
 static bool
-cagg_query_supported(Query *query, StringInfo hint, StringInfo detail, const bool finalized)
+cagg_query_supported(const Query *query, StringInfo hint, StringInfo detail, const bool finalized)
 {
+/*
+ * For now deprecate partial aggregates on release builds only.
+ * Once migration tests are made compatible with PG15 enable deprecation
+ * on debug builds as well.
+ */
+#ifndef DEBUG
+#if PG15_GE
+	if (!finalized)
+	{
+		/* continuous aggregates with old format will not be allowed */
+		appendStringInfoString(detail,
+							   "Continuous Aggregates with partials is not supported anymore.");
+		appendStringInfoString(hint,
+							   "Define the Continuous Aggregate with \"finalized\" parameter set "
+							   "to true.");
+		return false;
+	}
+#endif
+#endif
+
 	if (query->commandType != CMD_SELECT)
 	{
 		appendStringInfoString(hint, "Use a SELECT query in the continuous aggregate view.");
@@ -1058,17 +1098,87 @@ cagg_query_supported(Query *query, StringInfo hint, StringInfo detail, const boo
 	return true; /* Query was OK and is supported */
 }
 
-static CAggTimebucketInfo
-cagg_validate_query(Query *query, bool finalized)
+static inline int64
+get_bucket_width(CAggTimebucketInfo bucket_info)
 {
-	CAggTimebucketInfo ret;
+	int64 width = 0;
+
+	/* calculate the width */
+	switch (bucket_info.bucket_width_type)
+	{
+		case INT8OID:
+		case INT4OID:
+		case INT2OID:
+			width = bucket_info.bucket_width;
+			break;
+		case INTERVALOID:
+		{
+			/*
+			 * epoch will treat year as 365.25 days. This leads to the unexpected
+			 * result that year is not multiple of day or month, which is perceived
+			 * as a bug. For that reason, we treat all months as 30 days regardless of year
+			 */
+			if (bucket_info.interval->month && !bucket_info.interval->day &&
+				!bucket_info.interval->time)
+			{
+				bucket_info.interval->day = bucket_info.interval->month * DAYS_PER_MONTH;
+				bucket_info.interval->month = 0;
+			}
+			Datum epoch = DirectFunctionCall2(interval_part,
+											  PointerGetDatum(cstring_to_text("epoch")),
+											  IntervalPGetDatum(bucket_info.interval));
+			/* cast float8 to int8 */
+			width = DatumGetInt64(DirectFunctionCall1(dtoi8, epoch));
+			break;
+		}
+		default:
+			Assert(false);
+	}
+
+	return width;
+}
+
+static inline Datum
+get_bucket_width_datum(CAggTimebucketInfo bucket_info)
+{
+	Datum width = (Datum) 0;
+
+	switch (bucket_info.bucket_width_type)
+	{
+		case INT8OID:
+		case INT4OID:
+		case INT2OID:
+			width = ts_internal_to_interval_value(bucket_info.bucket_width,
+												  bucket_info.bucket_width_type);
+			break;
+		case INTERVALOID:
+			width = IntervalPGetDatum(bucket_info.interval);
+			break;
+		default:
+			Assert(false);
+	}
+
+	return width;
+}
+
+static CAggTimebucketInfo
+cagg_validate_query(const Query *query, const bool finalized, const char *cagg_schema,
+					const char *cagg_name)
+{
+	CAggTimebucketInfo bucket_info, bucket_info_parent;
 	Cache *hcache;
-	Hypertable *ht = NULL;
-	RangeTblRef *rtref = NULL;
-	RangeTblEntry *rte;
-	List *fromList;
+	Hypertable *ht = NULL, *ht_parent = NULL;
+	RangeTblRef *rtref = NULL, *rtref_other = NULL;
+	RangeTblEntry *rte = NULL, *rte_other = NULL;
+	JoinType jointype = JOIN_FULL;
+	OpExpr *op = NULL;
+	List *fromList = NIL;
 	StringInfo hint = makeStringInfo();
 	StringInfo detail = makeStringInfo();
+	bool is_nested = false;
+	Query *prev_query = NULL;
+	ContinuousAgg *cagg_parent = NULL;
+	Oid normal_table_id = InvalidOid;
 
 	if (!cagg_query_supported(query, hint, detail, finalized))
 	{
@@ -1086,49 +1196,219 @@ cagg_validate_query(Query *query, bool finalized)
 		cagg_agg_validate((Node *) query->targetList, NULL);
 		cagg_agg_validate((Node *) query->havingQual, NULL);
 	}
-
+	/* Check if there are only two tables in the from list */
 	fromList = query->jointree->fromlist;
-	if (list_length(fromList) != 1 || !IsA(linitial(fromList), RangeTblRef))
+	if (list_length(fromList) > CONTINUOUS_AGG_MAX_JOIN_RELATIONS)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("only one hypertable allowed in continuous aggregate view")));
+				 errmsg("only two tables with one hypertable and one normal table"
+						"are  allowed in continuous aggregate view")));
 	}
-	/* check if we have a hypertable in the FROM clause */
-	rtref = linitial_node(RangeTblRef, query->jointree->fromlist);
-	rte = list_nth(query->rtable, rtref->rtindex - 1);
+	/* Extra checks for joins in Caggs */
+	if (list_length(fromList) == CONTINUOUS_AGG_MAX_JOIN_RELATIONS ||
+		!IsA(linitial(query->jointree->fromlist), RangeTblRef))
+	{
+		/* Using old format caggs is not supported */
+		if (!finalized)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("old format of continuous aggregate is not supported with joins"),
+					 errhint("set timescaledb.finalized to TRUE")));
+
+		if (list_length(fromList) == CONTINUOUS_AGG_MAX_JOIN_RELATIONS)
+		{
+			if (!IsA(linitial(fromList), RangeTblRef) || !IsA(lsecond(fromList), RangeTblRef))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("invalid continuous aggregate view"),
+						 errdetail(
+							 "from clause can only have one hypertable and one normal table")));
+
+			rtref = linitial_node(RangeTblRef, query->jointree->fromlist);
+			rte = list_nth(query->rtable, rtref->rtindex - 1);
+			rtref_other = lsecond_node(RangeTblRef, query->jointree->fromlist);
+			rte_other = list_nth(query->rtable, rtref_other->rtindex - 1);
+			jointype = rte->jointype || rte_other->jointype;
+
+			if (query->jointree->quals != NULL && IsA(query->jointree->quals, OpExpr))
+				op = (OpExpr *) query->jointree->quals;
+		}
+		else
+		{
+			ListCell *l;
+			foreach (l, query->jointree->fromlist)
+			{
+				Node *jtnode = (Node *) lfirst(l);
+				JoinExpr *join = NULL;
+				if (IsA(jtnode, JoinExpr))
+				{
+					join = castNode(JoinExpr, jtnode);
+#if PG13_LT
+					if (join->usingClause != NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("invalid continuous aggregate view"),
+								 errdetail(
+									 "joins with using clause in continuous aggregate definition"
+									 " work for Postgres versions 13 and above")));
+#endif
+					jointype = join->jointype;
+					op = (OpExpr *) join->quals;
+					rte = list_nth(query->rtable, ((RangeTblRef *) join->larg)->rtindex - 1);
+					rte_other = list_nth(query->rtable, ((RangeTblRef *) join->rarg)->rtindex - 1);
+				}
+			}
+		}
+
+		/*
+		 * Cagg with joins does not support hierarchical caggs in from clause.
+		 */
+		if (rte->relkind == RELKIND_VIEW || rte_other->relkind == RELKIND_VIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("joins for hierarchical continuous aggregates are not supported")));
+
+		/*
+		 * Error out if there is aynthing else than one normal table and one hypertable
+		 * in the from clause, e.g. sub-query
+		 */
+		if (((rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_VIEW) ||
+			 rte->tablesample || rte->inh == false) ||
+			((rte_other->relkind != RELKIND_RELATION && rte_other->relkind != RELKIND_VIEW) ||
+			 rte_other->tablesample || rte_other->inh == false) ||
+			(ts_is_hypertable(rte->relid) == ts_is_hypertable(rte_other->relid)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("invalid continuous aggregate view"),
+					 errdetail("from clause can only have one hypertable and one normal table")));
+
+		/* Only inner joins are allowed */
+		if (jointype != JOIN_INNER)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("only inner joins are supported in continuous aggregates")));
+
+		/* Only equality conditions are permitted on joins */
+		if (op && IsA(op, OpExpr) &&
+			list_length(castNode(OpExpr, op)->args) == CONTINUOUS_AGG_MAX_JOIN_RELATIONS)
+		{
+			Oid left_type = exprType(linitial(op->args));
+			Oid right_type = exprType(lsecond(op->args));
+			if (!ts_is_equality_operator(op->opno, left_type, right_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("invalid continuous aggregate view"),
+						 errdetail(
+							 "only equality conditions are supported in continuous aggregates")));
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("invalid continuous aggregate view"),
+					 errdetail("unsupported expression in join clause"),
+					 errhint("only equality condition is supported")));
+		/*
+		 * Record the table oid of the normal table, this is required so
+		 * that we know which one is hypertable to carry out the related
+		 * processing in later parts of code.
+		 */
+		normal_table_id = ts_is_hypertable(rte->relid) ? rte_other->relid : rte->relid;
+		if (normal_table_id == rte->relid)
+			rte = rte_other;
+	}
+	else
+	{
+		/* check if we have a hypertable in the FROM clause */
+		rtref = linitial_node(RangeTblRef, query->jointree->fromlist);
+		rte = list_nth(query->rtable, rtref->rtindex - 1);
+	}
 	/* FROM only <tablename> sets rte->inh to false */
-	if (rte->relkind != RELKIND_RELATION || rte->tablesample || rte->inh == false)
+	if (rte->rtekind != RTE_JOIN)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("invalid continuous aggregate view")));
+		if ((rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_VIEW) ||
+			rte->tablesample || rte->inh == false)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("invalid continuous aggregate view")));
 	}
-	if (rte->relkind == RELKIND_RELATION)
+
+	if (rte->relkind == RELKIND_RELATION || rte->relkind == RELKIND_VIEW)
 	{
 		const Dimension *part_dimension = NULL;
+		int32 parent_mat_hypertable_id = INVALID_HYPERTABLE_ID;
 
-		ht = ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_NONE, &hcache);
+		if (rte->relkind == RELKIND_RELATION)
+			ht = ts_hypertable_cache_get_cache_and_entry(rte->relid, CACHE_FLAG_NONE, &hcache);
+		else
+		{
+			cagg_parent = ts_continuous_agg_find_by_relid(rte->relid);
+
+			if (!cagg_parent)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("invalid continuous aggregate query"),
+						 errhint("continuous aggregate needs to query hypertable or another "
+								 "continuous aggregate")));
+			}
+
+			if (!ContinuousAggIsFinalized(cagg_parent))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("old format of continuous aggregate is not supported"),
+						 errhint("Run \"CALL cagg_migrate('%s.%s');\" to migrate to the new "
+								 "format.",
+								 NameStr(cagg_parent->data.user_view_schema),
+								 NameStr(cagg_parent->data.user_view_name))));
+			}
+
+			parent_mat_hypertable_id = cagg_parent->data.mat_hypertable_id;
+			hcache = ts_hypertable_cache_pin();
+			ht = ts_hypertable_cache_get_entry_by_id(hcache, cagg_parent->data.mat_hypertable_id);
+
+			/* if parent cagg is nested then we should get the matht otherwise the rawht*/
+			if (ContinuousAggIsNested(cagg_parent))
+				ht_parent =
+					ts_hypertable_cache_get_entry_by_id(hcache,
+														cagg_parent->data.mat_hypertable_id);
+			else
+				ht_parent =
+					ts_hypertable_cache_get_entry_by_id(hcache,
+														cagg_parent->data.raw_hypertable_id);
+
+			/* get the querydef for the source cagg */
+			is_nested = true;
+			prev_query = ts_continuous_agg_get_query(cagg_parent);
+		}
 
 		if (TS_HYPERTABLE_IS_INTERNAL_COMPRESSION_TABLE(ht))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("hypertable is an internal compressed hypertable")));
 
-		/* there can only be one continuous aggregate per table */
-		switch (ts_continuous_agg_hypertable_status(ht->fd.id))
+		if (rte->relkind == RELKIND_RELATION)
 		{
-			case HypertableIsMaterialization:
-			case HypertableIsMaterializationAndRaw:
+			ContinuousAggHypertableStatus status = ts_continuous_agg_hypertable_status(ht->fd.id);
+
+			/* prevent create a CAGG over an existing materialization hypertable */
+			if (status == HypertableIsMaterialization ||
+				status == HypertableIsMaterializationAndRaw)
+			{
+				const ContinuousAgg *cagg = ts_continuous_agg_find_by_mat_hypertable_id(ht->fd.id);
+				Assert(cagg != NULL);
+
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("hypertable is a continuous aggregate materialization table")));
-			case HypertableIsRawTable:
-				break;
-			case HypertableIsNotContinuousAgg:
-				break;
-			default:
-				Assert(false);
+						 errmsg("hypertable is a continuous aggregate materialization table"),
+						 errdetail("Materialization hypertable \"%s.%s\".",
+								   NameStr(ht->fd.schema_name),
+								   NameStr(ht->fd.table_name)),
+						 errhint("Do you want to use continuous aggregate \"%s.%s\" instead?",
+								 NameStr(cagg->data.user_view_schema),
+								 NameStr(cagg->data.user_view_name))));
+			}
 		}
 
 		/* get primary partitioning column information */
@@ -1144,7 +1424,8 @@ cagg_validate_query(Query *query, bool finalized)
 					 errmsg("custom partitioning functions not supported"
 							" with continuous aggregates")));
 
-		if (IS_INTEGER_TYPE(ts_dimension_get_partition_type(part_dimension)))
+		if (IS_INTEGER_TYPE(ts_dimension_get_partition_type(part_dimension)) &&
+			rte->relkind == RELKIND_RELATION)
 		{
 			const char *funcschema = NameStr(part_dimension->fd.integer_now_func_schema);
 			const char *funcname = NameStr(part_dimension->fd.integer_now_func);
@@ -1159,29 +1440,130 @@ cagg_validate_query(Query *query, bool finalized)
 						 errhint("Set a custom time function on the hypertable.")));
 		}
 
-		caggtimebucketinfo_init(&ret,
+		caggtimebucketinfo_init(&bucket_info,
 								ht->fd.id,
 								ht->main_table_relid,
 								part_dimension->column_attno,
 								part_dimension->fd.column_type,
-								part_dimension->fd.interval_length);
+								part_dimension->fd.interval_length,
+								parent_mat_hypertable_id);
+
+		if (is_nested)
+		{
+			const Dimension *part_dimension_parent =
+				hyperspace_get_open_dimension(ht_parent->space, 0);
+
+			caggtimebucketinfo_init(&bucket_info_parent,
+									ht_parent->fd.id,
+									ht_parent->main_table_relid,
+									part_dimension_parent->column_attno,
+									part_dimension_parent->fd.column_type,
+									part_dimension_parent->fd.interval_length,
+									INVALID_HYPERTABLE_ID);
+		}
 
 		ts_cache_release(hcache);
 	}
 
-	/*check row security settings for the table */
+	/* check row security settings for the table */
 	if (ts_has_row_security(rte->relid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot create continuous aggregate on hypertable with row security")));
 
-	/* we need a GROUP By clause with time_bucket on the partitioning
+	/*
+	 * We need a GROUP By clause with time_bucket on the partitioning
 	 * column of the hypertable
 	 */
 	Assert(query->groupClause);
+	caggtimebucket_validate(&bucket_info, query->groupClause, query->targetList);
 
-	caggtimebucket_validate(&ret, query->groupClause, query->targetList);
-	return ret;
+	/* nested cagg validations */
+	if (is_nested)
+	{
+		int64 bucket_width = 0, bucket_width_parent = 0;
+		bool is_greater_or_equal_than_parent = true, is_multiple_of_parent = true;
+
+		Assert(prev_query->groupClause);
+		caggtimebucket_validate(&bucket_info_parent,
+								prev_query->groupClause,
+								prev_query->targetList);
+
+		/* cannot create cagg with fixed bucket on top of variable bucket */
+		if ((bucket_info_parent.bucket_width == BUCKET_WIDTH_VARIABLE &&
+			 bucket_info.bucket_width != BUCKET_WIDTH_VARIABLE))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot create continuous aggregate with fixed-width bucket on top of "
+							"one using variable-width bucket"),
+					 errdetail("Continuous aggregate with a fixed time bucket width (e.g. 61 days) "
+							   "cannot be created on top of one using variable time bucket width "
+							   "(e.g. 1 month).\n"
+							   "The variance can lead to the fixed width one not being a multiple "
+							   "of the variable width one.")));
+		}
+
+		/* get bucket widths for validation */
+		bucket_width = get_bucket_width(bucket_info);
+		bucket_width_parent = get_bucket_width(bucket_info_parent);
+
+		Assert(bucket_width != 0);
+		Assert(bucket_width_parent != 0);
+
+		/* check if the current bucket is greater or equal than the parent */
+		is_greater_or_equal_than_parent = (bucket_width >= bucket_width_parent);
+
+		/* check if buckets are multiple */
+		if (bucket_width_parent != 0)
+		{
+			if (bucket_width_parent > bucket_width && bucket_width != 0)
+				is_multiple_of_parent = ((bucket_width_parent % bucket_width) == 0);
+			else
+				is_multiple_of_parent = ((bucket_width % bucket_width_parent) == 0);
+		}
+
+		/* proceed with validation errors */
+		if (!is_greater_or_equal_than_parent || !is_multiple_of_parent)
+		{
+			Datum width, width_parent;
+			Oid outfuncid = InvalidOid;
+			bool isvarlena;
+			char *width_out, *width_out_parent;
+			char *message = NULL;
+
+			getTypeOutputInfo(bucket_info.bucket_width_type, &outfuncid, &isvarlena);
+			width = get_bucket_width_datum(bucket_info);
+			width_out = DatumGetCString(OidFunctionCall1(outfuncid, width));
+
+			getTypeOutputInfo(bucket_info_parent.bucket_width_type, &outfuncid, &isvarlena);
+			width_parent = get_bucket_width_datum(bucket_info_parent);
+			width_out_parent = DatumGetCString(OidFunctionCall1(outfuncid, width_parent));
+
+			/* new bucket should be multiple of the parent */
+			if (!is_multiple_of_parent)
+				message = "multiple of";
+
+			/* new bucket should be greater than the parent */
+			if (!is_greater_or_equal_than_parent)
+				message = "greater or equal than";
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot create continuous aggregate with incompatible bucket width"),
+					 errdetail("Time bucket width of \"%s.%s\" [%s] should be %s the time "
+							   "bucket width of \"%s.%s\" [%s].",
+							   cagg_schema,
+							   cagg_name,
+							   width_out,
+							   message,
+							   NameStr(cagg_parent->data.user_view_schema),
+							   NameStr(cagg_parent->data.user_view_name),
+							   width_out_parent)));
+		}
+	}
+
+	return bucket_info;
 }
 
 /* add ts_internal_cagg_final to bytea column.
@@ -1602,8 +1984,7 @@ mattablecolumninfo_addentry(MatTableColumnInfo *out, Node *input, int original_q
 
 /* add internal columns for the materialization table */
 static void
-mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo, RangeTblEntry *usertbl_rte,
-							   int32 usertbl_htid)
+mattablecolumninfo_addinternal(MatTableColumnInfo *matcolinfo)
 {
 	Index maxRef;
 	int colno = list_length(matcolinfo->partial_seltlist) + 1;
@@ -1988,20 +2369,39 @@ finalizequery_init(FinalizeQueryInfo *inp, Query *orig_query, MatTableColumnInfo
  * for the materialization table
  * matcollist - column list for mat table
  * mattbladdress - materialization table ObjectAddress
+ * This is the function responsible for creating the final
+ * structures for selecting from the materialized hypertable
+ * created for the Cagg which is
+ * select * from _timescaldeb_internal._matrialized_hypertable_<xxx>
  */
 static Query *
 finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
-							   ObjectAddress *mattbladdress)
+							   ObjectAddress *mattbladdress, char *relname)
 {
 	Query *final_selquery = NULL;
 	ListCell *lc;
+	FromExpr *fromexpr;
+	RangeTblEntry *rte;
+
 	/*
 	 * for initial cagg creation rtable will have only 1 entry,
 	 * for alter table rtable will have multiple entries with our
 	 * RangeTblEntry as last member.
+	 * For cagg with joins, we need to create a new RTE and jointree
+	 * which contains the information of the materialised hypertable
+	 * that is created for this cagg.
 	 */
-	RangeTblEntry *rte = llast_node(RangeTblEntry, inp->final_userquery->rtable);
-	FromExpr *fromexpr;
+	if (list_length(inp->final_userquery->jointree->fromlist) >= CONTINUOUS_AGG_MAX_JOIN_RELATIONS)
+	{
+		rte = makeNode(RangeTblEntry);
+		rte->alias = makeAlias(relname, NIL);
+		rte->inFromCl = true;
+		rte->inh = true;
+		rte->rellockmode = 1;
+		rte->eref = copyObject(rte->alias);
+	}
+	else
+		rte = llast_node(RangeTblEntry, inp->final_userquery->rtable);
 	rte->relid = mattbladdress->objectId;
 	rte->rtekind = RTE_RELATION;
 	rte->relkind = RELKIND_RELATION;
@@ -2034,13 +2434,31 @@ finalizequery_get_select_query(FinalizeQueryInfo *inp, List *matcollist,
 
 	CAGG_MAKEQUERY(final_selquery, inp->final_userquery);
 	final_selquery->hasAggs = !inp->finalized;
-	final_selquery->rtable = inp->final_userquery->rtable; /* fixed up above */
-	/* fixup from list. No quals on original table should be
-	 * present here - they should be on the query that populates the mattable (partial_selquery)
+	if (list_length(inp->final_userquery->jointree->fromlist) >= CONTINUOUS_AGG_MAX_JOIN_RELATIONS)
+	{
+		RangeTblRef *rtr;
+		final_selquery->rtable = list_make1(rte);
+		rtr = makeNode(RangeTblRef);
+		rtr->rtindex = 1;
+		fromexpr = makeFromExpr(list_make1(rtr), NULL);
+	}
+	else
+	{
+		final_selquery->rtable = inp->final_userquery->rtable;
+		fromexpr = inp->final_userquery->jointree;
+		fromexpr->quals = NULL;
+	}
+
+	/*
+	 * fixup from list. No quals on original table should be
+	 * present here - they should be on the query that populates
+	 * the mattable (partial_selquery). For the Cagg with join,
+	 * we can not copy the fromlist from inp->final_userquery as
+	 * it has two tables in this case.
 	 */
-	Assert(list_length(inp->final_userquery->jointree->fromlist) == 1);
-	fromexpr = inp->final_userquery->jointree;
-	fromexpr->quals = NULL;
+	Assert(list_length(inp->final_userquery->jointree->fromlist) <=
+		   CONTINUOUS_AGG_MAX_JOIN_RELATIONS);
+
 	final_selquery->jointree = fromexpr;
 	final_selquery->targetList = inp->final_seltlist;
 	final_selquery->sortClause = inp->final_userquery->sortClause;
@@ -2160,6 +2578,14 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	bool finalized = DatumGetBool(with_clause_options[ContinuousViewOptionFinalized].parsed);
 
 	finalqinfo.finalized = finalized;
+	if (list_length(panquery->jointree->fromlist) >= CONTINUOUS_AGG_MAX_JOIN_RELATIONS &&
+		!materialized_only)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("real-time continuous aggregates are not supported with joins"),
+				 errhint("set materialized_only to true")));
+	}
 
 	/*
 	 * Assign the column_name aliases in CREATE VIEW to the query. No other modifications to
@@ -2180,10 +2606,7 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	 *         on the user query's table
 	 */
 	if (!finalized)
-	{
-		RangeTblEntry *usertbl_rte = list_nth(panquery->rtable, 0);
-		mattablecolumninfo_addinternal(&mattblinfo, usertbl_rte, origquery_ht->htid);
-	}
+		mattablecolumninfo_addinternal(&mattblinfo);
 
 	/* Step 1: create the materialization table */
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
@@ -2204,8 +2627,10 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 	/* Step 2: create view with select finalize from materialization
 	 * table
 	 */
-	final_selquery =
-		finalizequery_get_select_query(&finalqinfo, mattblinfo.matcollist, &mataddress);
+	final_selquery = finalizequery_get_select_query(&finalqinfo,
+													mattblinfo.matcollist,
+													&mataddress,
+													mat_rel->relname);
 
 	if (!materialized_only)
 		final_selquery = build_union_query(origquery_ht,
@@ -2248,7 +2673,8 @@ cagg_create(const CreateTableAsStmt *create_stmt, ViewStmt *stmt, Query *panquer
 							  materialized_only,
 							  dum_rel->schemaname,
 							  dum_rel->relname,
-							  finalized);
+							  finalized,
+							  origquery_ht->parent_mat_hypertable_id);
 
 	if (origquery_ht->bucket_width == BUCKET_WIDTH_VARIABLE)
 	{
@@ -2333,7 +2759,10 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 				 errhint("Use ALTER MATERIALIZED VIEW to enable compression.")));
 	}
 
-	timebucket_exprinfo = cagg_validate_query((Query *) stmt->into->viewQuery, finalized);
+	timebucket_exprinfo = cagg_validate_query((Query *) stmt->into->viewQuery,
+											  finalized,
+											  get_namespace_name(nspid),
+											  stmt->into->rel->relname);
 	cagg_create(stmt, &viewstmt, (Query *) stmt->query, &timebucket_exprinfo, with_clause_options);
 
 	if (!stmt->into->skipData)
@@ -2373,7 +2802,7 @@ tsl_process_continuous_agg_viewstmt(Node *node, const char *query_string, void *
 								   ts_time_get_min(refresh_window.type);
 		refresh_window.end = ts_time_get_noend_or_max(refresh_window.type);
 
-		continuous_agg_refresh_internal(cagg, &refresh_window, CAGG_REFRESH_CREATION);
+		continuous_agg_refresh_internal(cagg, &refresh_window, CAGG_REFRESH_CREATION, true, true);
 	}
 	return DDL_DONE;
 }
@@ -2438,16 +2867,20 @@ cagg_rebuild_view_definition(ContinuousAgg *agg, Hypertable *mat_ht)
 	Relation direct_view_rel = relation_open(direct_view_oid, AccessShareLock);
 	Query *direct_query = copyObject(get_view_query(direct_view_rel));
 	remove_old_and_new_rte_from_query(direct_query);
-	CAggTimebucketInfo timebucket_exprinfo = cagg_validate_query(direct_query, finalized);
+	CAggTimebucketInfo timebucket_exprinfo =
+		cagg_validate_query(direct_query,
+							finalized,
+							NameStr(agg->data.user_view_schema),
+							NameStr(agg->data.user_view_name));
 
 	mattablecolumninfo_init(&mattblinfo, copyObject(direct_query->groupClause));
 	fqi.finalized = finalized;
 	finalizequery_init(&fqi, direct_query, &mattblinfo);
 
-	RangeTblEntry *usertbl_rte = list_nth(direct_query->rtable, 0);
-	mattablecolumninfo_addinternal(&mattblinfo, usertbl_rte, 0);
+	mattablecolumninfo_addinternal(&mattblinfo);
 
-	Query *view_query = finalizequery_get_select_query(&fqi, mattblinfo.matcollist, &mataddress);
+	Query *view_query =
+		finalizequery_get_select_query(&fqi, mattblinfo.matcollist, &mataddress, relname);
 
 	if (!agg->data.materialized_only)
 		view_query = build_union_query(&timebucket_exprinfo,
@@ -2575,7 +3008,11 @@ cagg_flip_realtime_view_definition(ContinuousAgg *agg, Hypertable *mat_ht)
 	relation_close(direct_view_rel, NoLock);
 	remove_old_and_new_rte_from_query(direct_query);
 
-	CAggTimebucketInfo timebucket_exprinfo = cagg_validate_query(direct_query, agg->data.finalized);
+	CAggTimebucketInfo timebucket_exprinfo =
+		cagg_validate_query(direct_query,
+							agg->data.finalized,
+							NameStr(agg->data.user_view_schema),
+							NameStr(agg->data.user_view_name));
 
 	/* flip */
 	agg->data.materialized_only = !agg->data.materialized_only;

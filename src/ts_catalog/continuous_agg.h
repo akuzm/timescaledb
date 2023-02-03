@@ -8,6 +8,7 @@
 #define TIMESCALEDB_CONTINUOUS_AGG_H
 #include <postgres.h>
 #include <catalog/pg_type.h>
+#include <nodes/parsenodes.h>
 
 #include "ts_catalog/catalog.h"
 #include "chunk.h"
@@ -121,6 +122,12 @@ ContinuousAggIsFinalized(const ContinuousAgg *cagg)
 	return (cagg->data.finalized == true);
 }
 
+static inline bool
+ContinuousAggIsNested(const ContinuousAgg *cagg)
+{
+	return (cagg->data.parent_mat_hypertable_id != INVALID_HYPERTABLE_ID);
+}
+
 typedef enum ContinuousAggHypertableStatus
 {
 	HypertableIsNotContinuousAgg = 0,
@@ -213,5 +220,7 @@ ts_compute_circumscribed_bucketed_refresh_window_variable(int64 *start, int64 *e
 														  const ContinuousAggsBucketFunction *bf);
 extern TSDLLEXPORT int64 ts_compute_beginning_of_the_next_bucket_variable(
 	int64 timeval, const ContinuousAggsBucketFunction *bf);
+
+extern TSDLLEXPORT Query *ts_continuous_agg_get_query(ContinuousAgg *cagg);
 
 #endif /* TIMESCALEDB_CONTINUOUS_AGG_H */

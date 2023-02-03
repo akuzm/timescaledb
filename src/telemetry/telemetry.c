@@ -8,6 +8,7 @@
 #include <fmgr.h>
 #include <miscadmin.h>
 #include <commands/extension.h>
+#include <storage/ipc.h>
 #include <catalog/pg_collation.h>
 #include <utils/builtins.h>
 #include <utils/json.h>
@@ -234,7 +235,7 @@ ts_check_version_response(const char *json)
 	{
 		if (!ts_validate_server_version(json, &result))
 		{
-			elog(WARNING, "server did not return a valid TimescaleDB version: %s", result.errhint);
+			elog(NOTICE, "server did not return a valid TimescaleDB version: %s", result.errhint);
 			return;
 		}
 
@@ -330,36 +331,35 @@ add_errors_by_sqlerrcode(JsonbParseState *parse_state)
 	StringInfo command;
 	MemoryContext old_context = CurrentMemoryContext, spi_context;
 
-	const char *command_string =
-		"SELECT "
-		"job_type, jsonb_object_agg(sqlerrcode, count) "
-		"FROM"
-		"("
-		"	SELECT ("
-		"		CASE "
-		"			WHEN error_data ->> \'proc_schema\' = \'_timescaledb_internal\'"
-		" 			AND error_data ->> \'proc_name\' ~ "
-		"\'^policy_(retention|compression|reorder|refresh_continuous_"
-		"aggregate|telemetry|job_error_retention)$\' "
-		"			THEN error_data ->> \'proc_name\' "
-		"			ELSE \'user_defined_action\'"
-		"		END"
-		"	) as job_type, "
-		"	error_data ->> \'sqlerrcode\' as sqlerrcode, "
-		"	pg_catalog.COUNT(*) "
-		"	FROM "
-		"	_timescaledb_internal.job_errors "
-		"	WHERE error_data ->> \'sqlerrcode\' IS NOT NULL "
-		"	GROUP BY job_type, error_data->> \'sqlerrcode\' "
-		"	ORDER BY job_type"
-		") q "
-		"GROUP BY q.job_type";
+	const char *command_string = "SELECT "
+								 "job_type, jsonb_object_agg(sqlerrcode, count) "
+								 "FROM"
+								 "("
+								 "	SELECT ("
+								 "		CASE "
+								 "			WHEN proc_schema = \'_timescaledb_internal\'"
+								 " 			AND proc_name ~ "
+								 "\'^policy_(retention|compression|reorder|refresh_continuous_"
+								 "aggregate|telemetry|job_error_retention)$\' "
+								 "			THEN proc_name "
+								 "			ELSE \'user_defined_action\'"
+								 "		END"
+								 "	) as job_type, "
+								 "	sqlerrcode, "
+								 "	pg_catalog.COUNT(*) "
+								 "	FROM "
+								 "	timescaledb_information.job_errors "
+								 "	WHERE sqlerrcode IS NOT NULL "
+								 "	GROUP BY job_type, sqlerrcode "
+								 "	ORDER BY job_type"
+								 ") q "
+								 "GROUP BY q.job_type";
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 
-	/* SPI calls must be qualified otherwise they are unsafe */
-	res = SPI_exec("SET search_path TO pg_catalog, pg_temp", 0);
+	/* Lock down search_path */
+	res = SPI_exec("SET LOCAL search_path TO pg_catalog, pg_temp", 0);
 	if (res < 0)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), (errmsg("could not set search_path"))));
 
@@ -397,7 +397,6 @@ add_errors_by_sqlerrcode(JsonbParseState *parse_state)
 		old_context = MemoryContextSwitchTo(spi_context);
 	}
 
-	res = SPI_exec("RESET search_path", 0);
 	res = SPI_finish();
 
 	Assert(res == SPI_OK_FINISH);
@@ -461,8 +460,8 @@ add_job_stats_by_job_type(JsonbParseState *parse_state)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 
-	/* SPI calls must be qualified otherwise they are unsafe */
-	res = SPI_exec("SET search_path TO pg_catalog, pg_temp", 0);
+	/* Lock down search_path */
+	res = SPI_exec("SET LOCAL search_path TO pg_catalog, pg_temp", 0);
 	if (res < 0)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), (errmsg("could not set search_path"))));
 
@@ -524,7 +523,6 @@ add_job_stats_by_job_type(JsonbParseState *parse_state)
 		add_job_stats_internal(parse_state, TextDatumGetCString(jobtype_datum), &stats);
 		old_context = MemoryContextSwitchTo(spi_context);
 	}
-	res = SPI_exec("RESET search_path", 0);
 	res = SPI_finish();
 	Assert(res == SPI_OK_FINISH);
 }
@@ -609,6 +607,7 @@ format_iso8601(Datum value)
 #define REQ_RELKIND_CAGG_ON_DISTRIBUTED_HYPERTABLE_COUNT "num_caggs_on_distributed_hypertables"
 #define REQ_RELKIND_CAGG_USES_REAL_TIME_AGGREGATION_COUNT "num_caggs_using_real_time_aggregation"
 #define REQ_RELKIND_CAGG_FINALIZED "num_caggs_finalized"
+#define REQ_RELKIND_CAGG_NESTED "num_caggs_nested"
 
 static JsonbValue *
 add_compression_stats_object(JsonbParseState *parse_state, StatsRelType reltype,
@@ -702,6 +701,7 @@ add_relkind_stats_object(JsonbParseState *parse_state, const char *relkindname,
 						   REQ_RELKIND_CAGG_USES_REAL_TIME_AGGREGATION_COUNT,
 						   cs->uses_real_time_aggregation_count);
 		ts_jsonb_add_int64(parse_state, REQ_RELKIND_CAGG_FINALIZED, cs->finalized);
+		ts_jsonb_add_int64(parse_state, REQ_RELKIND_CAGG_NESTED, cs->nested);
 	}
 
 	return pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL);
@@ -995,37 +995,41 @@ ts_build_version_request(const char *host, const char *path)
 	return req;
 }
 
+static ConnectionType
+connection_type(const char *service)
+{
+	if (strcmp("http", service) == 0)
+		return CONNECTION_PLAIN;
+	else if (strcmp("https", service) == 0)
+		return CONNECTION_SSL;
+
+	ereport(NOTICE,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("scheme \"%s\" not supported for telemetry", service)));
+	return _CONNECTION_MAX;
+}
+
 Connection *
 ts_telemetry_connect(const char *host, const char *service)
 {
-	Connection *conn = NULL;
-	int ret;
+	Connection *conn = ts_connection_create(connection_type(service));
 
-	if (strcmp("http", service) == 0)
-		conn = ts_connection_create(CONNECTION_PLAIN);
-	else if (strcmp("https", service) == 0)
-		conn = ts_connection_create(CONNECTION_SSL);
-	else
-		ereport(WARNING,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("scheme \"%s\" not supported for telemetry", service)));
-
-	if (conn == NULL)
-		return NULL;
-
-	ret = ts_connection_connect(conn, host, service, 0);
-
-	if (ret < 0)
+	if (conn)
 	{
-		const char *errstr = ts_connection_get_and_clear_error(conn);
+		int ret = ts_connection_connect(conn, host, service, 0);
 
-		ts_connection_destroy(conn);
-		conn = NULL;
+		if (ret < 0)
+		{
+			const char *errstr = ts_connection_get_and_clear_error(conn);
 
-		ereport(WARNING,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("telemetry could not connect to \"%s\"", host),
-				 errdetail("%s", errstr)));
+			ts_connection_destroy(conn);
+			conn = NULL;
+
+			ereport(NOTICE,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("telemetry could not connect to \"%s\"", host),
+					 errdetail("%s", errstr)));
+		}
 	}
 
 	return conn;
@@ -1084,13 +1088,13 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 
 	if (err != HTTP_ERROR_NONE)
 	{
-		elog(WARNING, "telemetry error: %s", ts_http_strerror(err));
+		elog(NOTICE, "telemetry error: %s", ts_http_strerror(err));
 		goto cleanup;
 	}
 
 	if (!ts_http_response_state_valid_status(rsp))
 	{
-		elog(WARNING,
+		elog(NOTICE,
 			 "telemetry got unexpected HTTP response status: %d",
 			 ts_http_response_state_status_code(rsp));
 		goto cleanup;
@@ -1111,7 +1115,7 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 	{
 		/* If the response is malformed, ts_check_version_response() will
 		 * throw an error, so we capture the error here and print debugging
-		 * information before re-throwing the error. */
+		 * information. */
 		ereport(NOTICE,
 				(errmsg("malformed telemetry response body"),
 				 errdetail("host=%s, service=%s, path=%s: %s",
@@ -1119,7 +1123,12 @@ ts_telemetry_main(const char *host, const char *path, const char *service)
 						   service,
 						   path,
 						   json ? json : "<EMPTY>")));
-		PG_RE_THROW();
+		/* Do not throw an error in this case, there is really nothing wrong
+		   with the system. It's only telemetry that is having problems, so we
+		   just wrap this up and exit. */
+		if (started)
+			AbortCurrentTransaction();
+		return false;
 	}
 	PG_END_TRY();
 

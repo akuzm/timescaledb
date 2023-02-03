@@ -73,9 +73,12 @@ bool ts_guc_enable_constraint_exclusion = true;
 bool ts_guc_enable_qual_propagation = true;
 bool ts_guc_enable_cagg_reorder_groupby = true;
 bool ts_guc_enable_now_constify = true;
+bool ts_guc_enable_osm_reads = true;
 TSDLLEXPORT bool ts_guc_enable_transparent_decompression = true;
 bool ts_guc_enable_per_data_node_queries = true;
+bool ts_guc_enable_parameterized_data_node_scan = true;
 bool ts_guc_enable_async_append = true;
+TSDLLEXPORT bool ts_guc_enable_compression_indexscan = true;
 TSDLLEXPORT bool ts_guc_enable_skip_scan = true;
 int ts_guc_max_open_chunks_per_insert = 10;
 int ts_guc_max_cached_chunks_per_hypertable = 10;
@@ -292,6 +295,31 @@ _guc_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("timescaledb.enable_parameterized_data_node_scan",
+							 "Enable parameterized data node scans",
+							 "Disable this as a workaround in case these plans are incorrectly "
+							 "chosen "
+							 "by the query planner when they are suboptimal",
+							 &ts_guc_enable_parameterized_data_node_scan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("timescaledb.enable_tiered_reads",
+							 "Enable tiered data reads",
+							 "Enable reading of tiered data by including a foreign table "
+							 "representing the data in the object storage into the query plan",
+							 &ts_guc_enable_osm_reads,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomIntVariable("timescaledb.max_insert_batch_size",
 							"The max number of tuples to batch before sending to a data node",
 							"When acting as a access node, TimescaleDB splits batches of "
@@ -367,6 +395,17 @@ _guc_init(void)
 							 "Enable getting and showing EXPLAIN output from remote nodes",
 							 &ts_guc_enable_remote_explain,
 							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("timescaledb.enable_compression_indexscan",
+							 "Enable compression to take indexscan path",
+							 "Enable indexscan during compression, if matching index is found",
+							 &ts_guc_enable_compression_indexscan,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL,

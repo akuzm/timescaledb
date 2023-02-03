@@ -25,8 +25,8 @@
 #include "guc.h"
 #include "hypercube.h"
 #include "hypertable.h"
-#include "nodes/chunk_dispatch.h"
-#include "nodes/chunk_insert_state.h"
+#include "nodes/chunk_dispatch/chunk_dispatch.h"
+#include "nodes/chunk_dispatch/chunk_insert_state.h"
 #include "partitioning.h"
 #include "remote/connection_cache.h"
 #include "remote/dist_txn.h"
@@ -1345,6 +1345,7 @@ remote_copy_process_and_send_data(RemoteCopyContext *context)
 	for (int row_in_batch = 0; row_in_batch < n; row_in_batch++)
 	{
 		Point *point = context->batch_points[row_in_batch];
+		bool found;
 
 		Chunk *chunk = ts_hypertable_find_chunk_for_point(ht, point);
 		if (chunk == NULL)
@@ -1360,16 +1361,42 @@ remote_copy_process_and_send_data(RemoteCopyContext *context)
 				end_copy_on_success(&context->connection_state);
 				did_end_copy = true;
 			}
-			chunk = ts_hypertable_create_chunk_for_point(ht, point);
+			chunk = ts_hypertable_create_chunk_for_point(ht, point, &found);
+		}
+		else
+			found = true;
+
+		/* get the filtered list of "available" DNs for this chunk but only if it's replicated */
+		if (found && ht->fd.replication_factor > 1)
+		{
+			List *chunk_data_nodes =
+				ts_chunk_data_node_scan_by_chunk_id_filter(chunk->fd.id, CurrentMemoryContext);
+
+			/*
+			 * If the chunk was not created as part of this insert, we need to check whether any
+			 * of the chunk's data nodes are currently unavailable and in that case consider the
+			 * chunk stale on those data nodes. Do that by removing the AN's chunk-datanode
+			 * mapping for the unavailable data nodes.
+			 *
+			 * Note that the metadata will only get updated once since we assign the chunk's
+			 * data_node list to the list of available DNs the first time this
+			 * dist_update_stale_chunk_metadata API gets called. So both chunk_data_nodes and
+			 * chunk->data_nodes will point to the same list and no subsequent metadata updates will
+			 * occur.
+			 */
+			if (ht->fd.replication_factor > list_length(chunk_data_nodes))
+				ts_cm_functions->dist_update_stale_chunk_metadata(chunk, chunk_data_nodes);
+
+			list_free(chunk_data_nodes);
 		}
 
 		/*
 		 * For remote copy, we don't use chunk insert states on the AN.
-		 * So we need to explicitly set the chunk as unordered when copies
+		 * So we need to explicitly set the chunk as partial when copies
 		 * are directed to previously compressed chunks.
 		 */
-		if (ts_chunk_is_compressed(chunk) && (!ts_chunk_is_unordered(chunk)))
-			ts_chunk_set_unordered(chunk);
+		if (ts_chunk_is_compressed(chunk) && (!ts_chunk_is_partial(chunk)))
+			ts_chunk_set_partial(chunk);
 
 		/*
 		 * Schedule the row for sending to the data nodes containing the chunk.

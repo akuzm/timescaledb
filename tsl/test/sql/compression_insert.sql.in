@@ -499,7 +499,7 @@ DROP trigger t4_constraint ON trigger_test;
 -- now add a new column to the table and insert into a new chunk
 ALTER TABLE trigger_test ADD COLUMN addcolv varchar(10);
 ALTER TABLE trigger_test ADD COLUMN addcoli integer;
-INSERT INTO trigger_test(time, device, value, addcolv, addcoli) 
+INSERT INTO trigger_test(time, device, value, addcolv, addcoli)
 VALUES ( '2010-01-01', 10, 10, 'ten', 222);
 SELECT compress_chunk(c, true) FROM show_chunks('trigger_test') c;
 
@@ -541,10 +541,9 @@ INSERT INTO test_ordering VALUES (105),(104),(103);
 INSERT INTO test_ordering VALUES (21), (22),(113);
 SELECT count(*) FROM test_ordering;
 INSERT INTO test_ordering VALUES (106) RETURNING *;
--- insert into compressed chunk does not support RETURNING
-\set ON_ERROR_STOP 0
-INSERT INTO test_ordering VALUES (23), (24),(115) RETURNING *;
-\set ON_ERROR_STOP 1
+-- insert into compressed chunk does support RETURNING
+INSERT INTO test_ordering VALUES (23), (24), (115) RETURNING *;
+INSERT INTO test_ordering VALUES (23), (24), (115) RETURNING tableoid::regclass, *;
 
 SELECT compress_chunk(format('%I.%I',chunk_schema,chunk_name), true) FROM timescaledb_information.chunks WHERE hypertable_name = 'test_ordering';
 

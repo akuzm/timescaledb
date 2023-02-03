@@ -105,7 +105,7 @@ CREATE TABLE underreplicated(time timestamptz, device int, temp float);
 -- can't create an under-replicated hypertable
 SELECT * FROM create_hypertable('underreplicated', 'time', replication_factor => 4);
 \set ON_ERROR_STOP 1
--- can create under-replicated hypertable byf force detaching a data node
+
 RESET ROLE;
 SELECT node_name, database, node_created, database_created, extension_created
 FROM add_data_node(:'DATA_NODE_4', host => 'localhost', database => :'DATA_NODE_4');
@@ -114,10 +114,25 @@ GRANT CREATE ON SCHEMA public TO :ROLE_1;
 SET ROLE :ROLE_1;
 SELECT * FROM create_hypertable('underreplicated', 'time', replication_factor => 4);
 
+-- test that attaching a data node to an existing hypertable with
+-- repartition=>false does not change the number of partitions when
+-- number of partitions is greater than number of data nodes.
+SELECT * FROM set_number_partitions('disttable', 8, 'device');
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+SELECT attach_data_node(:'DATA_NODE_4', 'disttable', repartition => false);
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+
 --create new session to clear out connections
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
-SELECT * FROM delete_data_node(:'DATA_NODE_4', force => true, drop_database => true);
+SELECT * FROM delete_data_node(:'DATA_NODE_4', force => true, drop_database => true, repartition => false);
 SET ROLE :ROLE_1;
+-- Deleting a data node should also not change the number of
+-- partitions with repartition=>false
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+
+-- reset to 3 partitions
+SELECT * FROM set_number_partitions('disttable', 3, 'device');
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
 
 CREATE OR REPLACE FUNCTION test_trigger()
     RETURNS TRIGGER LANGUAGE PLPGSQL AS
@@ -1433,7 +1448,7 @@ $$);
 
 DROP TABLE disttable_serial;
 
--- Test insert batching case which will hit the limit of arguments for 
+-- Test insert batching case which will hit the limit of arguments for
 -- prepared statements (65k).
 --
 -- Issue: #1702
@@ -1515,7 +1530,7 @@ CREATE TABLE test_1702 (
 	dummy68	int	,
 	dummy69	int	,
 	dummy70	int	,
-	dummy71	int	
+	dummy71	int
 );
 
 SELECT create_distributed_hypertable('test_1702', 'time', 'id');
@@ -1601,8 +1616,8 @@ SELECT * FROM create_distributed_hypertable('dist_hypertable_1', 'time', 'device
 DROP TABLE disttable;
 
 CREATE TABLE disttable(
-    time timestamptz NOT NULL, 
-    device int, 
+    time timestamptz NOT NULL,
+    device int,
     value float
 );
 SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device', 3);
@@ -1836,7 +1851,7 @@ SELECT * FROM disttable ORDER BY 1;
 
 -- Check distributed hypertable within procedure properly drops remote tables
 --
--- #3663 
+-- #3663
 --
 CREATE TABLE test (time timestamp, v int);
 SELECT create_distributed_hypertable('test','time');
@@ -2066,7 +2081,7 @@ insert into pruned_chunks_2 select * from pruned_chunks_1 WHERE time > '2022-01-
 -- TEST freeze_chunk api. does not work for distributed chunks
 SELECT chunk_schema || '.' ||  chunk_name as "CHNAME"
 FROM timescaledb_information.chunks
-WHERE hypertable_name = 'pruned_chunks_1' 
+WHERE hypertable_name = 'pruned_chunks_1'
 ORDER BY chunk_name LIMIT 1
 \gset
 

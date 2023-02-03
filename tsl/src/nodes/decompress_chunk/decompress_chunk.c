@@ -21,6 +21,7 @@
 
 #include <planner.h>
 
+#include "compat/compat.h"
 #include "ts_catalog/hypertable_compression.h"
 #include "import/planner.h"
 #include "compression/create.h"
@@ -384,6 +385,10 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 
 	Assert(chunk->fd.compressed_chunk_id > 0);
 
+	Path *uncompressed_path = chunk_rel->pathlist ? (Path *) linitial(chunk_rel->pathlist) : NULL;
+	Path *uncompressed_partial_path =
+		chunk_rel->partial_pathlist ? (Path *) linitial(chunk_rel->partial_pathlist) : NULL;
+	Assert(uncompressed_path);
 	chunk_rel->pathlist = NIL;
 	chunk_rel->partial_pathlist = NIL;
 
@@ -393,7 +398,11 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 
 	compressed_rel->consider_parallel = chunk_rel->consider_parallel;
 	/* translate chunk_rel->baserestrictinfo */
-	pushdown_quals(root, chunk_rel, compressed_rel, info->hypertable_compression_info);
+	pushdown_quals(root,
+				   chunk_rel,
+				   compressed_rel,
+				   info->hypertable_compression_info,
+				   ts_chunk_is_partial(chunk));
 	set_baserel_size_estimates(root, compressed_rel);
 	new_row_estimate = compressed_rel->rows * DECOMPRESS_CHUNK_BATCH_SIZE;
 
@@ -423,17 +432,17 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 	foreach (lc, compressed_rel->pathlist)
 	{
 		Path *child_path = lfirst(lc);
-		DecompressChunkPath *path;
+		Path *path;
 
 		/*
-		 * We skip any BitmapScan paths here as supporting those
-		 * would require fixing up the internal scan. Since we
+		 * We skip any BitmapScan parameterized paths here as supporting
+		 * those would require fixing up the internal scan. Since we
 		 * currently do not do this BitmapScans would be generated
 		 * when we have a parameterized path on a compressed column
 		 * that would have invalid references due to our
 		 * EquivalenceClasses.
 		 */
-		if (IsA(child_path, BitmapHeapPath))
+		if (IsA(child_path, BitmapHeapPath) && child_path->param_info)
 			continue;
 
 		/*
@@ -503,7 +512,7 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 				continue;
 		}
 
-		path = decompress_chunk_path_create(root, info, 0, child_path);
+		path = (Path *) decompress_chunk_path_create(root, info, 0, child_path);
 
 		/* If we can push down the sort below the DecompressChunk node, we set the pathkeys of the
 		 * decompress node to the query pathkeys, while remembering the compressed_pathkeys
@@ -540,9 +549,24 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 			add_path(chunk_rel, &dcpath->cpath.path);
 		}
 
+		/*
+		 * If this is a partially compressed chunk we have to combine data
+		 * from compressed and uncompressed chunk.
+		 */
+		if (ts_chunk_is_partial(chunk))
+			path = (Path *) create_append_path_compat(root,
+													  chunk_rel,
+													  list_make2(path, uncompressed_path),
+													  NIL /* partial paths */,
+													  NIL /* pathkeys */,
+													  PATH_REQ_OUTER(uncompressed_path),
+													  0,
+													  false,
+													  false,
+													  path->rows + uncompressed_path->rows);
 		/* this has to go after the path is copied for the ordered path since path can get freed in
 		 * add_path */
-		add_path(chunk_rel, &path->cpath.path);
+		add_path(chunk_rel, path);
 	}
 	/* the chunk_rel now owns the paths, remove them from the compressed_rel so they can't be freed
 	 * if it's planned */
@@ -553,14 +577,31 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 		foreach (lc, compressed_rel->partial_pathlist)
 		{
 			Path *child_path = lfirst(lc);
-			DecompressChunkPath *path;
+			Path *path;
 			if (child_path->param_info != NULL &&
 				(bms_is_member(chunk_rel->relid, child_path->param_info->ppi_req_outer) ||
 				 (!info->single_chunk &&
 				  bms_is_member(ht_relid, child_path->param_info->ppi_req_outer))))
 				continue;
-			path = decompress_chunk_path_create(root, info, parallel_workers, child_path);
-			add_partial_path(chunk_rel, &path->cpath.path);
+
+			/*
+			 * If this is a partially compressed chunk we have to combine data
+			 * from compressed and uncompressed chunk.
+			 */
+			path = (Path *) decompress_chunk_path_create(root, info, parallel_workers, child_path);
+			if (ts_chunk_is_partial(chunk) && uncompressed_partial_path)
+				path =
+					(Path *) create_append_path_compat(root,
+													   chunk_rel,
+													   NIL,
+													   list_make2(path, uncompressed_partial_path),
+													   NIL /* pathkeys */,
+													   PATH_REQ_OUTER(uncompressed_partial_path),
+													   parallel_workers,
+													   false,
+													   NIL,
+													   path->rows + uncompressed_path->rows);
+			add_partial_path(chunk_rel, path);
 		}
 		/* the chunk_rel now owns the paths, remove them from the compressed_rel so they can't be
 		 * freed if it's planned */
@@ -568,6 +609,9 @@ ts_decompress_chunk_generate_paths(PlannerInfo *root, RelOptInfo *chunk_rel, Hyp
 	}
 	/* set reloptkind to RELOPT_DEADREL to prevent postgresql from replanning this relation */
 	compressed_rel->reloptkind = RELOPT_DEADREL;
+
+	/* We should never get in the situation with no viable paths. */
+	Assert(chunk_rel->pathlist != NIL);
 }
 
 /*
@@ -1204,6 +1248,18 @@ create_compressed_scan_paths(PlannerInfo *root, RelOptInfo *compressed_rel, int 
 		add_partial_path(compressed_rel, compressed_path);
 	}
 
+	/*
+	 * We set enable_bitmapscan to false here to ensure any pathes with bitmapscan do not
+	 * displace other pathes. Note that setting the postgres GUC will not actually disable
+	 * the bitmapscan path creation but will instead create them with very high cost.
+	 * If bitmapscan were the dominant path after postgres planning we could end up
+	 * in a situation where we have no valid plan for this relation because we remove
+	 * bitmapscan pathes from the pathlist.
+	 */
+
+	bool old_bitmapscan = enable_bitmapscan;
+	enable_bitmapscan = false;
+
 	if (sort_info->can_pushdown_sort)
 	{
 		/*
@@ -1223,6 +1279,8 @@ create_compressed_scan_paths(PlannerInfo *root, RelOptInfo *compressed_rel, int 
 		check_index_predicates(root, compressed_rel);
 		create_index_paths(root, compressed_rel);
 	}
+
+	enable_bitmapscan = old_bitmapscan;
 }
 
 /*
@@ -1377,7 +1435,7 @@ build_sortinfo(Chunk *chunk, RelOptInfo *chunk_rel, CompressionInfo *info, List 
 	ListCell *lc = list_head(pathkeys);
 	SortInfo sort_info = { .can_pushdown_sort = false, .needs_sequence_num = false };
 
-	if (pathkeys == NIL || ts_chunk_is_unordered(chunk))
+	if (pathkeys == NIL || ts_chunk_is_unordered(chunk) || ts_chunk_is_partial(chunk))
 		return sort_info;
 
 	/* all segmentby columns need to be prefix of pathkeys */

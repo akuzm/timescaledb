@@ -43,6 +43,7 @@
 #include "annotations.h"
 #include "chunk.h"
 #include "cross_module_fn.h"
+#include "debug_assert.h"
 #include "dimension.h"
 #include "dimension_slice.h"
 #include "dimension_vector.h"
@@ -53,7 +54,7 @@
 #include "import/allpaths.h"
 #include "license_guc.h"
 #include "nodes/chunk_append/chunk_append.h"
-#include "nodes/chunk_dispatch_plan.h"
+#include "nodes/chunk_dispatch/chunk_dispatch.h"
 #include "nodes/constraint_aware_append/constraint_aware_append.h"
 #include "nodes/hypertable_modify.h"
 #include "partitioning.h"
@@ -76,7 +77,6 @@ typedef struct BaserelInfoEntry
 {
 	Oid reloid;
 	Hypertable *ht;
-	uint32 chunk_status; /* status of chunk, if this is a chunk */
 
 	uint32 status; /* hash status */
 } BaserelInfoEntry;
@@ -155,7 +155,7 @@ static struct BaserelInfo_hash *ts_baserel_info = NULL;
  * chunk info at the plan time chunk exclusion.
  */
 void
-add_baserel_cache_entry_for_chunk(Oid chunk_reloid, uint32 chunk_status, Hypertable *hypertable)
+add_baserel_cache_entry_for_chunk(Oid chunk_reloid, Hypertable *hypertable)
 {
 	Assert(hypertable != NULL);
 	Assert(ts_baserel_info != NULL);
@@ -164,15 +164,13 @@ add_baserel_cache_entry_for_chunk(Oid chunk_reloid, uint32 chunk_status, Hyperta
 	BaserelInfoEntry *entry = BaserelInfo_insert(ts_baserel_info, chunk_reloid, &found);
 	if (found)
 	{
-		/* Already cached, check that the parameters are the same. */
+		/* Already cached. */
 		Assert(entry->ht != NULL);
-		Assert(entry->chunk_status == chunk_status);
 		return;
 	}
 
 	/* Fill the cache entry. */
 	entry->ht = hypertable;
-	entry->chunk_status = chunk_status;
 }
 
 static void
@@ -227,10 +225,16 @@ planner_hcache_pop(bool release)
 
 	hcache = linitial(planner_hcaches);
 
-	if (release)
-		ts_cache_release(hcache);
-
 	planner_hcaches = list_delete_first(planner_hcaches);
+
+	if (release)
+	{
+		ts_cache_release(hcache);
+		/* If we pop a stack and discover a new hypertable cache, the basrel
+		 * cache can contain invalid entries, so we reset it. */
+		if (planner_hcaches != NIL && hcache != linitial(planner_hcaches))
+			BaserelInfo_reset(ts_baserel_info);
+	}
 }
 
 static bool
@@ -459,6 +463,27 @@ timescaledb_planner(Query *parse, int cursor_opts, ParamListInfo bound_params)
 						"commands ignored until end of transaction block")));
 
 	planner_hcache_push();
+	if (ts_baserel_info == NULL)
+	{
+		/*
+		 * The calls to timescaledb_planner can be recursive (e.g. when
+		 * evaluating an immutable SQL function at planning time). We want to
+		 * create and destroy the per-query baserel info table only at the
+		 * top-level call, hence this flag.
+		 */
+		reset_baserel_info = true;
+
+		/*
+		 * This is a per-query cache, so we create it in the current memory
+		 * context for the top-level call of this function, which hopefully
+		 * should exist for the duration of the query. Message or portal
+		 * memory contexts could also be suitable, but they don't exist for
+		 * SPI calls.
+		 */
+		ts_baserel_info = BaserelInfo_create(CurrentMemoryContext,
+											 /* nelements = */ 1,
+											 /* private_data = */ NULL);
+	}
 
 	PG_TRY();
 	{
@@ -534,28 +559,6 @@ timescaledb_planner(Query *parse, int cursor_opts, ParamListInfo bound_params)
 						ts_data_node_fetcher_scan_type = ts_guc_remote_data_fetcher;
 					}
 				}
-			}
-
-			if (ts_baserel_info == NULL)
-			{
-				/*
-				 * The calls to timescaledb_planner can be recursive (e.g. when
-				 * evaluating an immutable SQL function at planning time). We
-				 * want to create and destroy the per-query baserel info table
-				 * only at the top-level call, hence this flag.
-				 */
-				reset_baserel_info = true;
-
-				/*
-				 * This is a per-query cache, so we create it in the current
-				 * memory context for the top-level call of this function, which
-				 * hopefully should exist for the duration of the query. Message
-				 * or portal memory contexts could also be suitable, but they
-				 * don't exist for SPI calls.
-				 */
-				ts_baserel_info = BaserelInfo_create(CurrentMemoryContext,
-													 /* nelements = */ 1,
-													 /* private_data = */ NULL);
 			}
 		}
 
@@ -678,35 +681,47 @@ get_or_add_baserel_from_cache(Oid chunk_reloid, Oid parent_reloid)
 		return entry;
 	}
 
-	/*
-	 * This reloid is not in the chunk cache, so do the full metadata
-	 * lookup.
-	 */
-	int32 hypertable_id = 0;
-	int32 chunk_status = 0;
-	if (ts_chunk_get_hypertable_id_and_status_by_relid(chunk_reloid, &hypertable_id, &chunk_status))
+	if (OidIsValid(parent_reloid))
 	{
-		/*
-		 * This is a chunk. Look up the hypertable for it.
-		 */
-		if (OidIsValid(parent_reloid))
+		ht = ts_planner_get_hypertable(parent_reloid, CACHE_FLAG_CHECK);
+
+#ifdef USE_ASSERT_CHECKING
+		/* Sanity check on the caller-specified hypertable reloid. */
+		int32 parent_hypertable_id = ts_chunk_get_hypertable_id_by_relid(chunk_reloid);
+		if (parent_hypertable_id != INVALID_HYPERTABLE_ID)
 		{
-			/* Sanity check on the caller-specified hypertable reloid. */
-			Assert(ts_hypertable_id_to_relid(hypertable_id) == parent_reloid);
+			Assert(ts_hypertable_id_to_relid(parent_hypertable_id) == parent_reloid);
+
+			if (ht != NULL)
+			{
+				Assert(ht->fd.id == parent_hypertable_id);
+			}
 		}
-		else
+#endif
+	}
+	else
+	{
+		/* Hypertable reloid not specified by the caller, look it up by
+		 * an expensive metadata scan.
+		 */
+		int32 hypertable_id = ts_chunk_get_hypertable_id_by_relid(chunk_reloid);
+
+		if (hypertable_id != INVALID_HYPERTABLE_ID)
 		{
 			/* Hypertable reloid not specified by the caller, look it up. */
 			parent_reloid = ts_hypertable_id_to_relid(hypertable_id);
+			Ensure(OidIsValid(parent_reloid),
+				   "unable to get valid parent Oid for hypertable %d",
+				   hypertable_id);
+
+			ht = ts_planner_get_hypertable(parent_reloid, CACHE_FLAG_NONE);
+			Assert(ht != NULL);
+			Assert(ht->fd.id == hypertable_id);
 		}
-		ht = ts_planner_get_hypertable(parent_reloid, CACHE_FLAG_NONE);
-		Assert(ht != NULL);
-		Assert(ht->fd.id == hypertable_id);
 	}
 
 	/* Cache the result. */
 	entry->ht = ht;
-	entry->chunk_status = chunk_status;
 	return entry;
 }
 
@@ -849,9 +864,30 @@ should_chunk_append(Hypertable *ht, PlannerInfo *root, RelOptInfo *rel, Path *pa
 			{
 				MergeAppendPath *merge = castNode(MergeAppendPath, path);
 				PathKey *pk;
+				ListCell *lc;
 
 				if (!ordered || path->pathkeys == NIL || list_length(merge->subpaths) == 0)
 					return false;
+
+				/*
+				 * Check for partial compressed chunks.
+				 *
+				 * When partial compressed chunks are present we can not do 1-level
+				 * ordered append. We instead need nested Appends to correctly preserve
+				 * ordering. For now we skip ordered append optimization when we encounter
+				 * partial chunks.
+				 */
+				foreach (lc, merge->subpaths)
+				{
+					Path *child = lfirst(lc);
+					RelOptInfo *chunk_rel = child->parent;
+					if (chunk_rel->fdw_private)
+					{
+						TimescaleDBPrivate *private = chunk_rel->fdw_private;
+						if (private->chunk && ts_chunk_is_partial(private->chunk))
+							return false;
+					}
+				}
 
 				/* cannot support ordered append with OSM chunks. OSM chunk
 				 * ranges are not recorded with the catalog
@@ -947,9 +983,9 @@ reenable_inheritance(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntr
 
 			in_rte->inh = true;
 			reenabled_inheritance = true;
-			/* Redo set_rel_consider_parallel, as results of the call may no longer be valid here
-			 * (due to adding more tables to the set of tables under consideration here). This is
-			 * especially true if dealing with foreign data wrappers. */
+			/* Redo set_rel_consider_parallel, as results of the call may no longer be valid
+			 * here (due to adding more tables to the set of tables under consideration here).
+			 * This is especially true if dealing with foreign data wrappers. */
 
 			/*
 			 * An entry of reloptkind RELOPT_OTHER_MEMBER_REL might still
@@ -1187,22 +1223,6 @@ timescaledb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
 			break;
 		case TS_REL_CHUNK_STANDALONE:
 		case TS_REL_CHUNK_CHILD:
-
-			if (IS_UPDL_CMD(root->parse))
-			{
-				BaserelInfoEntry *chunk_cache_entry =
-					BaserelInfo_lookup(ts_baserel_info, rte->relid);
-				Assert(chunk_cache_entry != NULL);
-				int32 chunk_status = chunk_cache_entry->chunk_status;
-				/* throw error if chunk has invalid status for operation */
-				ts_chunk_validate_chunk_status_for_operation(rte->relid,
-															 chunk_status,
-															 root->parse->commandType ==
-																	 CMD_UPDATE ?
-																 CHUNK_UPDATE :
-																 CHUNK_DELETE,
-															 true);
-			}
 			/* Check for UPDATE/DELETE (DML) on compressed chunks */
 			if (IS_UPDL_CMD(root->parse) && dml_involves_hypertable(root, ht, rti))
 			{

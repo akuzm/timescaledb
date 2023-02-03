@@ -343,9 +343,9 @@ set(PG_VERSION "${PG_VERSION_MAJOR}.${PG_VERSION_MINOR}")
 # Ensure that PostgreSQL version is supported and consistent with src/compat.h
 # version check
 if((${PG_VERSION_MAJOR} LESS "12")
-   OR (${PG_VERSION_MAJOR} GREATER "14")
+   OR (${PG_VERSION_MAJOR} GREATER "15")
    AND NOT (${EXPERIMENTAL}))
-  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 12, 13 and 14")
+  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 12, 13, 14 and 15")
 else()
   message(STATUS "Compiling against PostgreSQL version ${PG_VERSION}")
 endif()
@@ -468,15 +468,9 @@ else()
   message(STATUS "Regress checks and isolation checks disabled")
 endif()
 
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
-  set(LINTER_DEFAULT ON)
-else()
-  set(LINTER_DEFAULT OFF)
-endif()
-
 # Linter support via clang-tidy. Enabled when using clang as compiler
 option(LINTER "Enable linter support using clang-tidy (ON when using clang)"
-       ${LINTER_DEFAULT})
+       OFF)
 
 set(LINTER_STRICT_DEFAULT OFF)
 option(LINTER_STRICT "Treat linter warnings as errors" ${LINTER_STRICT_DEFAULT})
@@ -508,6 +502,18 @@ if(NOT EXISTS ${PG_INCLUDEDIR}/pg_config.h)
       "Could not find pg_config.h in ${PG_INCLUDEDIR}. "
       "Make sure PG_PATH points to a valid PostgreSQL installation that includes development headers."
   )
+endif()
+
+# This is currently only available in snapshot branches so we cannot use the
+# normal pg version check to determine availability.
+if(EXISTS ${PG_INCLUDEDIR_SERVER}/utils/rel.h)
+  file(READ ${PG_INCLUDEDIR_SERVER}/utils/rel.h PG_UTILS_REL_H)
+  string(REGEX MATCH "RelationGetSmgr" PG_HAVE_RELATION_GET_SMGR
+               ${PG_UTILS_REL_H})
+endif()
+
+if(PG_HAVE_RELATION_GET_SMGR)
+  add_compile_definitions(PG_HAVE_RELATION_GET_SMGR=1)
 endif()
 
 file(READ ${PG_INCLUDEDIR}/pg_config.h PG_CONFIG_H)

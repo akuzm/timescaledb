@@ -25,8 +25,10 @@ extern bool ts_guc_enable_runtime_exclusion;
 extern bool ts_guc_enable_constraint_exclusion;
 extern bool ts_guc_enable_cagg_reorder_groupby;
 extern bool ts_guc_enable_now_constify;
+extern bool ts_guc_enable_osm_reads;
 extern TSDLLEXPORT bool ts_guc_enable_transparent_decompression;
 extern TSDLLEXPORT bool ts_guc_enable_per_data_node_queries;
+extern TSDLLEXPORT bool ts_guc_enable_parameterized_data_node_scan;
 extern TSDLLEXPORT bool ts_guc_enable_async_append;
 extern TSDLLEXPORT bool ts_guc_enable_skip_scan;
 extern bool ts_guc_restoring;
@@ -55,6 +57,7 @@ extern TSDLLEXPORT bool ts_guc_enable_client_ddl_on_data_nodes;
 extern TSDLLEXPORT char *ts_guc_ssl_dir;
 extern TSDLLEXPORT char *ts_guc_passfile;
 extern TSDLLEXPORT bool ts_guc_enable_remote_explain;
+extern TSDLLEXPORT bool ts_guc_enable_compression_indexscan;
 
 typedef enum DataFetcherType
 {

@@ -35,14 +35,19 @@
 #include "scan_exec.h"
 #include "planner.h"
 
-/* Default CPU cost to start up a foreign query. */
-#define DEFAULT_FDW_STARTUP_COST 100.0
-
-/* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
-/* Note that postgres_fdw sets this to 0.01, but we want to penalize
+/*
+ * Default CPU cost to process 1 row (above and beyond cpu_tuple_cost).
+ *
+ * Note that postgres_fdw sets this to 0.01, but we want to penalize
  * transferring many tuples in order to make it more attractive to push down
- * aggregates and thus transfer/process less tuples. */
-#define DEFAULT_FDW_TUPLE_COST 0.08
+ * aggregates and thus transfer/process less tuples. Postgres settings do not
+ * make much sense, because transferring the tuples over network is surely
+ * more expensive than transferring them to the local parallel executor.
+ */
+#define DEFAULT_FDW_TUPLE_COST (DEFAULT_PARALLEL_TUPLE_COST * 10)
+
+/* Default CPU cost to start up a foreign query. */
+#define DEFAULT_FDW_STARTUP_COST (DEFAULT_PARALLEL_SETUP_COST * 10)
 
 #define DEFAULT_FDW_FETCH_SIZE 10000
 
@@ -78,6 +83,13 @@ apply_fdw_and_server_options(TsFdwRelInfo *fpinfo)
 								option_extract_extension_list(defGetString(def), false));
 			else if (strcmp(def->defname, "fetch_size") == 0)
 				fpinfo->fetch_size = strtol(defGetString(def), NULL, 10);
+			else if (strcmp(def->defname, "reference_tables") == 0)
+			{
+				/* This option can only be defined per FDW. So, no list_concat of
+				 * FDW and server options is needed. */
+				fpinfo->join_reference_tables =
+					option_extract_join_ref_table_list(defGetString(def));
+			}
 		}
 	}
 }

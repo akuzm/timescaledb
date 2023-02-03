@@ -6,7 +6,6 @@ set(TEST_FILES
     bgw_custom.sql
     bgw_policy.sql
     cagg_errors.sql
-    cagg_errors_deprecated.sql
     cagg_invalidation.sql
     cagg_permissions.sql
     cagg_policy.sql
@@ -32,6 +31,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     APPEND
     TEST_FILES
     bgw_db_scheduler.sql
+    job_errors_permissions.sql
     troubleshooting_job_errors.sql
     bgw_db_scheduler_fixed.sql
     bgw_reorder_drop_chunks.sql
@@ -45,6 +45,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     compression_errors.sql
     compression_hypertable.sql
     compression_merge.sql
+    compression_indexscan.sql
     compression_segment_meta.sql
     compression.sql
     compress_table.sql
@@ -55,13 +56,12 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     cagg_ddl_dist_ht.sql
     cagg_drop_chunks.sql
     cagg_dump.sql
-    cagg_migrate_integer.sql
-    cagg_migrate_integer_dist_ht.sql
-    cagg_migrate_timestamp.sql
-    cagg_migrate_timestamp_dist_ht.sql
-    cagg_migrate_timestamptz.sql
-    cagg_migrate_timestamptz_dist_ht.sql
+    cagg_errors_deprecated.sql
+    cagg_migrate.sql
+    cagg_migrate_dist_ht.sql
     cagg_multi.sql
+    cagg_on_cagg.sql
+    cagg_on_cagg_dist_ht.sql
     continuous_aggs_deprecated.sql
     cagg_tableam.sql
     cagg_usage.sql
@@ -75,16 +75,17 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     dist_api_calls.sql
     dist_commands.sql
     dist_compression.sql
+    dist_copy_available_dns.sql
     dist_copy_format_long.sql
     dist_copy_long.sql
     dist_ddl.sql
+    dist_cagg.sql
     dist_move_chunk.sql
-    dist_partial_agg.sql
     dist_policy.sql
-    dist_query.sql
     dist_util.sql
     dist_triggers.sql
     dist_backup.sql
+    insert_memory_usage.sql
     read_only.sql
     remote_connection_cache.sql
     remote_connection.sql
@@ -95,9 +96,6 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     transparent_decompression_queries.sql
     tsl_tables.sql
     license_tsl.sql)
-  if(USE_TELEMETRY)
-    list(APPEND TEST_FILES telemetry_stats.sql)
-  endif()
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 
 if((${PG_VERSION_MAJOR} GREATER_EQUAL "14"))
@@ -107,7 +105,10 @@ if((${PG_VERSION_MAJOR} GREATER_EQUAL "14"))
 endif()
 
 set(SOLO_TESTS
+    # dist_hypertable needs a lot of memory when the Sanitizer is active
+    dist_hypertable-${PG_VERSION_MAJOR}
     bgw_db_scheduler
+    job_errors_permissions
     troubleshooting_job_errors
     bgw_db_scheduler_fixed
     bgw_reorder_drop_chunks
@@ -127,7 +128,13 @@ set(SOLO_TESTS
     remote_txn
     remote_txn_resolve
     reorder
-    telemetry_stats)
+    telemetry_stats-${PG_VERSION_MAJOR})
+
+# In PG15.0 and PG15.1, dist_move_chunk can get stuck when run in parallel with
+# other tests as mentioned in #4972.
+if(${PG_VERSION_MAJOR} EQUAL "15" AND ${PG_VERSION_MINOR} LESS "2")
+  list(APPEND SOLO_TESTS dist_move_chunk)
+endif()
 
 set(TEST_TEMPLATES
     compression_insert.sql.in cagg_union_view.sql.in plan_skip_scan.sql.in
@@ -147,8 +154,15 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     dist_hypertable.sql.in
     remote_copy.sql.in
     dist_grant.sql.in
+    dist_ref_table_join.sql.in
+    dist_partial_agg.sql.in
+    dist_query.sql.in
     cagg_invalidation_dist_ht.sql.in
-    continuous_aggs.sql.in)
+    continuous_aggs.sql.in
+    cagg_joins.sql.in)
+  if(USE_TELEMETRY)
+    list(APPEND TEST_TEMPLATES telemetry_stats.sql.in)
+  endif()
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 
 # Check if PostgreSQL was compiled with JIT support

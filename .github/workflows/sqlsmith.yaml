@@ -1,73 +1,53 @@
 name: SQLsmith
-on:
+"on":
   schedule:
-    # run daily 20:00 on main branch
+    # run daily 2:00 on main branch
     - cron: '0 2 * * *'
   workflow_dispatch:
   push:
     branches:
       - sqlsmith
+      - main
 jobs:
-  config:
-    runs-on: ubuntu-latest
-    outputs:
-      pg14_latest: ${{ steps.setter.outputs.PG14_LATEST }}
-    steps:
-    - name: Checkout source code
-      uses: actions/checkout@v3
-    - name: Read configuration
-      id: setter
-      run: python .github/gh_config_reader.py
-
-  regress:
+  sqlsmith:
+    # Change the JOB_NAME variable below when changing the name.
+    # Don't use the env variable here because the env context is not accessible.
     name: SQLsmith PG${{ matrix.pg }}
     runs-on: ${{ matrix.os }}
-    needs: config
     strategy:
       matrix:
         os: ["ubuntu-20.04"]
-        pg: [ "${{ fromJson(needs.config.outputs.pg14_latest) }}" ]
-        cc: ["gcc"]
+        pg: [ "15" ]
         build_type: ["Debug"]
       fail-fast: false
     env:
       PG_SRC_DIR: pgbuild
       PG_INSTALL_DIR: postgresql
+      JOB_NAME: SQLsmith PG${{ matrix.pg }}
 
     steps:
     - name: Install Linux Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install flex bison systemd-coredump gdb clang-9 llvm-9 llvm-9-dev llvm-9-tools build-essential autoconf autoconf-archive libpqxx-dev libboost-regex-dev libsqlite3-dev
 
-    # this workflow depends on the cached postgres build from the main regression
-    # workflow since that workflow runs daily there should always be a cache hit
-    - name: Cache PostgreSQL ${{ matrix.pg }}
-      id: cache-postgresql
-      uses: actions/cache@v3
-      with:
-        path: ~/${{ env.PG_SRC_DIR }}
-        key: ${{ matrix.os }}-postgresql-${{ matrix.pg }}-${{ matrix.cc }}-${{ matrix.build_type }}
-
-    # we abort on cache miss otherwise we would have to reproduce most variables
-    # of the main regression build matrix in this workflow
-    - name: Abort on cache miss
-      if: steps.cache-postgresql.outputs.cache-hit != 'true'
-      run: false
-
-    - name: Install PostgreSQL ${{ matrix.pg }} ${{ matrix.build_type }}
+    - name: Install Dependencies
       run: |
-        make -C ~/$PG_SRC_DIR install
-        make -C ~/$PG_SRC_DIR/contrib/postgres_fdw install
+        sudo apt-get update
+        sudo apt-get install gnupg systemd-coredump gdb postgresql-common \
+            libkrb5-dev build-essential autoconf autoconf-archive libpqxx-dev \
+            libboost-regex-dev libsqlite3-dev
+        yes | sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+        sudo apt-get update
+        sudo apt-get install postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
 
     - name: Checkout TimescaleDB
       uses: actions/checkout@v3
 
     - name: Build TimescaleDB
       run: |
-        ./bootstrap -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DPG_SOURCE_DIR=~/$PG_SRC_DIR -DPG_PATH=~/$PG_INSTALL_DIR ${{ matrix.tsdb_build_args }}
+        ./bootstrap -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         make -C build
-        make -C build install
+        sudo make -C build install
 
     - name: Checkout sqlsmith
       uses: actions/checkout@v3
@@ -86,8 +66,10 @@ jobs:
     - name: Setup test environment
       run: |
         mkdir ~/pgdata
-        ~/$PG_INSTALL_DIR/bin/initdb ~/pgdata
-        ~/$PG_INSTALL_DIR/bin/pg_ctl -D ~/pgdata start -o "-cshared_preload_libraries=timescaledb" -o "-cmax_connections=200" -o "-cmax_prepared_transactions=100"
+        /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctl initdb -D ~/pgdata
+        /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctl -D ~/pgdata start \
+            -o "-cshared_preload_libraries=timescaledb" -o "-cmax_connections=200" \
+            -o "-cmax_prepared_transactions=100" -o "-cunix_socket_directories=/tmp"
         psql -h /tmp postgres -c 'CREATE DATABASE smith;'
         psql -h /tmp smith -c 'CREATE EXTENSION timescaledb;'
         psql -h /tmp smith -c '\i ${{ github.workspace }}/tsl/test/shared/sql/include/shared_setup.sql'
@@ -96,8 +78,14 @@ jobs:
     # 10 times 10000 queries seems to take roughly 40 minutes in CI
     - name: Run SQLsmith
       run: |
+        set -o pipefail
         cd sqlsmith
-        for i in `seq 1 10`; do ./sqlsmith --seed=$((16#$(openssl rand -hex 3))) --exclude-catalog --target="host=/tmp dbname=smith" --max-queries=10000; done
+        for _ in {1..10}
+        do
+            ./sqlsmith --seed=$((16#$(openssl rand -hex 3))) --exclude-catalog \
+                --target="host=/tmp dbname=smith" --max-queries=10000 \
+            2>&1 | tee sqlsmith.log # We only keep the last log.
+        done
 
     - name: Check for coredumps
       if: always()
@@ -113,10 +101,19 @@ jobs:
     - name: Stack trace
       if: always() && steps.collectlogs.outputs.coredumps == 'true'
       run: |
-        sudo coredumpctl gdb <<EOT
-          printf "%s\n\n", debug_query_string
+        sudo coredumpctl gdb <<<"
+          set verbose on
+          set trace-commands on
+          show debug-file-directory
+          printf "'"'"query = '%s'\n\n"'"'", debug_query_string
+          frame function ExceptionalCondition
+          printf "'"'"condition = '%s'\n"'"'", conditionName
+          up 1
+          l
+          info args
+          info locals
           bt full
-        EOT
+        " 2>&1 | tee stacktrace.log
         ./scripts/bundle_coredumps.sh
         false
 
@@ -126,3 +123,24 @@ jobs:
       with:
         name: Coredumps sqlsmith ${{ matrix.os }} PG${{ matrix.pg }}
         path: coredumps
+
+    - name: Upload test results to the database
+      if: always()
+      env:
+        CI_STATS_DB: ${{ secrets.CI_STATS_DB }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        JOB_STATUS: ${{ job.status }}
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]] ;
+        then
+            GITHUB_PR_NUMBER="${{ github.event.number }}"
+        else
+            GITHUB_PR_NUMBER=0
+        fi
+        export GITHUB_PR_NUMBER
+        scripts/upload_ci_stats.sh

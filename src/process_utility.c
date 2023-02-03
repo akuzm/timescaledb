@@ -281,6 +281,14 @@ check_altertable_add_column_for_compressed(Hypertable *ht, ColumnDef *col)
 			Constraint *constraint = lfirst_node(Constraint, lc);
 			switch (constraint->contype)
 			{
+				/*
+				 * We can safelly ignore NULL constraints because it does nothing
+				 * and according to Postgres docs is useless and exist just for
+				 * compatibility with other database systems
+				 * https://www.postgresql.org/docs/current/ddl-constraints.html#id-1.5.4.6.6
+				 */
+				case CONSTR_NULL:
+					continue;
 				case CONSTR_NOTNULL:
 					has_notnull = true;
 					continue;
@@ -906,6 +914,8 @@ process_vacuum(ProcessUtilityArgs *args)
 	Hypertable *ht;
 	List *vacuum_rels = NIL;
 	bool is_vacuumcmd;
+	/* save original VacuumRelation list */
+	List *saved_stmt_rels = stmt->rels;
 
 	is_vacuumcmd = stmt->is_vacuumcmd;
 
@@ -975,6 +985,12 @@ process_vacuum(ProcessUtilityArgs *args)
 															  cp->compressed_relid);
 		}
 	}
+	/*
+	Restore original list. stmt->rels which has references to
+	VacuumRelation list is freed up, however VacuumStmt is not
+	cleaned up because of which there is a crash.
+	*/
+	stmt->rels = saved_stmt_rels;
 	return DDL_DONE;
 }
 
@@ -1082,6 +1098,17 @@ process_truncate(ProcessUtilityArgs *args)
 																		  TS_TIME_NOBEGIN,
 																		  TS_TIME_NOEND);
 
+						/* Additionally, this cagg's materialization hypertable could be the
+						 * underlying hypertable for other caggs defined on top of it, in that case
+						 * we must update the hypertable invalidation log */
+						ContinuousAggHypertableStatus agg_status;
+
+						agg_status = ts_continuous_agg_hypertable_status(mat_ht->fd.id);
+						if (agg_status & HypertableIsRawTable)
+							ts_cm_functions->continuous_agg_invalidate_raw_ht(mat_ht,
+																			  TS_TIME_NOBEGIN,
+																			  TS_TIME_NOEND);
+
 						/* mark list as changed because we'll add the materialization hypertable */
 						list_changed = true;
 					}
@@ -1139,6 +1166,14 @@ process_truncate(ProcessUtilityArgs *args)
 						ht = ts_hypertable_cache_get_entry(hcache,
 														   chunk->hypertable_relid,
 														   CACHE_FLAG_NONE);
+
+						/*
+						 * Block direct TRUNCATE on frozen chunk.
+						 */
+#if PG14_GE
+						if (ts_chunk_is_frozen(chunk))
+							elog(ERROR, "cannot TRUNCATE frozen chunk \"%s\"", get_rel_name(relid));
+#endif
 
 						Assert(ht != NULL);
 
@@ -3934,7 +3969,10 @@ process_altertable_set_options(AlterTableCmd *cmd, Hypertable *ht)
 	if (compress_options)
 	{
 		parse_results = ts_compress_hypertable_set_clause_parse(compress_options);
-		if (parse_results[CompressEnabled].is_default)
+		/* We allow updating compress chunk time interval independently of other compression
+		 * options. */
+		if (parse_results[CompressEnabled].is_default &&
+			parse_results[CompressChunkTimeInterval].is_default)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("the option timescaledb.compress must be set to true to enable "

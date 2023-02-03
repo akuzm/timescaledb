@@ -5,15 +5,16 @@
  */
 
 #include <postgres.h>
-#include <foreign/foreign.h>
+#include <access/htup_details.h>
+#include <access/xact.h>
 #include <catalog/pg_foreign_server.h>
 #include <catalog/pg_foreign_table.h>
 #include <catalog/dependency.h>
 #include <catalog/namespace.h>
-#include <access/htup_details.h>
-#include <access/xact.h>
+#include <foreign/foreign.h>
 #include <nodes/makefuncs.h>
 #include <nodes/parsenodes.h>
+#include <storage/lmgr.h>
 #include <utils/acl.h>
 #include <utils/builtins.h>
 #include <utils/syscache.h>
@@ -24,10 +25,10 @@
 #include <utils/snapmgr.h>
 #include <executor/executor.h>
 #include <parser/parse_func.h>
+#include <storage/lmgr.h>
 #include <funcapi.h>
 #include <miscadmin.h>
 #include <fmgr.h>
-
 #ifdef USE_ASSERT_CHECKING
 #include <funcapi.h>
 #endif
@@ -43,6 +44,7 @@
 #include "chunk_api.h"
 #include "data_node.h"
 #include "deparse.h"
+#include "debug_point.h"
 #include "dist_util.h"
 #include "remote/dist_commands.h"
 #include "ts_catalog/chunk_data_node.h"
@@ -506,4 +508,329 @@ chunk_drop_replica(PG_FUNCTION_ARGS)
 	chunk_api_call_chunk_drop_replica(chunk, node_name, server->serverid);
 
 	PG_RETURN_VOID();
+}
+
+/* Data in a frozen chunk cannot be modified. So any operation
+ * that rewrites data for a frozen chunk will be blocked.
+ * Note that a frozen chunk can still be dropped.
+ */
+Datum
+chunk_freeze_chunk(PG_FUNCTION_ARGS)
+{
+	Oid chunk_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	TS_PREVENT_FUNC_IF_READ_ONLY();
+	Chunk *chunk = ts_chunk_get_by_relid(chunk_relid, true);
+	Assert(chunk != NULL);
+	if (chunk->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("operation not supported on distributed chunk or foreign table \"%s\"",
+						get_rel_name(chunk_relid))));
+	}
+	if (ts_chunk_is_frozen(chunk))
+		PG_RETURN_BOOL(true);
+	/* get Share lock. will wait for other concurrent transactions that are
+	 * modifying the chunk. Does not block SELECTs on the chunk.
+	 * Does not block other DDL on the chunk table.
+	 */
+	DEBUG_WAITPOINT("freeze_chunk_before_lock");
+	LockRelationOid(chunk_relid, ShareLock);
+	bool ret = ts_chunk_set_frozen(chunk);
+	PG_RETURN_BOOL(ret);
+}
+
+Datum
+chunk_unfreeze_chunk(PG_FUNCTION_ARGS)
+{
+	Oid chunk_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	TS_PREVENT_FUNC_IF_READ_ONLY();
+	Chunk *chunk = ts_chunk_get_by_relid(chunk_relid, true);
+	Assert(chunk != NULL);
+	if (chunk->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("operation not supported on distributed chunk or foreign table \"%s\"",
+						get_rel_name(chunk_relid))));
+	}
+	if (!ts_chunk_is_frozen(chunk))
+		PG_RETURN_BOOL(true);
+	/* This is a previously frozen chunk. Only selects are permitted on this chunk.
+	 * This changes the status in the catalog to allow previously blocked operations.
+	 */
+	bool ret = ts_chunk_unset_frozen(chunk);
+	PG_RETURN_BOOL(ret);
+}
+
+static List *
+chunk_id_list_create(ArrayType *array)
+{
+	/* create a sorted list of chunk ids from array */
+	ArrayIterator it;
+	Datum id_datum;
+	List *id_list = NIL;
+	bool isnull;
+
+	it = array_create_iterator(array, 0, NULL);
+	while (array_iterate(it, &id_datum, &isnull))
+	{
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chunks array arguments cannot be NULL")));
+		id_list = lappend_int(id_list, DatumGetInt32(id_datum));
+	}
+	array_free_iterator(it);
+
+	(void) list_sort_compat(id_list, list_int_cmp_compat);
+	return id_list;
+}
+
+static List *
+chunk_id_list_exclusive_right_merge_join(const List *an_list, const List *dn_list)
+{
+	/*
+	 * merge join two sorted list and return only values which exclusively
+	 * exists in the right target (dn_list list)
+	 */
+	List *result = NIL;
+	const ListCell *l = list_head(an_list);
+	const ListCell *r = list_head(dn_list);
+	for (;;)
+	{
+		if (l && r)
+		{
+			int compare = list_int_cmp_compat(l, r);
+			if (compare == 0)
+			{
+				/* l = r */
+				l = lnext_compat(an_list, l);
+				r = lnext_compat(dn_list, r);
+			}
+			else if (compare < 0)
+			{
+				/* l < r */
+				/* chunk exists only on the access node */
+				l = lnext_compat(an_list, l);
+			}
+			else
+			{
+				/* l > r */
+				/* chunk exists only on the data node */
+				result = lappend_int(result, lfirst_int(r));
+				r = lnext_compat(dn_list, r);
+			}
+		}
+		else if (l)
+		{
+			/* chunk exists only on the access node */
+			l = lnext_compat(an_list, l);
+		}
+		else if (r)
+		{
+			/* chunk exists only on the data node */
+			result = lappend_int(result, lfirst_int(r));
+			r = lnext_compat(dn_list, r);
+		}
+		else
+		{
+			break;
+		}
+	}
+	return result;
+}
+
+/*
+ * chunk_drop_stale_chunks:
+ *
+ * This function drops chunks on a specified data node if those chunks are
+ * not known by the access node (chunks array).
+ *
+ * This function is intended to be used on the access node and data node.
+ */
+void
+ts_chunk_drop_stale_chunks(const char *node_name, ArrayType *chunks_array)
+{
+	DistUtilMembershipStatus membership;
+
+	/* execute according to the node membership */
+	membership = dist_util_membership();
+	if (membership == DIST_MEMBER_ACCESS_NODE)
+	{
+		StringInfo cmd = makeStringInfo();
+		bool first = true;
+
+		if (node_name == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("node_name argument cannot be NULL")));
+		if (chunks_array != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chunks argument cannot be used on the access node")));
+
+		/* get an exclusive lock on the chunks catalog table to prevent new chunk
+		 * creation during this operation */
+		LockRelationOid(ts_catalog_get()->tables[CHUNK].id, AccessExclusiveLock);
+
+		/* generate query to execute drop_stale_chunks() on the data node */
+		appendStringInfo(cmd, "SELECT _timescaledb_internal.drop_stale_chunks(NULL, array[");
+
+		/* scan for chunks that reference the given data node */
+		ScanIterator it = ts_chunk_data_nodes_scan_iterator_create(CurrentMemoryContext);
+		ts_chunk_data_nodes_scan_iterator_set_node_name(&it, node_name);
+		ts_scanner_foreach(&it)
+		{
+			TupleTableSlot *slot = ts_scan_iterator_slot(&it);
+			bool PG_USED_FOR_ASSERTS_ONLY isnull = false;
+			int32 node_chunk_id;
+
+			node_chunk_id =
+				DatumGetInt32(slot_getattr(slot, Anum_chunk_data_node_node_chunk_id, &isnull));
+			Assert(!isnull);
+
+			appendStringInfo(cmd, "%s%d", first ? "" : ",", node_chunk_id);
+			first = false;
+		}
+		ts_scan_iterator_close(&it);
+
+		appendStringInfo(cmd, "]::integer[])");
+
+		/* execute command on the data node */
+		ts_dist_cmd_run_on_data_nodes(cmd->data, list_make1((char *) node_name), true);
+	}
+	else if (membership == DIST_MEMBER_DATA_NODE)
+	{
+		List *an_chunk_id_list = NIL;
+		List *dn_chunk_id_list = NIL;
+		List *dn_chunk_id_list_stale = NIL;
+		ListCell *lc;
+		Cache *htcache;
+
+		if (node_name != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("node_name argument cannot be used on the data node")));
+
+		if (chunks_array == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chunks argument cannot be NULL")));
+
+		/* get a sorted list of chunk ids from the supplied chunks id argument array */
+		an_chunk_id_list = chunk_id_list_create(chunks_array);
+
+		/* get a local sorted list of chunk ids */
+		dn_chunk_id_list = ts_chunk_get_all_chunk_ids(RowExclusiveLock);
+
+		/* merge join two sorted list and get chunk ids which exists locally */
+		dn_chunk_id_list_stale =
+			chunk_id_list_exclusive_right_merge_join(an_chunk_id_list, dn_chunk_id_list);
+
+		/* drop stale chunks */
+		htcache = ts_hypertable_cache_pin();
+		foreach (lc, dn_chunk_id_list_stale)
+		{
+			const Chunk *chunk = ts_chunk_get_by_id(lfirst_int(lc), false);
+			Hypertable *ht;
+
+			/* chunk might be already dropped by previous drop, if the chunk was compressed */
+			if (chunk == NULL)
+				continue;
+
+			/* ensure that we drop only chunks related to distributed hypertables */
+			ht = ts_hypertable_cache_get_entry(htcache, chunk->hypertable_relid, CACHE_FLAG_NONE);
+			if (hypertable_is_distributed_member(ht))
+				ts_chunk_drop(chunk, DROP_RESTRICT, DEBUG1);
+		}
+		ts_cache_release(htcache);
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("current server is not an access node or data node")));
+	}
+}
+
+Datum
+chunk_drop_stale_chunks(PG_FUNCTION_ARGS)
+{
+	char *node_name = PG_ARGISNULL(0) ? NULL : NameStr(*PG_GETARG_NAME(0));
+	ArrayType *chunks_array = PG_ARGISNULL(1) ? NULL : PG_GETARG_ARRAYTYPE_P(1);
+
+	TS_PREVENT_FUNC_IF_READ_ONLY();
+
+	ts_chunk_drop_stale_chunks(node_name, chunks_array);
+	PG_RETURN_VOID();
+}
+/*
+ * Update and refresh the DN list for a given chunk. We remove metadata for this chunk
+ * for unavailable DNs
+ */
+void
+chunk_update_stale_metadata(Chunk *new_chunk, List *chunk_data_nodes)
+{
+	List *serveroids = NIL, *removeoids = NIL;
+	ChunkDataNode *cdn;
+	ListCell *lc;
+
+	/* check that at least one data node is available for this chunk on the AN */
+	if (chunk_data_nodes == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_TS_INSUFFICIENT_NUM_DATA_NODES),
+				 (errmsg("insufficient number of available data nodes"),
+				  errhint("Increase the number of available data nodes on hypertable "
+						  "\"%s\".",
+						  get_rel_name(new_chunk->hypertable_relid)))));
+
+	foreach (lc, chunk_data_nodes)
+	{
+		cdn = lfirst(lc);
+		serveroids = lappend_oid(serveroids, cdn->foreign_server_oid);
+	}
+
+	foreach (lc, new_chunk->data_nodes)
+	{
+		cdn = lfirst(lc);
+
+		/*
+		 * check if this DN is a part of chunk_data_nodes. If not
+		 * found in chunk_data_nodes, then we need to remove this
+		 * chunk id to node name mapping and also update the primary
+		 * foreign server if necessary. It's possible that this metadata
+		 * might have been already cleared earlier in which case the
+		 * data_nodes list for the chunk will be the same as the
+		 * "serveroids" list and no unnecesary metadata update function
+		 * calls will occur.
+		 */
+		if (!list_member_oid(serveroids, cdn->foreign_server_oid))
+		{
+			chunk_update_foreign_server_if_needed(new_chunk, cdn->foreign_server_oid, false);
+			ts_chunk_data_node_delete_by_chunk_id_and_node_name(cdn->fd.chunk_id,
+																NameStr(cdn->fd.node_name));
+
+			removeoids = lappend_oid(removeoids, cdn->foreign_server_oid);
+		}
+	}
+
+	/* remove entries from new_chunk->data_nodes matching removeoids */
+	foreach (lc, removeoids)
+	{
+		ListCell *l;
+		Oid serveroid = lfirst_oid(lc);
+
+		/* this contrived code to ensure PG12+ compatible in-place list delete */
+		foreach (l, new_chunk->data_nodes)
+		{
+			cdn = lfirst(l);
+
+			if (cdn->foreign_server_oid == serveroid)
+			{
+				new_chunk->data_nodes = list_delete_ptr(new_chunk->data_nodes, cdn);
+				break;
+			}
+		}
+	}
 }

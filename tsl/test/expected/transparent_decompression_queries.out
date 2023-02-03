@@ -1,7 +1,7 @@
 -- This file and its contents are licensed under the Timescale License.
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
---TEST github issue 1650 character segment by column 
+--TEST github issue 1650 character segment by column
 CREATE TABLE test_chartab ( job_run_id INTEGER NOT NULL, mac_id CHAR(16) NOT NULL, rtt INTEGER NOT NULL, ts TIMESTAMP(3) NOT NULL );
 SELECT create_hypertable('test_chartab', 'ts', chunk_time_interval => interval '1 day', migrate_data => true);
 WARNING:  column type "timestamp without time zone" used for "ts" does not follow best practices
@@ -87,8 +87,8 @@ EXPLAIN (analyze,costs off,timing off,summary off) SELECT
 FROM merge_sort
 WHERE time < now()
 GROUP BY 2, 3;
-                                                  QUERY PLAN                                                   
----------------------------------------------------------------------------------------------------------------
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate (actual rows=1 loops=1)
    Group Key: merge_sort.device_id, merge_sort.measure_id
    ->  Custom Scan (ConstraintAwareAppend) (actual rows=745 loops=1)
@@ -98,10 +98,7 @@ GROUP BY 2, 3;
                Sort Key: _hyper_3_5_chunk.device_id, _hyper_3_5_chunk.measure_id
                ->  Custom Scan (DecompressChunk) on _hyper_3_5_chunk (actual rows=120 loops=1)
                      Filter: ("time" < now())
-                     ->  Sort (actual rows=1 loops=1)
-                           Sort Key: compress_hyper_4_10_chunk.device_id, compress_hyper_4_10_chunk.measure_id
-                           Sort Method: quicksort 
-                           ->  Seq Scan on compress_hyper_4_10_chunk (actual rows=1 loops=1)
+                     ->  Index Scan using compress_hyper_4_10_chunk__compressed_hypertable_4_device_id_me on compress_hyper_4_10_chunk (actual rows=1 loops=1)
                ->  Sort (actual rows=168 loops=1)
                      Sort Key: _hyper_3_6_chunk.device_id, _hyper_3_6_chunk.measure_id
                      Sort Method: quicksort 
@@ -122,7 +119,7 @@ GROUP BY 2, 3;
                      Sort Method: quicksort 
                      ->  Seq Scan on _hyper_3_9_chunk (actual rows=121 loops=1)
                            Filter: ("time" < now())
-(33 rows)
+(30 rows)
 
 -- this should exclude the decompressed chunk
 EXPLAIN (analyze,costs off,timing off,summary off) SELECT
@@ -166,7 +163,7 @@ GROUP BY 2, 3;
 
 RESET enable_hashagg;
 -- test if volatile function quals are applied to compressed chunks
-CREATE FUNCTION check_equal_228( intval INTEGER) RETURNS BOOL 
+CREATE FUNCTION check_equal_228( intval INTEGER) RETURNS BOOL
 LANGUAGE PLPGSQL AS
 $BODY$
 DECLARE
@@ -179,7 +176,7 @@ END;
 $BODY$;
 -- the function cannot be pushed down to compressed chunk
 -- but should be applied as a filter on decompresschunk
-SELECT * from test_chartab 
+SELECT * from test_chartab
 WHERE check_equal_228(rtt) ORDER BY ts;
  job_run_id |      mac_id      | rtt |              ts              
 ------------+------------------+-----+------------------------------
@@ -187,8 +184,8 @@ WHERE check_equal_228(rtt) ORDER BY ts;
        8890 | 001407000001DD2E | 228 | Fri Dec 20 02:52:05.863 2019
 (2 rows)
 
-EXPLAIN (analyze,costs off,timing off,summary off) 
-SELECT * from test_chartab 
+EXPLAIN (analyze,costs off,timing off,summary off)
+SELECT * from test_chartab
 WHERE check_equal_228(rtt) and ts < '2019-12-15 00:00:00' order by ts;
                                                    QUERY PLAN                                                    
 -----------------------------------------------------------------------------------------------------------------

@@ -56,7 +56,7 @@ INSERT INTO _timescaledb_internal.saved_privs
       WHERE relkind IN ('r', 'v') AND nspname IN ('_timescaledb_catalog', '_timescaledb_config')
         OR nspname = '_timescaledb_internal'
         AND relname IN ('hypertable_chunk_local_size', 'compressed_chunk_stats',
-                        'bgw_job_stat', 'bgw_policy_chunk_stats')
+                        'bgw_job_stat', 'bgw_policy_chunk_stats', 'job_errors')
 ON CONFLICT DO NOTHING;
 
 -- The above is good enough for tables and views. However sequences need to
@@ -130,5 +130,21 @@ CREATE FUNCTION _timescaledb_internal.update_dimension_partition(hypertable REGC
 SELECT _timescaledb_internal.update_dimension_partition(format('%I.%I', h.schema_name, h.table_name))
 FROM _timescaledb_catalog.hypertable h
 INNER JOIN _timescaledb_catalog.dimension d ON (d.hypertable_id = h.id)
-WHERE d.interval_length IS NULL; 
+WHERE d.interval_length IS NULL;
 DROP FUNCTION _timescaledb_internal.update_dimension_partition;
+
+-- Report warning when partial aggregates are used
+DO $$
+DECLARE
+  cagg_name text;
+BEGIN
+    FOR cagg_name IN
+      SELECT
+        format('%I.%I', user_view_schema, user_view_name)
+      FROM _timescaledb_catalog.continuous_agg
+      WHERE finalized IS FALSE
+      ORDER BY 1
+    LOOP
+      RAISE WARNING 'Continuous Aggregate: % with old format will not be supported with PG15. You should upgrade to the new format', cagg_name;
+    END LOOP;
+END $$;

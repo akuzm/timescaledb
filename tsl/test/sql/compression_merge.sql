@@ -11,8 +11,8 @@ CREATE TABLE test1 ("Time" timestamptz, i integer, value integer);
 SELECT table_name from create_hypertable('test1', 'Time', chunk_time_interval=> INTERVAL '1 hour');
 
 -- This will generate 24 chunks
-INSERT INTO test1 
-SELECT t, i, gen_rand_minstd() 
+INSERT INTO test1
+SELECT t, i, gen_rand_minstd()
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-03 0:59', '1 minute') t
 CROSS JOIN generate_series(1, 5, 1) i;
 
@@ -38,8 +38,8 @@ CREATE TABLE test2 ("Time" timestamptz, i integer, loc integer, value integer);
 SELECT table_name from create_hypertable('test2', 'Time', chunk_time_interval=> INTERVAL '1 hour');
 
 -- This will generate 24 1 hour chunks.
-INSERT INTO test2 
-SELECT t, i, gen_rand_minstd() 
+INSERT INTO test2
+SELECT t, i, gen_rand_minstd()
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-03 0:59', '1 minute') t
 CROSS JOIN generate_series(1, 5, 1) i;
 
@@ -105,22 +105,31 @@ INSERT INTO test5 SELECT t, 1, gen_rand_minstd() FROM generate_series('2018-03-0
 -- Compression is set to merge those 24 chunks into 1 24 hour chunk
 ALTER TABLE test5 set (timescaledb.compress, timescaledb.compress_segmentby='i', timescaledb.compress_orderby='"Time"', timescaledb.compress_chunk_time_interval='24 hours');
 
-SELECT compress_chunk(i) FROM show_chunks('test5') i LIMIT 1;
+SELECT
+  $$
+  SELECT * FROM test5 ORDER BY i, "Time"
+  $$ AS "QUERY" \gset
+
+SELECT compress_chunk(i) FROM show_chunks('test5') i LIMIT 4;
+
+-- Make sure sequence numbers are correctly fetched from index.
+SELECT _ts_meta_sequence_num FROM _timescaledb_internal.compress_hyper_10_187_chunk where i = 1;
 
 SELECT schemaname || '.' || indexname AS "INDEXNAME"
 FROM pg_indexes i
-INNER JOIN _timescaledb_catalog.chunk cc ON i.schemaname = cc.schema_name and i.tablename = cc.table_name 
-INNER JOIN _timescaledb_catalog.chunk c ON (cc.id = c.compressed_chunk_id) 
+INNER JOIN _timescaledb_catalog.chunk cc ON i.schemaname = cc.schema_name and i.tablename = cc.table_name
+INNER JOIN _timescaledb_catalog.chunk c ON (cc.id = c.compressed_chunk_id)
 LIMIT 1 \gset
+
 
 DROP INDEX :INDEXNAME;
 
 -- We dropped the index from compressed chunk thats needed to determine sequence numbers
 -- during merge, merging will fallback to doing heap scans and work just fine.
-SELECT
-  $$
-  SELECT * FROM test5 ORDER BY i, "Time"
-  $$ AS "QUERY" \gset
+SELECT compress_chunk(i, true) FROM show_chunks('test5') i LIMIT 5;
+
+-- Make sure sequence numbers are correctly fetched from heap.
+SELECT _ts_meta_sequence_num FROM _timescaledb_internal.compress_hyper_10_187_chunk where i = 1;
 
 SELECT 'test5' AS "HYPERTABLE_NAME" \gset
 \ir include/compression_test_merge.sql
@@ -131,8 +140,8 @@ CREATE TABLE test6 ("Time" timestamptz, i integer, value integer);
 SELECT table_name from create_hypertable('test6', 'Time', chunk_time_interval=> INTERVAL '1 hour');
 
 -- This will generate 24 chunks
-INSERT INTO test6 
-SELECT t, i, gen_rand_minstd() 
+INSERT INTO test6
+SELECT t, i, gen_rand_minstd()
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-03 0:59', '1 minute') t
 CROSS JOIN generate_series(1, 5, 1) i;
 
@@ -140,14 +149,47 @@ CROSS JOIN generate_series(1, 5, 1) i;
 ALTER TABLE test6 set (timescaledb.compress, timescaledb.compress_segmentby='i', timescaledb.compress_orderby='"Time"', timescaledb.compress_chunk_time_interval='2 hours');
 
 SELECT compress_chunk(i) FROM show_chunks('test6') i;
-SELECT 12 as expected_number_of_chunks, count(*) as number_of_chunks FROM show_chunks('test6');
-SELECT decompress_chunk(i) FROM show_chunks('test6') i;
+SELECT count(*) as number_of_chunks FROM show_chunks('test6');
 
--- Altering compress chunk time interval will cause us to create 6 chunks instead of 12.
-ALTER TABLE test6 set (timescaledb.compress, timescaledb.compress_segmentby='i', timescaledb.compress_orderby='"Time"', timescaledb.compress_chunk_time_interval='4 hours');
+-- This will generate another 24 chunks
+INSERT INTO test6
+SELECT t, i, gen_rand_minstd()
+FROM generate_series('2018-03-03 1:00'::TIMESTAMPTZ, '2018-03-04 0:59', '1 minute') t
+CROSS JOIN generate_series(1, 5, 1) i;
+-- Altering compress chunk time interval will cause us to create 6 chunks from the additional 24 chunks.
+ALTER TABLE test6 set (timescaledb.compress_chunk_time_interval='4 hours');
 
 SELECT compress_chunk(i, true) FROM show_chunks('test6') i;
-SELECT 6 as expected_number_of_chunks, count(*) as number_of_chunks FROM show_chunks('test6');
+SELECT count(*) as number_of_chunks FROM show_chunks('test6');
+
+-- This will generate another 3 chunks
+INSERT INTO test6
+SELECT t, i, gen_rand_minstd()
+FROM generate_series('2018-03-04 1:00'::TIMESTAMPTZ, '2018-03-04 3:59', '1 minute') t
+CROSS JOIN generate_series(1, 5, 1) i;
+-- Altering compress chunk time interval will cause us to create 3 chunks from the additional 3 chunks.
+-- Setting compressed chunk to anything less than chunk interval should disable merging chunks.
+ALTER TABLE test6 set (timescaledb.compress_chunk_time_interval='30 minutes');
+
+SELECT compress_chunk(i, true) FROM show_chunks('test6') i;
+SELECT count(*) as number_of_chunks FROM show_chunks('test6');
+
+-- This will generate another 3 chunks
+INSERT INTO test6
+SELECT t, i, gen_rand_minstd()
+FROM generate_series('2018-03-04 4:00'::TIMESTAMPTZ, '2018-03-04 6:59', '1 minute') t
+CROSS JOIN generate_series(1, 5, 1) i;
+-- Altering compress chunk time interval will cause us to create 3 chunks from the additional 3 chunks.
+-- Setting compressed chunk to anything less than chunk interval should disable merging chunks.
+ALTER TABLE test6 set (timescaledb.compress_chunk_time_interval=0);
+
+SELECT compress_chunk(i, true) FROM show_chunks('test6') i;
+SELECT count(*) as number_of_chunks FROM show_chunks('test6');
+
+-- Setting compress chunk time to NULL will error out.
+\set ON_ERROR_STOP 0
+ALTER TABLE test6 set (timescaledb.compress_chunk_time_interval=NULL);
+\set ON_ERROR_STOP 1
 
 DROP TABLE test6;
 
@@ -155,8 +197,8 @@ CREATE TABLE test7 ("Time" timestamptz, i integer, j integer, k integer, value i
 SELECT table_name from create_hypertable('test7', 'Time', chunk_time_interval=> INTERVAL '1 hour');
 
 -- This will generate 24 chunks
-INSERT INTO test7 
-SELECT t, i, gen_rand_minstd(), gen_rand_minstd(), gen_rand_minstd()  
+INSERT INTO test7
+SELECT t, i, gen_rand_minstd(), gen_rand_minstd(), gen_rand_minstd()
 FROM generate_series('2018-03-02 1:00'::TIMESTAMPTZ, '2018-03-03 0:59', '1 minute') t
 CROSS JOIN generate_series(1, 5, 1) i;
 
@@ -172,3 +214,22 @@ SELECT 'test7' AS "HYPERTABLE_NAME" \gset
 \ir include/compression_test_merge.sql
 
 DROP TABLE test7;
+
+--#5090
+CREATE TABLE test8(time TIMESTAMPTZ NOT NULL, value DOUBLE PRECISION NOT NULL, series_id BIGINT NOT NULL);
+
+SELECT create_hypertable('test8', 'time', chunk_time_interval => INTERVAL '1 h');
+
+ALTER TABLE test8 set (timescaledb.compress,
+    timescaledb.compress_segmentby = 'series_id',
+    timescaledb.compress_orderby = 'time',
+    timescaledb.compress_chunk_time_interval = '1 day');
+
+INSERT INTO test8 (time, series_id, value) SELECT t, s, 1 FROM generate_series(NOW(), NOW()+INTERVAL'4h', INTERVAL '30s') t CROSS JOIN generate_series(0, 100, 1) s;
+
+SELECT compress_chunk(c, true) FROM show_chunks('test8') c LIMIT 4;
+SET enable_indexscan TO OFF;
+SET enable_seqscan TO OFF;
+SET enable_bitmapscan TO ON;
+
+SELECT count(*) FROM test8 WHERE series_id = 1;

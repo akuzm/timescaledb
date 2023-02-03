@@ -26,6 +26,8 @@ from ci_settings import (
     PG13_LATEST,
     PG14_EARLIEST,
     PG14_LATEST,
+    PG15_EARLIEST,
+    PG15_LATEST,
 )
 
 # github event type which is either push, pull_request or schedule
@@ -135,30 +137,30 @@ def macos_config(overrides):
     return base_config
 
 
+# common installcheck_args for all pg15 tests
+# partialize_finalize is ignored due to #4937
+pg15_installcheck_args = "IGNORES='partialize_finalize'"
+
 # always test debug build on latest of all supported pg versions
 m["include"].append(build_debug_config({"pg": PG12_LATEST}))
 m["include"].append(
     build_debug_config({"pg": PG13_LATEST, "cc": "clang-14", "cxx": "clang++-14"})
 )
 m["include"].append(build_debug_config({"pg": PG14_LATEST}))
-
-m["include"].append(build_release_config(macos_config({})))
-
-m["include"].append(build_without_telemetry({"pg": PG14_LATEST}))
-
 m["include"].append(
-    build_debug_config(
-        {
-            "pg": 15,
-            "snapshot": "snapshot",
-            "tsdb_build_args": "-DASSERTIONS=ON -DREQUIRE_ALL_TESTS=ON -DEXPERIMENTAL=ON",
-            # below tests are tracked as part of #4838
-            "installcheck_args": "SKIPS='003_connections_privs 001_simple_multinode 004_multinode_rdwr_1pc data_node_bootstrap dist_hypertable-15 bgw_custom cagg_dump' "
-            # below tests are tracked as part of #4835
-            "IGNORES='telemetry_stats dist_query dist_partial_agg plan_hashagg partialize_finalize dist_fetcher_type dist_remote_error jit-15 "
-            # below tests are tracked as part of #4837
-            "remote_txn'",
-        }
+    build_debug_config({"pg": PG15_LATEST, "installcheck_args": pg15_installcheck_args})
+)
+
+# test latest postgres release in MacOS
+m["include"].append(
+    build_release_config(
+        macos_config({"pg": PG15_LATEST, "installcheck_args": pg15_installcheck_args})
+    )
+)
+# test latest postgres release without telemetry
+m["include"].append(
+    build_without_telemetry(
+        {"pg": PG15_LATEST, "installcheck_args": pg15_installcheck_args}
     )
 )
 
@@ -200,18 +202,31 @@ if event_type != "pull_request":
         )
     )
 
+    # add debug test for first supported PG15 version
+    m["include"].append(
+        build_debug_config(
+            {"pg": PG15_EARLIEST, "installcheck_args": pg15_installcheck_args}
+        )
+    )
+
     # add debug test for MacOS
     m["include"].append(build_debug_config(macos_config({})))
 
-    # add release test for latest pg 12 and 13
+    # add release test for latest pg releases
     m["include"].append(build_release_config({"pg": PG12_LATEST}))
     m["include"].append(build_release_config({"pg": PG13_LATEST}))
     m["include"].append(build_release_config({"pg": PG14_LATEST}))
+    m["include"].append(
+        build_release_config(
+            {"pg": PG15_LATEST, "installcheck_args": pg15_installcheck_args}
+        )
+    )
 
     # add apache only test for latest pg
     m["include"].append(build_apache_config({"pg": PG12_LATEST}))
     m["include"].append(build_apache_config({"pg": PG13_LATEST}))
     m["include"].append(build_apache_config({"pg": PG14_LATEST}))
+    m["include"].append(build_apache_config({"pg": PG15_LATEST}))
 
     # to discover issues with upcoming releases we run CI against
     # the stable branches of supported PG releases
@@ -223,6 +238,15 @@ if event_type != "pull_request":
                 "installcheck_args": "IGNORES='dist_gapfill_pushdown-14 memoize'",
                 "pg": 14,
                 "snapshot": "snapshot",
+            }
+        )
+    )
+    m["include"].append(
+        build_debug_config(
+            {
+                "pg": 15,
+                "snapshot": "snapshot",
+                "installcheck_args": pg15_installcheck_args,
             }
         )
     )
@@ -269,7 +293,9 @@ else:
             tests.add(name)
         else:
             # Should've been filtered out above.
-            print(f"unknown extension '{ext}' for test output file '{f}'", file=sys.stderr)
+            print(
+                f"unknown extension '{ext}' for test output file '{f}'", file=sys.stderr
+            )
             sys.exit(1)
 
     if tests:

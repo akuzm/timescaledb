@@ -29,34 +29,11 @@ CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finali
 as
 select * from conditions , mat_t1 WITH NO DATA;
 
--- join multiple tables
-CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
-as
-select location, count(*) from conditions , mat_t1
-where conditions.location = mat_t1.c
-group by location WITH NO DATA;
-
--- join multiple tables WITH explicit JOIN
-CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
-as
-select location, count(*) from conditions JOIN mat_t1 ON true
-where conditions.location = mat_t1.c
-group by location WITH NO DATA;
-
--- LATERAL multiple tables
-CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
-as
-select location, count(*) from conditions,
-LATERAL (Select * from mat_t1 where c = conditions.location) q
-group by location WITH NO DATA;
-
-
 --non-hypertable
 CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
 as
 select a, count(*) from mat_t1
 group by a WITH NO DATA;
-
 
 -- no group by
 CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
@@ -335,6 +312,19 @@ Select sum( b), min(c)
 from rowsec_tab
 group by time_bucket('1', a) WITH NO DATA;
 
+-- cagg on cagg not allowed
+CREATE MATERIALIZED VIEW mat_m1 WITH (timescaledb.continuous, timescaledb.finalized = false)
+AS
+SELECT time_bucket('1 day', timec) AS bucket
+  FROM conditions
+GROUP BY time_bucket('1 day', timec);
+
+CREATE MATERIALIZED VIEW mat_m2_on_mat_m1 WITH (timescaledb.continuous)
+AS
+SELECT time_bucket('1 week', bucket) AS bucket
+  FROM mat_m1
+GROUP BY time_bucket('1 week', bucket);
+
 drop table conditions cascade;
 
 --negative tests for WITH options
@@ -595,4 +585,3 @@ FROM
       AND uncompress.table_name = 'comp_ht_test') \gset
 
 CREATE MATERIALIZED VIEW cagg1 WITH(timescaledb.continuous, timescaledb.finalized = false) AS SELECT time_bucket('1h',_ts_meta_min_1) FROM :INTERNALTABLE GROUP BY 1;
-

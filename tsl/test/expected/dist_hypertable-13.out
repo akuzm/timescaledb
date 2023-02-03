@@ -133,7 +133,6 @@ CREATE TABLE underreplicated(time timestamptz, device int, temp float);
 SELECT * FROM create_hypertable('underreplicated', 'time', replication_factor => 4);
 ERROR:  replication factor too large for hypertable "underreplicated"
 \set ON_ERROR_STOP 1
--- can create under-replicated hypertable byf force detaching a data node
 RESET ROLE;
 SELECT node_name, database, node_created, database_created, extension_created
 FROM add_data_node(:'DATA_NODE_4', host => 'localhost', database => :'DATA_NODE_4');
@@ -152,9 +151,50 @@ NOTICE:  adding not-null constraint to column "time"
              2 | public      | underreplicated | t
 (1 row)
 
+-- test that attaching a data node to an existing hypertable with
+-- repartition=>false does not change the number of partitions when
+-- number of partitions is greater than number of data nodes.
+SELECT * FROM set_number_partitions('disttable', 8, 'device');
+ set_number_partitions 
+-----------------------
+ 
+(1 row)
+
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+ table_name | dimension_id |     range_start      |       data_nodes       
+------------+--------------+----------------------+------------------------
+ disttable  |            2 | -9223372036854775808 | {db_dist_hypertable_1}
+ disttable  |            2 |            268435455 | {db_dist_hypertable_2}
+ disttable  |            2 |            536870910 | {db_dist_hypertable_3}
+ disttable  |            2 |            805306365 | {db_dist_hypertable_1}
+ disttable  |            2 |           1073741820 | {db_dist_hypertable_2}
+ disttable  |            2 |           1342177275 | {db_dist_hypertable_3}
+ disttable  |            2 |           1610612730 | {db_dist_hypertable_1}
+ disttable  |            2 |           1879048185 | {db_dist_hypertable_2}
+(8 rows)
+
+SELECT attach_data_node(:'DATA_NODE_4', 'disttable', repartition => false);
+      attach_data_node      
+----------------------------
+ (1,2,db_dist_hypertable_4)
+(1 row)
+
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+ table_name | dimension_id |     range_start      |       data_nodes       
+------------+--------------+----------------------+------------------------
+ disttable  |            2 | -9223372036854775808 | {db_dist_hypertable_1}
+ disttable  |            2 |            268435455 | {db_dist_hypertable_2}
+ disttable  |            2 |            536870910 | {db_dist_hypertable_3}
+ disttable  |            2 |            805306365 | {db_dist_hypertable_4}
+ disttable  |            2 |           1073741820 | {db_dist_hypertable_1}
+ disttable  |            2 |           1342177275 | {db_dist_hypertable_2}
+ disttable  |            2 |           1610612730 | {db_dist_hypertable_3}
+ disttable  |            2 |           1879048185 | {db_dist_hypertable_4}
+(8 rows)
+
 --create new session to clear out connections
 \c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER;
-SELECT * FROM delete_data_node(:'DATA_NODE_4', force => true, drop_database => true);
+SELECT * FROM delete_data_node(:'DATA_NODE_4', force => true, drop_database => true, repartition => false);
 WARNING:  insufficient number of data nodes for distributed hypertable "underreplicated"
  delete_data_node 
 ------------------
@@ -162,6 +202,36 @@ WARNING:  insufficient number of data nodes for distributed hypertable "underrep
 (1 row)
 
 SET ROLE :ROLE_1;
+-- Deleting a data node should also not change the number of
+-- partitions with repartition=>false
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+ table_name | dimension_id |     range_start      |       data_nodes       
+------------+--------------+----------------------+------------------------
+ disttable  |            2 | -9223372036854775808 | {db_dist_hypertable_1}
+ disttable  |            2 |            268435455 | {db_dist_hypertable_2}
+ disttable  |            2 |            536870910 | {db_dist_hypertable_3}
+ disttable  |            2 |            805306365 | {db_dist_hypertable_1}
+ disttable  |            2 |           1073741820 | {db_dist_hypertable_2}
+ disttable  |            2 |           1342177275 | {db_dist_hypertable_3}
+ disttable  |            2 |           1610612730 | {db_dist_hypertable_1}
+ disttable  |            2 |           1879048185 | {db_dist_hypertable_2}
+(8 rows)
+
+-- reset to 3 partitions
+SELECT * FROM set_number_partitions('disttable', 3, 'device');
+ set_number_partitions 
+-----------------------
+ 
+(1 row)
+
+SELECT * FROM hypertable_partitions WHERE table_name = 'disttable';
+ table_name | dimension_id |     range_start      |       data_nodes       
+------------+--------------+----------------------+------------------------
+ disttable  |            2 | -9223372036854775808 | {db_dist_hypertable_1}
+ disttable  |            2 |            715827882 | {db_dist_hypertable_2}
+ disttable  |            2 |           1431655764 | {db_dist_hypertable_3}
+(3 rows)
+
 CREATE OR REPLACE FUNCTION test_trigger()
     RETURNS TRIGGER LANGUAGE PLPGSQL AS
 $BODY$
@@ -809,32 +879,33 @@ EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT device, temp, avg(temp) OVER (PARTITION BY device)
 FROM disttable
 ORDER BY device, temp;
-                                                                                   QUERY PLAN                                                                                    
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Incremental Sort
-   Output: disttable_1.device, disttable_1.temp, (avg(disttable_1.temp) OVER (?))
-   Sort Key: disttable_1.device, disttable_1.temp
-   Presorted Key: disttable_1.device
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Output: disttable.device, disttable.temp, (avg(disttable.temp) OVER (?))
+   Sort Key: disttable.device, disttable.temp
    ->  WindowAgg
-         Output: disttable_1.device, disttable_1.temp, avg(disttable_1.temp) OVER (?)
-         ->  Merge Append
-               Sort Key: disttable_1.device
-               ->  Custom Scan (DataNodeScan) on public.disttable disttable_1
-                     Output: disttable_1.device, disttable_1.temp
-                     Data node: db_dist_hypertable_1
-                     Chunks: _dist_hyper_1_1_chunk, _dist_hyper_1_4_chunk
-                     Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
-               ->  Custom Scan (DataNodeScan) on public.disttable disttable_2
-                     Output: disttable_2.device, disttable_2.temp
-                     Data node: db_dist_hypertable_2
-                     Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_5_chunk
-                     Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
-               ->  Custom Scan (DataNodeScan) on public.disttable disttable_3
-                     Output: disttable_3.device, disttable_3.temp
-                     Data node: db_dist_hypertable_3
-                     Chunks: _dist_hyper_1_2_chunk, _dist_hyper_1_6_chunk
-                     Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
-(23 rows)
+         Output: disttable.device, disttable.temp, avg(disttable.temp) OVER (?)
+         ->  Custom Scan (AsyncAppend)
+               Output: disttable.device, disttable.temp
+               ->  Merge Append
+                     Sort Key: disttable_1.device
+                     ->  Custom Scan (DataNodeScan) on public.disttable disttable_1
+                           Output: disttable_1.device, disttable_1.temp
+                           Data node: db_dist_hypertable_1
+                           Chunks: _dist_hyper_1_1_chunk, _dist_hyper_1_4_chunk
+                           Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
+                     ->  Custom Scan (DataNodeScan) on public.disttable disttable_2
+                           Output: disttable_2.device, disttable_2.temp
+                           Data node: db_dist_hypertable_2
+                           Chunks: _dist_hyper_1_3_chunk, _dist_hyper_1_5_chunk
+                           Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
+                     ->  Custom Scan (DataNodeScan) on public.disttable disttable_3
+                           Output: disttable_3.device, disttable_3.temp
+                           Data node: db_dist_hypertable_3
+                           Chunks: _dist_hyper_1_2_chunk, _dist_hyper_1_6_chunk
+                           Remote SQL: SELECT device, temp FROM public.disttable WHERE _timescaledb_internal.chunks_in(public.disttable.*, ARRAY[1, 2]) ORDER BY device ASC NULLS LAST
+(24 rows)
 
 SELECT device, temp, avg(temp) OVER (PARTITION BY device)
 FROM disttable
@@ -2142,8 +2213,8 @@ SELECT * FROM _timescaledb_catalog.dimension;
  id | hypertable_id |   column_name    |       column_type        | aligned | num_slices | partitioning_func_schema | partitioning_func  | interval_length | compress_interval_length | integer_now_func_schema | integer_now_func 
 ----+---------------+------------------+--------------------------+---------+------------+--------------------------+--------------------+-----------------+--------------------------+-------------------------+------------------
   1 |             1 | time             | timestamp with time zone | t       |            |                          |                    |    604800000000 |                          |                         | 
-  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash |                 |                          |                         | 
   3 |             2 | time             | timestamp with time zone | t       |            |                          |                    |    604800000000 |                          |                         | 
+  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash |                 |                          |                         | 
   5 |             4 | time Col %#^#@$# | timestamp with time zone | t       |            |                          |                    |    604800000000 |                          |                         | 
   6 |             4 | __region         | text                     | f       |          4 | _timescaledb_internal    | get_partition_hash |                 |                          |                         | 
 (5 rows)
@@ -2177,8 +2248,8 @@ NOTICE:  [db_dist_hypertable_1]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  4|            3|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
  5|            3|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
 (5 rows)
@@ -2211,8 +2282,8 @@ NOTICE:  [db_dist_hypertable_2]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  6|            4|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
  7|            4|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
 (5 rows)
@@ -2245,8 +2316,8 @@ NOTICE:  [db_dist_hypertable_3]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  4|            3|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
  5|            3|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
 (5 rows)
@@ -2373,8 +2444,8 @@ SELECT * FROM _timescaledb_catalog.dimension;
  id | hypertable_id |   column_name    |       column_type        | aligned | num_slices | partitioning_func_schema |   partitioning_func   | interval_length | compress_interval_length | integer_now_func_schema | integer_now_func 
 ----+---------------+------------------+--------------------------+---------+------------+--------------------------+-----------------------+-----------------+--------------------------+-------------------------+------------------
   1 |             1 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
-  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   3 |             2 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
+  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   5 |             4 | time Col %#^#@$# | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
   6 |             4 | __region         | text                     | f       |          2 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   7 |             5 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
@@ -2393,8 +2464,8 @@ SELECT * FROM _timescaledb_catalog.dimension;
  id | hypertable_id |   column_name    |       column_type        | aligned | num_slices | partitioning_func_schema |   partitioning_func   | interval_length | compress_interval_length | integer_now_func_schema | integer_now_func 
 ----+---------------+------------------+--------------------------+---------+------------+--------------------------+-----------------------+-----------------+--------------------------+-------------------------+------------------
   1 |             1 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
-  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   3 |             2 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
+  2 |             1 | device           | integer                  | f       |          3 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   5 |             4 | time Col %#^#@$# | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
   6 |             4 | __region         | text                     | f       |          2 | _timescaledb_internal    | get_partition_hash    |                 |                          |                         | 
   7 |             5 | time             | timestamp with time zone | t       |            |                          |                       |    604800000000 |                          |                         | 
@@ -2413,8 +2484,8 @@ NOTICE:  [db_dist_hypertable_1]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func    |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+---------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  4|            3|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
  5|            3|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  6|            4|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
@@ -2430,8 +2501,8 @@ NOTICE:  [db_dist_hypertable_2]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func    |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+---------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  6|            4|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
  7|            4|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash   |               |                        |                       |                
  8|            5|time            |timestamp with time zone|t      |          |                        |                     |   604800000000|                        |                       |                
@@ -2447,8 +2518,8 @@ NOTICE:  [db_dist_hypertable_3]:
 id|hypertable_id|column_name     |column_type             |aligned|num_slices|partitioning_func_schema|partitioning_func |interval_length|compress_interval_length|integer_now_func_schema|integer_now_func
 --+-------------+----------------+------------------------+-------+----------+------------------------+------------------+---------------+------------------------+-----------------------+----------------
  1|            1|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
- 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  3|            2|time            |timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
+ 2|            1|device          |integer                 |f      |         3|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
  4|            3|time Col %#^#@$#|timestamp with time zone|t      |          |                        |                  |   604800000000|                        |                       |                
  5|            3|__region        |text                    |f      |         4|_timescaledb_internal   |get_partition_hash|               |                        |                       |                
 (5 rows)
@@ -3787,15 +3858,15 @@ ANALYZE hyper_estimate;
 EXPLAIN (COSTS ON)
 SELECT *
 FROM hyper_estimate;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
- Append  (cost=100.00..607.58 rows=15 width=20)
-   ->  Foreign Scan on _dist_hyper_16_38_chunk  (cost=100.00..101.40 rows=4 width=20)
-   ->  Foreign Scan on _dist_hyper_16_39_chunk  (cost=100.00..101.20 rows=2 width=20)
-   ->  Foreign Scan on _dist_hyper_16_40_chunk  (cost=100.00..101.30 rows=3 width=20)
-   ->  Foreign Scan on _dist_hyper_16_41_chunk  (cost=100.00..101.20 rows=2 width=20)
-   ->  Foreign Scan on _dist_hyper_16_42_chunk  (cost=100.00..101.30 rows=3 width=20)
-   ->  Foreign Scan on _dist_hyper_16_43_chunk  (cost=100.00..101.10 rows=1 width=20)
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Append  (cost=10000.00..60021.38 rows=15 width=20)
+   ->  Foreign Scan on _dist_hyper_16_38_chunk  (cost=10000.00..10005.08 rows=4 width=20)
+   ->  Foreign Scan on _dist_hyper_16_39_chunk  (cost=10000.00..10003.04 rows=2 width=20)
+   ->  Foreign Scan on _dist_hyper_16_40_chunk  (cost=10000.00..10004.06 rows=3 width=20)
+   ->  Foreign Scan on _dist_hyper_16_41_chunk  (cost=10000.00..10003.04 rows=2 width=20)
+   ->  Foreign Scan on _dist_hyper_16_42_chunk  (cost=10000.00..10004.06 rows=3 width=20)
+   ->  Foreign Scan on _dist_hyper_16_43_chunk  (cost=10000.00..10002.02 rows=1 width=20)
 (7 rows)
 
 -- Let's insert data into a new chunk. This will result in chunk creation.
@@ -3804,16 +3875,16 @@ INSERT INTO hyper_estimate VALUES ('2019-11-11 06:01', 1, 1.1);
 EXPLAIN (COSTS ON)
 SELECT *
 FROM hyper_estimate;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
- Append  (cost=100.00..707.77 rows=17 width=20)
-   ->  Foreign Scan on _dist_hyper_16_38_chunk  (cost=100.00..101.40 rows=4 width=20)
-   ->  Foreign Scan on _dist_hyper_16_39_chunk  (cost=100.00..101.20 rows=2 width=20)
-   ->  Foreign Scan on _dist_hyper_16_40_chunk  (cost=100.00..101.30 rows=3 width=20)
-   ->  Foreign Scan on _dist_hyper_16_41_chunk  (cost=100.00..101.20 rows=2 width=20)
-   ->  Foreign Scan on _dist_hyper_16_42_chunk  (cost=100.00..101.30 rows=3 width=20)
-   ->  Foreign Scan on _dist_hyper_16_43_chunk  (cost=100.00..101.10 rows=1 width=20)
-   ->  Foreign Scan on _dist_hyper_16_44_chunk  (cost=100.00..100.19 rows=2 width=20)
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Append  (cost=10000.00..70023.31 rows=17 width=20)
+   ->  Foreign Scan on _dist_hyper_16_38_chunk  (cost=10000.00..10005.08 rows=4 width=20)
+   ->  Foreign Scan on _dist_hyper_16_39_chunk  (cost=10000.00..10003.04 rows=2 width=20)
+   ->  Foreign Scan on _dist_hyper_16_40_chunk  (cost=10000.00..10004.06 rows=3 width=20)
+   ->  Foreign Scan on _dist_hyper_16_41_chunk  (cost=10000.00..10003.04 rows=2 width=20)
+   ->  Foreign Scan on _dist_hyper_16_42_chunk  (cost=10000.00..10004.06 rows=3 width=20)
+   ->  Foreign Scan on _dist_hyper_16_43_chunk  (cost=10000.00..10002.02 rows=1 width=20)
+   ->  Foreign Scan on _dist_hyper_16_44_chunk  (cost=10000.00..10001.93 rows=2 width=20)
 (8 rows)
 
 CREATE TABLE devices (
@@ -4785,7 +4856,7 @@ Sun Jan 01 09:11:00 2017 PST|     3|  2|  2|  2
 (1 row)
 
 DROP TABLE disttable_serial;
--- Test insert batching case which will hit the limit of arguments for 
+-- Test insert batching case which will hit the limit of arguments for
 -- prepared statements (65k).
 --
 -- Issue: #1702
@@ -4865,7 +4936,7 @@ CREATE TABLE test_1702 (
 	dummy68	int	,
 	dummy69	int	,
 	dummy70	int	,
-	dummy71	int	
+	dummy71	int
 );
 SELECT create_distributed_hypertable('test_1702', 'time', 'id');
 WARNING:  column type "character varying" used for "id" does not follow best practices
@@ -5010,8 +5081,8 @@ ERROR:  cannot migrate data for distributed hypertable
 --
 DROP TABLE disttable;
 CREATE TABLE disttable(
-    time timestamptz NOT NULL, 
-    device int, 
+    time timestamptz NOT NULL,
+    device int,
     value float
 );
 SELECT * FROM create_distributed_hypertable('disttable', 'time', 'device', 3);
@@ -5533,7 +5604,7 @@ SELECT * FROM disttable ORDER BY 1;
 
 -- Check distributed hypertable within procedure properly drops remote tables
 --
--- #3663 
+-- #3663
 --
 CREATE TABLE test (time timestamp, v int);
 SELECT create_distributed_hypertable('test','time');
@@ -6071,7 +6142,7 @@ insert into pruned_chunks_2 select * from pruned_chunks_1 WHERE time > '2022-01-
 -- TEST freeze_chunk api. does not work for distributed chunks
 SELECT chunk_schema || '.' ||  chunk_name as "CHNAME"
 FROM timescaledb_information.chunks
-WHERE hypertable_name = 'pruned_chunks_1' 
+WHERE hypertable_name = 'pruned_chunks_1'
 ORDER BY chunk_name LIMIT 1
 \gset
 \set ON_ERROR_STOP 0

@@ -162,6 +162,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.invalidation_process_cagg_log = tsl_invalidation_process_cagg_log,
 	.cagg_try_repair = tsl_cagg_try_repair,
 
+	/* Compression */
 	.compressed_data_decompress_forward = tsl_compressed_data_decompress_forward,
 	.compressed_data_decompress_reverse = tsl_compressed_data_decompress_reverse,
 	.compressed_data_send = tsl_compressed_data_send,
@@ -181,10 +182,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.process_rename_cmd = tsl_process_rename_cmd,
 	.compress_chunk = tsl_compress_chunk,
 	.decompress_chunk = tsl_decompress_chunk,
-	.compress_row_init = compress_row_init,
-	.compress_row_exec = compress_row_exec,
-	.compress_row_end = compress_row_end,
-	.compress_row_destroy = compress_row_destroy,
+
 	.data_node_add = data_node_add,
 	.data_node_delete = data_node_delete,
 	.data_node_attach = data_node_attach,
@@ -199,6 +197,9 @@ CrossModuleFunctions tsl_cm_functions = {
 	.create_chunk = chunk_create,
 	.create_chunk_on_data_nodes = chunk_api_create_on_data_nodes,
 	.chunk_drop_replica = chunk_drop_replica,
+	.chunk_freeze_chunk = chunk_freeze_chunk,
+	.chunk_unfreeze_chunk = chunk_unfreeze_chunk,
+	.chunks_drop_stale = chunk_drop_stale_chunks,
 	.hypertable_make_distributed = hypertable_make_distributed,
 	.get_and_validate_data_node_list = hypertable_get_and_validate_data_nodes,
 	.timescaledb_fdw_handler = timescaledb_fdw_handler,
@@ -221,6 +222,7 @@ CrossModuleFunctions tsl_cm_functions = {
 	.dist_remote_chunk_info = dist_util_remote_chunk_info,
 	.dist_remote_compressed_chunk_info = dist_util_remote_compressed_chunk_info,
 	.dist_remote_hypertable_index_info = dist_util_remote_hypertable_index_info,
+	.dist_update_stale_chunk_metadata = chunk_update_stale_metadata,
 	.validate_as_data_node = validate_data_node_settings,
 	.distributed_exec = ts_dist_cmd_exec,
 	.create_distributed_restore_point = create_distributed_restore_point,

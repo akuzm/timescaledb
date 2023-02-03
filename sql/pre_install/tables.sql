@@ -203,7 +203,7 @@ CREATE INDEX chunk_compressed_chunk_id_idx ON _timescaledb_catalog.chunk (compre
 --we could use a partial index (where osm_chunk is true). However, the catalog code
 --does not work with partial/functional indexes. So we instead have a full index here.
 --Another option would be to use the status field to identify a OSM chunk. However bit
---operations only work on varbit datatype and not integer datatype. 
+--operations only work on varbit datatype and not integer datatype.
 CREATE INDEX chunk_osm_chunk_idx ON _timescaledb_catalog.chunk (osm_chunk, hypertable_id);
 
 SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.chunk', '');
@@ -350,6 +350,7 @@ SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.metadata', $$
 CREATE TABLE _timescaledb_catalog.continuous_agg (
   mat_hypertable_id integer NOT NULL,
   raw_hypertable_id integer NOT NULL,
+  parent_mat_hypertable_id integer,
   user_view_schema name NOT NULL,
   user_view_name name NOT NULL,
   partial_view_schema name NOT NULL,
@@ -364,7 +365,9 @@ CREATE TABLE _timescaledb_catalog.continuous_agg (
   CONSTRAINT continuous_agg_partial_view_schema_partial_view_name_key UNIQUE (partial_view_schema, partial_view_name),
   CONSTRAINT continuous_agg_user_view_schema_user_view_name_key UNIQUE (user_view_schema, user_view_name),
   CONSTRAINT continuous_agg_mat_hypertable_id_fkey FOREIGN KEY (mat_hypertable_id) REFERENCES _timescaledb_catalog.hypertable (id) ON DELETE CASCADE,
-  CONSTRAINT continuous_agg_raw_hypertable_id_fkey FOREIGN KEY (raw_hypertable_id) REFERENCES _timescaledb_catalog.hypertable (id) ON DELETE CASCADE
+  CONSTRAINT continuous_agg_raw_hypertable_id_fkey FOREIGN KEY (raw_hypertable_id) REFERENCES _timescaledb_catalog.hypertable (id) ON DELETE CASCADE,
+  CONSTRAINT continuous_agg_parent_mat_hypertable_id_fkey FOREIGN KEY (parent_mat_hypertable_id)
+    REFERENCES _timescaledb_catalog.continuous_agg (mat_hypertable_id) ON DELETE CASCADE
 );
 
 CREATE INDEX continuous_agg_raw_hypertable_id_idx ON _timescaledb_catalog.continuous_agg (raw_hypertable_id);
@@ -559,7 +562,7 @@ SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.continuous_agg_
 SELECT pg_catalog.pg_extension_config_dump(pg_get_serial_sequence('_timescaledb_catalog.continuous_agg_migrate_plan_step', 'step_id'), '');
 
 CREATE TABLE _timescaledb_internal.job_errors (
-  job_id integer not null, 
+  job_id integer not null,
   pid integer,
   start_time timestamptz,
   finish_time timestamptz,
@@ -567,6 +570,7 @@ CREATE TABLE _timescaledb_internal.job_errors (
 );
 
 SELECT pg_catalog.pg_extension_config_dump('_timescaledb_internal.job_errors', '');
+
 -- Set table permissions
 -- We need to grant SELECT to PUBLIC for all tables even those not
 -- marked as being dumped because pg_dump will try to access all
@@ -583,3 +587,7 @@ GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_catalog TO PUBLIC;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_config TO PUBLIC;
 
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_internal TO PUBLIC;
+
+-- We want to restrict access to the job errors to only work through
+-- the job_errors view.
+REVOKE ALL ON _timescaledb_internal.job_errors FROM PUBLIC;
