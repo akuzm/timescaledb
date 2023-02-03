@@ -10,11 +10,12 @@
 #include <access/htup_details.h>
 #include <access/multixact.h>
 #include <access/xact.h>
+#include <catalog/heap.h>
+#include <catalog/index.h>
 #include <catalog/namespace.h>
+#include <catalog/pg_am.h>
 #include <catalog/pg_attribute.h>
 #include <catalog/pg_type.h>
-#include <catalog/index.h>
-#include <catalog/heap.h>
 #include <common/base64.h>
 #include <executor/tuptable.h>
 #include <funcapi.h>
@@ -32,8 +33,6 @@
 #include <utils/syscache.h>
 #include <utils/tuplesort.h>
 #include <utils/typcache.h>
-#include <catalog/pg_am.h>
-#include <utils.h>
 
 #include "compat/compat.h"
 
@@ -50,7 +49,6 @@
 #include "ts_catalog/hypertable_compression.h"
 #include "ts_catalog/catalog.h"
 #include "guc.h"
-#include <nodes/print.h>
 
 #define MAX_ROWS_PER_COMPRESSION 1000
 /* gap in sequence id between rows, potential for adding rows in gap later */
@@ -1501,6 +1499,8 @@ typedef struct RowDecompressor
 	PerCompressedColumn *per_compressed_cols;
 	int16 num_compressed_columns;
 
+	TupleDesc in_desc;
+
 	TupleDesc out_desc;
 	Relation out_rel;
 
@@ -1522,6 +1522,45 @@ static void row_decompressor_decompress_row(RowDecompressor *row_decompressor);
 static bool per_compressed_col_get_data(PerCompressedColumn *per_compressed_col,
 										Datum *decompressed_datums, bool *decompressed_is_nulls);
 
+static RowDecompressor
+build_decompressor(Relation in_rel, Relation out_rel)
+{
+	TupleDesc in_desc = RelationGetDescr(in_rel);
+	TupleDesc out_desc = RelationGetDescr(out_rel);
+
+	Oid compressed_typeid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+
+	Assert(OidIsValid(compressed_typeid));
+
+	RowDecompressor decompressor = {
+		.per_compressed_cols =
+			create_per_compressed_column(in_desc, out_desc, out_rel->rd_id, compressed_typeid),
+		.num_compressed_columns = in_desc->natts,
+
+		.in_desc = in_desc,
+
+		.out_desc = out_desc,
+		.out_rel = out_rel,
+
+		.mycid = GetCurrentCommandId(true),
+		.bistate = GetBulkInsertState(),
+
+		/* cache memory used to store the decompressed datums/is_null for form_tuple */
+		.decompressed_datums = palloc(sizeof(Datum) * out_desc->natts),
+		.decompressed_is_nulls = palloc(sizeof(bool) * out_desc->natts),
+	};
+
+	/*
+	 * We need to make sure decompressed_is_nulls is in a defined state. While this
+	 * will get written for normal columns it will not get written for dropped columns
+	 * since dropped columns don't exist in the compressed chunk so we initiallize
+	 * with true here.
+	 */
+	memset(decompressor.decompressed_is_nulls, true, out_desc->natts);
+
+	return decompressor;
+}
+
 void
 decompress_chunk(Oid in_table, Oid out_table)
 {
@@ -1541,73 +1580,43 @@ decompress_chunk(Oid in_table, Oid out_table)
 	 */
 	Relation in_rel = relation_open(in_table, ExclusiveLock);
 
-	TupleDesc in_desc = RelationGetDescr(in_rel);
-	TupleDesc out_desc = RelationGetDescr(out_rel);
+	RowDecompressor decompressor = build_decompressor(in_rel, out_rel);
 
-	Oid compressed_data_type_oid = ts_custom_type_cache_get(CUSTOM_TYPE_COMPRESSED_DATA)->type_oid;
+	Datum *compressed_datums = palloc(sizeof(*compressed_datums) * decompressor.in_desc->natts);
+	bool *compressed_is_nulls = palloc(sizeof(*compressed_is_nulls) * decompressor.in_desc->natts);
 
-	Assert(OidIsValid(compressed_data_type_oid));
+	HeapTuple compressed_tuple;
+	TableScanDesc heapScan = table_beginscan(in_rel, GetLatestSnapshot(), 0, (ScanKey) NULL);
+	MemoryContext per_compressed_row_ctx =
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "decompress chunk per-compressed row",
+							  ALLOCSET_DEFAULT_SIZES);
 
+	for (compressed_tuple = heap_getnext(heapScan, ForwardScanDirection); compressed_tuple != NULL;
+		 compressed_tuple = heap_getnext(heapScan, ForwardScanDirection))
 	{
-		RowDecompressor decompressor = {
-			.per_compressed_cols = create_per_compressed_column(in_desc,
-																out_desc,
-																out_table,
-																compressed_data_type_oid),
-			.num_compressed_columns = in_desc->natts,
+		MemoryContext old_ctx;
 
-			.out_desc = out_desc,
-			.out_rel = out_rel,
+		Assert(HeapTupleIsValid(compressed_tuple));
 
-			.mycid = GetCurrentCommandId(true),
-			.bistate = GetBulkInsertState(),
+		old_ctx = MemoryContextSwitchTo(per_compressed_row_ctx);
 
-			/* cache memory used to store the decompressed datums/is_null for form_tuple */
-			.decompressed_datums = palloc(sizeof(Datum) * out_desc->natts),
-			.decompressed_is_nulls = palloc(sizeof(bool) * out_desc->natts),
-		};
-		/*
-		 * We need to make sure decompressed_is_nulls is in a defined state. While this
-		 * will get written for normal columns it will not get written for dropped columns
-		 * since dropped columns don't exist in the compressed chunk so we initiallize
-		 * with true here.
-		 */
-		memset(decompressor.decompressed_is_nulls, true, out_desc->natts);
+		heap_deform_tuple(compressed_tuple,
+						  decompressor.in_desc,
+						  compressed_datums,
+						  compressed_is_nulls);
+		populate_per_compressed_columns_from_data(decompressor.per_compressed_cols,
+												  decompressor.in_desc->natts,
+												  compressed_datums,
+												  compressed_is_nulls);
 
-		Datum *compressed_datums = palloc(sizeof(*compressed_datums) * in_desc->natts);
-		bool *compressed_is_nulls = palloc(sizeof(*compressed_is_nulls) * in_desc->natts);
-
-		HeapTuple compressed_tuple;
-		TableScanDesc heapScan = table_beginscan(in_rel, GetLatestSnapshot(), 0, (ScanKey) NULL);
-		MemoryContext per_compressed_row_ctx =
-			AllocSetContextCreate(CurrentMemoryContext,
-								  "decompress chunk per-compressed row",
-								  ALLOCSET_DEFAULT_SIZES);
-
-		for (compressed_tuple = heap_getnext(heapScan, ForwardScanDirection);
-			 compressed_tuple != NULL;
-			 compressed_tuple = heap_getnext(heapScan, ForwardScanDirection))
-		{
-			MemoryContext old_ctx;
-
-			Assert(HeapTupleIsValid(compressed_tuple));
-
-			old_ctx = MemoryContextSwitchTo(per_compressed_row_ctx);
-
-			heap_deform_tuple(compressed_tuple, in_desc, compressed_datums, compressed_is_nulls);
-			populate_per_compressed_columns_from_data(decompressor.per_compressed_cols,
-													  in_desc->natts,
-													  compressed_datums,
-													  compressed_is_nulls);
-
-			row_decompressor_decompress_row(&decompressor);
-			MemoryContextSwitchTo(old_ctx);
-			MemoryContextReset(per_compressed_row_ctx);
-		}
-
-		heap_endscan(heapScan);
-		FreeBulkInsertState(decompressor.bistate);
+		row_decompressor_decompress_row(&decompressor);
+		MemoryContextSwitchTo(old_ctx);
+		MemoryContextReset(per_compressed_row_ctx);
 	}
+
+	heap_endscan(heapScan);
+	FreeBulkInsertState(decompressor.bistate);
 
 	/* Recreate all indexes on out rel, we already have an exclusive lock on it,
 	 * so the strong locks taken by reindex_relation shouldn't matter. */
@@ -2028,176 +2037,4 @@ update_compressed_chunk_relstats(Oid uncompressed_relid, Oid compressed_relid)
 		restore_pgclass_stats(uncompressed_relid, comp_pages, comp_visible, out_tuples);
 		CommandCounterIncrement();
 	}
-}
-
-typedef struct CompressSingleRowState
-{
-	Relation in_rel;
-	Relation out_rel;
-	RowCompressor row_compressor;
-	TupleTableSlot *out_slot;
-} CompressSingleRowState;
-
-static TupleTableSlot *compress_singlerow(CompressSingleRowState *cr, TupleTableSlot *in_slot);
-
-CompressSingleRowState *
-compress_row_init(int srcht_id, Relation in_rel, Relation out_rel)
-{
-	ListCell *lc;
-	List *htcols_list = NIL;
-	int i = 0, cclen;
-	const ColumnCompressionInfo **ccinfo;
-	TupleDesc in_desc = RelationGetDescr(in_rel);
-	TupleDesc out_desc = RelationGetDescr(out_rel);
-	int16 *in_column_offsets;
-	int n_keys;
-	const ColumnCompressionInfo **keys;
-
-	CompressSingleRowState *cr = palloc(sizeof(CompressSingleRowState));
-	cr->out_slot =
-		MakeSingleTupleTableSlot(RelationGetDescr(out_rel), table_slot_callbacks(out_rel));
-	cr->in_rel = in_rel;
-	cr->out_rel = out_rel;
-
-	/* get compression properties for hypertable */
-	htcols_list = ts_hypertable_compression_get(srcht_id);
-	cclen = list_length(htcols_list);
-	ccinfo = palloc(sizeof(ColumnCompressionInfo *) * cclen);
-	foreach (lc, htcols_list)
-	{
-		FormData_hypertable_compression *fd = (FormData_hypertable_compression *) lfirst(lc);
-		ccinfo[i++] = fd;
-	}
-	in_column_offsets =
-		compress_chunk_populate_keys(RelationGetRelid(in_rel), ccinfo, cclen, &n_keys, &keys);
-	row_compressor_init(&cr->row_compressor,
-						in_desc,
-						out_rel,
-						cclen,
-						ccinfo,
-						in_column_offsets,
-						out_desc->natts,
-						false /*need_bistate*/);
-	return cr;
-}
-
-/* create a single row compressed tuple from data in slot */
-TupleTableSlot *
-compress_row_exec(CompressSingleRowState *cr, TupleTableSlot *slot)
-{
-	TupleTableSlot *compress_slot;
-	slot_getallattrs(slot);
-
-	cr->row_compressor.rows_compressed_into_current_value = 0;
-	row_compressor_update_group(&cr->row_compressor, slot);
-	row_compressor_append_row(&cr->row_compressor, slot);
-	compress_slot = compress_singlerow(cr, slot);
-	return compress_slot;
-}
-
-static TupleTableSlot *
-compress_singlerow(CompressSingleRowState *cr, TupleTableSlot *in_slot)
-{
-	Datum *invalues, *out_values;
-	bool *out_isnull;
-	TupleTableSlot *out_slot = cr->out_slot;
-	RowCompressor *row_compressor = &cr->row_compressor;
-
-	ExecClearTuple(out_slot);
-
-	/* ExecClearTuple above will leave dropped columns as non-null, which will
-	 * cause a segmentation fault in `heap_compute_data_size` since that
-	 * function expects dropped columns to have the null bit set. Since the
-	 * null bits are set below for all columns except */
-	memset(out_slot->tts_isnull,
-		   true,
-		   sizeof(*out_slot->tts_isnull) * out_slot->tts_tupleDescriptor->natts);
-
-	invalues = in_slot->tts_values;
-	out_values = out_slot->tts_values;
-	out_isnull = out_slot->tts_isnull;
-
-	/* Possible optimization: Can we do a pass through compression without a
-	 * full copy?  full copy needed for multiple values. But we are dealing
-	 * only with a single value, so just need the result of transformation
-	 * after passing it through the compressor function This probably needs a
-	 * bit of rewrite of the compression algorithm code
-	 */
-	Assert(row_compressor->n_input_columns == in_slot->tts_tupleDescriptor->natts);
-	for (int col = 0; col < row_compressor->n_input_columns; col++)
-	{
-		PerColumn *column = &row_compressor->per_column[col];
-		Compressor *compressor = row_compressor->per_column[col].compressor;
-		int in_colno = col;
-
-		int16 out_colno = row_compressor->uncompressed_col_to_compressed_col[col];
-		/* if there is no compressor, this must be a segmenter */
-		if (compressor != NULL)
-		{
-			void *compressed_data;
-			compressed_data = compressor->finish(compressor);
-			out_isnull[out_colno] = (compressed_data == NULL);
-			if (compressed_data)
-				out_values[out_colno] = PointerGetDatum(compressed_data);
-			if (column->min_max_metadata_builder != NULL)
-			{
-				if (compressed_data)
-				{
-					/* we can copy directly since we have only 1 row. */
-					out_isnull[column->min_metadata_attr_offset] = false;
-					out_isnull[column->max_metadata_attr_offset] = false;
-					out_values[column->min_metadata_attr_offset] = invalues[in_colno];
-					out_values[column->max_metadata_attr_offset] = invalues[in_colno];
-				}
-				else
-				{
-					out_isnull[column->min_metadata_attr_offset] = true;
-					out_isnull[column->max_metadata_attr_offset] = true;
-				}
-
-				segment_meta_min_max_builder_reset(column->min_max_metadata_builder);
-			}
-		}
-		/* if there is no compressor, this must be a segmenter */
-		else if (column->segment_info != NULL)
-		{
-			out_isnull[out_colno] = column->segment_info->is_null;
-			if (column->segment_info->is_null)
-				out_values[out_colno] = 0;
-			else
-				out_values[out_colno] = invalues[in_colno];
-		}
-		else
-		{
-			/* we have a 1-1 column mapping from uncompressed -> compressed chunk.
-			 * However, some columns could have been dropped from the uncompressed
-			 *chunk before the compressed one is created.
-			 */
-			Assert(out_colno == 0);
-		}
-	}
-
-	/* fill in additional meta data info */
-	out_values[row_compressor->count_metadata_column_offset] =
-		Int32GetDatum(1); /*we have only 1 row */
-	out_isnull[row_compressor->count_metadata_column_offset] = false;
-	/* Add an invalid sequence number */
-	out_values[row_compressor->sequence_num_metadata_column_offset] = Int32GetDatum(0);
-	out_isnull[row_compressor->sequence_num_metadata_column_offset] = false;
-
-	Assert(row_compressor->rows_compressed_into_current_value == 1);
-	ExecStoreVirtualTuple(out_slot);
-	return out_slot;
-}
-
-void
-compress_row_end(CompressSingleRowState *cr)
-{
-	row_compressor_finish(&cr->row_compressor);
-}
-
-void
-compress_row_destroy(CompressSingleRowState *cr)
-{
-	ExecDropSingleTupleTableSlot(cr->out_slot);
 }

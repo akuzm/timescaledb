@@ -31,6 +31,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     APPEND
     TEST_FILES
     bgw_db_scheduler.sql
+    job_errors_permissions.sql
     troubleshooting_job_errors.sql
     bgw_db_scheduler_fixed.sql
     bgw_reorder_drop_chunks.sql
@@ -95,9 +96,6 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     transparent_decompression_queries.sql
     tsl_tables.sql
     license_tsl.sql)
-  if(USE_TELEMETRY)
-    list(APPEND TEST_FILES telemetry_stats.sql)
-  endif()
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 
 if((${PG_VERSION_MAJOR} GREATER_EQUAL "14"))
@@ -110,6 +108,7 @@ set(SOLO_TESTS
     # dist_hypertable needs a lot of memory when the Sanitizer is active
     dist_hypertable-${PG_VERSION_MAJOR}
     bgw_db_scheduler
+    job_errors_permissions
     troubleshooting_job_errors
     bgw_db_scheduler_fixed
     bgw_reorder_drop_chunks
@@ -129,7 +128,13 @@ set(SOLO_TESTS
     remote_txn
     remote_txn_resolve
     reorder
-    telemetry_stats)
+    telemetry_stats-${PG_VERSION_MAJOR})
+
+# In PG15.0 and PG15.1, dist_move_chunk can get stuck when run in parallel with
+# other tests as mentioned in #4972.
+if(${PG_VERSION_MAJOR} EQUAL "15" AND ${PG_VERSION_MINOR} LESS "2")
+  list(APPEND SOLO_TESTS dist_move_chunk)
+endif()
 
 set(TEST_TEMPLATES
     compression_insert.sql.in cagg_union_view.sql.in plan_skip_scan.sql.in
@@ -149,10 +154,15 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     dist_hypertable.sql.in
     remote_copy.sql.in
     dist_grant.sql.in
+    dist_ref_table_join.sql.in
     dist_partial_agg.sql.in
     dist_query.sql.in
     cagg_invalidation_dist_ht.sql.in
-    continuous_aggs.sql.in)
+    continuous_aggs.sql.in
+    cagg_joins.sql.in)
+  if(USE_TELEMETRY)
+    list(APPEND TEST_TEMPLATES telemetry_stats.sql.in)
+  endif()
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 
 # Check if PostgreSQL was compiled with JIT support

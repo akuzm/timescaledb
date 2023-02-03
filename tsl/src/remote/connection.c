@@ -24,6 +24,7 @@
 #include <nodes/makefuncs.h>
 #include <port.h>
 #include <postmaster/postmaster.h>
+#include <storage/latch.h>
 #include <utils/builtins.h>
 #include <utils/fmgrprotos.h>
 #include <utils/inval.h>
@@ -51,10 +52,14 @@
  * This library file contains convenience functionality around the libpq
  * API. The major additional functionality offered includes:
  *
- * - libpq object lifecycles are tied to transactions (connections and
- *   results). This ensures that there are no memory leaks caused by libpq
- *   objects after a transaction completes.
- * - connection configuration suitable for TimescaleDB.
+ * - Lifecycle management: a connection is tied to the memory context it is
+ *   created in and result objects are tied to the connection they are created
+ *   from. The aim is to avoid memory leaks of libpq objects that aren't
+ *   allocated on a PostgreSQL memory context.
+ *
+ * - Connection configuration suitable for TimescaleDB, ensuring the data
+ *	 nodes use the same relevant configurations as the access node (e.g., time
+ *	 zone).
  *
  * NOTE that it is strongly adviced that connection-related functions do not
  * throw exceptions with, e.g., elog(ERROR). While exceptions can be caught
@@ -68,8 +73,8 @@
  * able to proceed even if the node is no longer available to respond to a
  * connection. Another example is performing a liveness check for node status.
  *
- * Therefore, it is best that defer throwing exceptions to high-level
- * functions that know when it is appropriate.
+ * Therefore, it is best to defer throwing exceptions to high-level functions
+ * that know when it is appropriate.
  */
 
 /* for assigning cursor numbers and prepared statement numbers */
@@ -144,29 +149,29 @@ list_insert_after(ListNode *entry, ListNode *prev)
  */
 typedef struct ResultEntry
 {
-	struct ListNode ln;		  /* Must be first entry */
-	TSConnection *conn;		  /* The connection the result was created on */
-	SubTransactionId subtxid; /* The subtransaction ID that created this result, if any. */
+	struct ListNode ln; /* Must be first entry */
+	TSConnection *conn; /* The connection the result was created on */
 	PGresult *result;
 } ResultEntry;
 
 typedef struct TSConnection
 {
-	ListNode ln;		/* Must be first entry */
-	PGconn *pg_conn;	/* PostgreSQL connection */
-	bool closing_guard; /* Guard against calling PQfinish() directly on PGconn */
+	ListNode ln;	 /* Must be first entry */
+	PGconn *pg_conn; /* PostgreSQL connection */
 	TSConnectionStatus status;
-	NameData node_name;		  /* Associated data node name */
-	char *tz_name;			  /* Timezone name last sent over connection */
-	bool autoclose;			  /* Set if this connection should automatically
-							   * close at the end of the (sub-)transaction */
-	SubTransactionId subtxid; /* The subtransaction ID that created this connection, if any. */
-	int xact_depth;			  /* 0 => no transaction, 1 => main transaction, > 1 =>
-							   * levels of subtransactions */
-	bool xact_transitioning;  /* TRUE if connection is transitioning to
-							   * another transaction state */
-	ListNode results;		  /* Head of PGresult list */
+	NameData node_name;				 /* Associated data node name */
+	char tz_name[TZ_STRLEN_MAX + 1]; /* Timezone name last sent over connection */
+	int xact_depth;					 /* 0 => no transaction, 1 => main transaction, > 1 =>
+									  * levels of subtransactions */
+	bool xact_transitioning;		 /* TRUE if connection is transitioning to
+									  * another transaction state */
+	ListNode results;				 /* Head of PGresult list */
 	bool binary_copy;
+	MemoryContext mcxt;
+	MemoryContextCallback mcxt_cb;
+	bool mcxt_cb_invoked;
+	WaitEventSet *wes;
+	int sockeventpos;
 } TSConnection;
 
 /*
@@ -345,15 +350,6 @@ fill_result_error(TSConnectionError *err, int errcode, const char *errmsg, const
 #define EVENTPROC_FAILURE 0
 #define EVENTPROC_SUCCESS 1
 
-static void
-remote_connection_free(TSConnection *conn)
-{
-	if (NULL != conn->tz_name)
-		free(conn->tz_name);
-
-	free(conn);
-}
-
 /*
  * Invoked on PQfinish(conn). Frees all PGresult objects created on the
  * connection, apart from those already freed with PQclear().
@@ -366,7 +362,6 @@ handle_conn_destroy(PGEventConnDestroy *event)
 	ListNode *curr;
 
 	Assert(NULL != conn);
-	Assert(conn->closing_guard);
 
 	curr = conn->results.next;
 
@@ -382,20 +377,20 @@ handle_conn_destroy(PGEventConnDestroy *event)
 		results_count++;
 	}
 
-	conn->pg_conn = NULL;
-	list_detach(&conn->ln);
-
 	if (results_count > 0)
 		elog(DEBUG3, "cleared %u result objects on connection %p", results_count, conn);
 
 	connstats.connections_closed++;
 
-	if (!conn->closing_guard)
-	{
-		ereport(WARNING,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("invalid closing of connection")));
-		remote_connection_free(conn);
-	}
+	conn->pg_conn = NULL;
+	list_detach(&conn->ln);
+
+	FreeWaitEventSet(conn->wes);
+
+	/* No need to delete the memory context here if handler was invoked by the
+	 * MemoryContextDelete callback */
+	if (!conn->mcxt_cb_invoked)
+		MemoryContextDelete(conn->mcxt);
 
 	return EVENTPROC_SUCCESS;
 }
@@ -411,29 +406,19 @@ handle_result_create(PGEventResultCreate *event)
 	ResultEntry *entry;
 
 	Assert(NULL != conn);
-
-	/* We malloc this (instead of palloc) since bound PGresult, which also
-	 * lives outside PostgreSQL's memory management. */
-	entry = malloc(sizeof(ResultEntry));
+	entry = MemoryContextAllocZero(conn->mcxt, sizeof(ResultEntry));
 
 	if (NULL == entry)
 		return EVENTPROC_FAILURE;
 
-	MemSet(entry, 0, sizeof(ResultEntry));
 	entry->ln.next = entry->ln.prev = NULL;
 	entry->conn = conn;
 	entry->result = event->result;
-	entry->subtxid = GetCurrentSubTransactionId();
-
 	/* Add entry as new head and set instance data */
 	list_insert_after(&entry->ln, &conn->results);
 	PQresultSetInstanceData(event->result, eventproc, entry);
 
-	elog(DEBUG3,
-		 "created result %p on connection %p subtxid %u",
-		 event->result,
-		 conn,
-		 entry->subtxid);
+	elog(DEBUG3, "created result %p on connection %p", event->result, conn);
 
 	connstats.results_created++;
 
@@ -454,9 +439,9 @@ handle_result_destroy(PGEventResultDestroy *event)
 	/* Detach entry */
 	list_detach(&entry->ln);
 
-	elog(DEBUG3, "destroyed result %p for subtxnid %u", entry->result, entry->subtxid);
+	elog(DEBUG3, "destroyed result %p", entry->result);
 
-	free(entry);
+	pfree(entry);
 
 	connstats.results_cleared++;
 
@@ -485,6 +470,10 @@ eventproc(PGEventId eventid, void *eventinfo, void *data)
 			break;
 		case PGEVT_RESULTDESTROY:
 			res = handle_result_destroy((PGEventResultDestroy *) eventinfo);
+			break;
+		case PGEVT_RESULTCOPY:
+			/* Not used in the code, so not handled */
+			Assert(false);
 			break;
 		default:
 			/* Not of interest, so return success */
@@ -623,6 +612,41 @@ extract_connection_options(List *defelems, const char **keywords, const char **v
 	return option_pos;
 }
 
+static bool
+prepend_enforced_conn_settings(TSConnection *conn, StringInfo cmdbuf)
+{
+	const char *local_tz_name = pg_get_timezone_name(session_timezone);
+
+	/*
+	 * We need to enforce the same timezone setting across nodes. Otherwise,
+	 * we might get the wrong result when we push down things like
+	 * date_trunc(text, timestamptz). To safely do that, we also need the
+	 * timezone databases to be the same on all data nodes.
+	 *
+	 * We save away the timezone name so that we know what we last sent over
+	 * the connection. If the time zone changed since last time we sent a
+	 * command, we will send a SET TIMEZONE command with the new timezone
+	 * first.
+	 */
+	if (conn->tz_name[0] == '\0' ||
+		(local_tz_name && pg_strcasecmp(conn->tz_name, local_tz_name) != 0))
+	{
+		StringInfo newcmd = makeStringInfo();
+
+		strncpy(conn->tz_name, local_tz_name, TZ_STRLEN_MAX);
+		appendStringInfo(newcmd, "SET TIMEZONE = '%s'", local_tz_name);
+
+		if (cmdbuf->len > 0)
+			appendStringInfo(newcmd, ";%s", cmdbuf->data);
+
+		*cmdbuf = *newcmd;
+
+		return true;
+	}
+
+	return false;
+}
+
 /*
  * Internal connection configure.
  *
@@ -630,18 +654,17 @@ extract_connection_options(List *defelems, const char **keywords, const char **v
  * changed. It is used to pass on configuration settings before executing a
  * command requested by module users.
  *
- * ATTENTION! This function should *not* use
- * `remote_connection_exec_ok_command` since this function is called
- * indirectly whenever a remote command is executed, which would lead to
- * infinite recursion. Stick to `PQ*` functions.
- *
  * Returns true if the current configuration is OK (no change) or was
  * successfully applied, otherwise false.
  */
 bool
 remote_connection_configure_if_changed(TSConnection *conn)
 {
-	const char *local_tz_name = pg_get_timezone_name(session_timezone);
+	StringInfoData cmd = {
+		.data = NULL,
+		.len = 0,
+		.maxlen = 0,
+	};
 	bool success = true;
 
 	/*
@@ -655,17 +678,11 @@ remote_connection_configure_if_changed(TSConnection *conn)
 	 * command, we will send a SET TIMEZONE command with the new timezone
 	 * first.
 	 */
-	if (conn->tz_name == NULL ||
-		(local_tz_name && pg_strcasecmp(conn->tz_name, local_tz_name) != 0))
+	if (prepend_enforced_conn_settings(conn, &cmd))
 	{
-		char *set_timezone_cmd = psprintf("SET TIMEZONE = '%s'", local_tz_name);
-		PGresult *result = PQexec(conn->pg_conn, set_timezone_cmd);
-
-		success = PQresultStatus(result) == PGRES_COMMAND_OK;
+		PGresult *result = remote_connection_exec(conn, cmd.data);
+		success = (PQresultStatus(result) == PGRES_COMMAND_OK);
 		PQclear(result);
-		pfree(set_timezone_cmd);
-		free(conn->tz_name);
-		conn->tz_name = strdup(local_tz_name);
 	}
 
 	return success;
@@ -691,6 +708,7 @@ static const char *default_connection_options[] = {
 	"SET datestyle = ISO",
 	"SET intervalstyle = postgres",
 	"SET extra_float_digits = 3",
+	"SET statement_timeout = 0",
 	NULL,
 };
 
@@ -722,30 +740,49 @@ remote_connection_configure(TSConnection *conn)
 		i++;
 	}
 
-	result = PQexec(conn->pg_conn, sql.data);
+	result = remote_connection_exec(conn, sql.data);
 	success = PQresultStatus(result) == PGRES_COMMAND_OK;
 	PQclear(result);
+	pfree(sql.data);
 
 	return success;
 }
 
+static void
+connection_memcxt_reset_cb(void *arg)
+{
+	TSConnection *conn = arg;
+
+	conn->mcxt_cb_invoked = true;
+
+	/* Close the connection and free all attached resources, unless already
+	 * closed explicitly before being freed. */
+	if (conn->pg_conn != NULL)
+		PQfinish(conn->pg_conn);
+}
+
+/*
+ * Create a new connection.
+ *
+ * The returned connection object is allocated on the current memory context
+ * and is tied to its life-cycle. The connection object includes natively
+ * allocated memory from libpq (via malloc) which will be freed via callbacks
+ * when the main memory context is freed.
+ */
 static TSConnection *
 remote_connection_create(PGconn *pg_conn, bool processing, const char *node_name)
 {
-	TSConnection *conn = malloc(sizeof(TSConnection));
+	MemoryContext mcxt =
+		AllocSetContextCreate(CurrentMemoryContext, "TSConnection", ALLOCSET_SMALL_SIZES);
+	TSConnection *conn = MemoryContextAllocZero(mcxt, sizeof(TSConnection));
 	int ret;
-
-	if (NULL == conn)
-		return NULL;
-
-	MemSet(conn, 0, sizeof(TSConnection));
 
 	/* Must register the event procedure before attaching any instance data */
 	ret = PQregisterEventProc(pg_conn, eventproc, "remote connection", conn);
 
 	if (ret == 0)
 	{
-		free(conn);
+		MemoryContextDelete(mcxt);
 		return NULL;
 	}
 
@@ -754,43 +791,35 @@ remote_connection_create(PGconn *pg_conn, bool processing, const char *node_name
 
 	conn->ln.next = conn->ln.prev = NULL;
 	conn->pg_conn = pg_conn;
-	conn->closing_guard = false;
 	remote_connection_set_status(conn, processing ? CONN_PROCESSING : CONN_IDLE);
 	namestrcpy(&conn->node_name, node_name);
-	conn->tz_name = NULL;
-	conn->autoclose = true;
-	conn->subtxid = GetCurrentSubTransactionId();
+	conn->tz_name[0] = '\0';
 	conn->xact_depth = 0;
 	conn->xact_transitioning = false;
 	/* Initialize results head */
 	conn->results.next = &conn->results;
 	conn->results.prev = &conn->results;
 	conn->binary_copy = false;
-	list_insert_after(&conn->ln, &connections);
+	conn->mcxt = mcxt;
+	conn->wes = CreateWaitEventSet(mcxt, 3);
+	AddWaitEventToSet(conn->wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(conn->wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	/* Register the socket to get the position in the events array. The actual
+	 * events used here does not matter, since it will be modified as
+	 * appropriate when needed. */
+	conn->sockeventpos =
+		AddWaitEventToSet(conn->wes, WL_SOCKET_READABLE, PQsocket(conn->pg_conn), NULL, NULL);
 
+	/* Register a memory context callback that will ensure the connection is
+	 * always closed and the resources are freed */
+	conn->mcxt_cb.func = connection_memcxt_reset_cb;
+	conn->mcxt_cb.arg = conn;
+	MemoryContextRegisterResetCallback(mcxt, &conn->mcxt_cb);
+	list_insert_after(&conn->ln, &connections);
 	elog(DEBUG3, "created connection %p", conn);
 	connstats.connections_created++;
 
 	return conn;
-}
-
-/*
- * Set the auto-close behavior.
- *
- * If set, the connection will be closed at the end of the (sub-)transaction
- * it was created on.
- *
- * The default value is on (true).
- *
- * Returns the previous setting.
- */
-bool
-remote_connection_set_autoclose(TSConnection *conn, bool autoclose)
-{
-	bool old = conn->autoclose;
-
-	conn->autoclose = autoclose;
-	return old;
 }
 
 int
@@ -890,30 +919,155 @@ remote_connection_get_result_error(const PGresult *res, TSConnectionError *err)
 	fill_result_error(err, ERRCODE_CONNECTION_EXCEPTION, "", res);
 }
 
+PGresult *
+remote_connection_get_result(const TSConnection *conn)
+{
+	PGresult *pgres = NULL;
+	int busy = 1;
+
+	do
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		busy = PQisBusy(conn->pg_conn);
+
+		if (busy == 1)
+		{
+			/* Busy, wait for readable */
+			WaitEvent event;
+
+			ModifyWaitEvent(conn->wes, conn->sockeventpos, WL_SOCKET_READABLE, NULL);
+			WaitEventSetWait(conn->wes, -1, &event, 1, PG_WAIT_EXTENSION);
+
+			if (event.events & WL_LATCH_SET)
+			{
+				/* Check for interrupts at top of the loop */
+				ResetLatch(MyLatch);
+			}
+
+			if (event.events & WL_SOCKET_READABLE)
+			{
+				Assert(event.pos == conn->sockeventpos);
+				Assert(event.fd == PQsocket(conn->pg_conn));
+
+				if (PQconsumeInput(conn->pg_conn) == 0)
+				{
+					pgres = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
+					PQfireResultCreateEvents(conn->pg_conn, pgres);
+					return pgres;
+				}
+			}
+		}
+		else if (busy == 0)
+		{
+			/* PQgetResult would not block */
+			pgres = PQgetResult(conn->pg_conn);
+		}
+		else
+		{
+			pg_unreachable();
+			Assert(false);
+		}
+	} while (busy == 1);
+
+	return pgres;
+}
+
 /*
  * Execute a remote command.
  *
- * Like PQexec, which this functions uses internally, the PGresult returned
- * describes only the last command executed in a multi-command string.
+ * The execution blocks until a result is received or a failure occurs. Unlike
+ * PQexec() and PQexecParams(), however, this function observes PostgreSQL
+ * interrupts (e.g., a query is canceled). Like PQexecParams(), the PGresult
+ * returned describes only the last command executed in a multi-command
+ * string.
  */
 PGresult *
 remote_connection_exec(TSConnection *conn, const char *cmd)
 {
-	PGresult *res;
+	WaitEvent event;
+	PGresult *res = NULL;
+	int ret = 0;
+	size_t cmdlen = strlen(cmd);
+	StringInfoData cmd_buf = {
+		.data = (char *) cmd,
+		.len = cmdlen,
+		.maxlen = cmdlen + 1,
+	};
 
-	if (!remote_connection_configure_if_changed(conn))
+	prepend_enforced_conn_settings(conn, &cmd_buf);
+
+	do
 	{
-		res = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
-		PQfireResultCreateEvents(conn->pg_conn, res);
-		return res;
-	}
+		CHECK_FOR_INTERRUPTS();
 
-	res = PQexec(conn->pg_conn, cmd);
+		/* Wait for writable socket in outer loop */
+		ModifyWaitEvent(conn->wes, conn->sockeventpos, WL_SOCKET_WRITEABLE, NULL);
+		WaitEventSetWait(conn->wes, -1, &event, 1, PG_WAIT_EXTENSION);
+
+		if (event.events & WL_LATCH_SET)
+		{
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (event.events & WL_SOCKET_WRITEABLE)
+		{
+			PGresult *last_result;
+
+			ret = PQsendQuery(conn->pg_conn, cmd_buf.data);
+
+			if (ret == 0)
+			{
+				res = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
+				PQfireResultCreateEvents(conn->pg_conn, res);
+				return res;
+			}
+
+			/* Command sent, so now wait for readable result in inner loop */
+			last_result = NULL;
+
+			/*
+			 * Read all results, but return only one in order to recreate the
+			 * behavior of the blocking PQexec() call. We need to handle
+			 * PG12,13 differently to be compatible across all versions of
+			 * PostgreSQL. In libpq's PQexec() errors from all the results are
+			 * concactinated, but that is not possible here due to lack of
+			 * access to internals. PG14 handles that automatically, however.
+			 */
+			while ((res = remote_connection_get_result(conn)) != NULL)
+			{
+				if (last_result)
+				{
+#if PG14_LT
+					if (PQresultStatus(last_result) == PGRES_FATAL_ERROR &&
+						PQresultStatus(res) == PGRES_FATAL_ERROR)
+					{
+						PQclear(res);
+						res = last_result;
+					}
+					else
+						PQclear(last_result);
+#else
+					PQclear(last_result);
+#endif
+				}
+
+				last_result = res;
+
+				if (PQresultStatus(res) == PGRES_COPY_IN || PQresultStatus(res) == PGRES_COPY_OUT ||
+					PQresultStatus(res) == PGRES_COPY_BOTH ||
+					PQstatus(conn->pg_conn) == CONNECTION_BAD)
+					break;
+			}
+
+			res = last_result;
+		}
+	} while (res == NULL);
 
 	/*
 	 * Workaround for the libpq disconnect case.
 	 *
-	 * libpq disconnect will create an result object without creating
+	 * libpq disconnect will create an empty result object without generating
 	 * events, which is usually done for a regular errors.
 	 *
 	 * In order to be compatible with our error handling code, force
@@ -922,15 +1076,12 @@ remote_connection_exec(TSConnection *conn, const char *cmd)
 	 */
 	if (res)
 	{
-		ExecStatusType status = PQresultStatus(res);
 		ResultEntry *entry = PQresultInstanceData(res, eventproc);
 
-		if (status == PGRES_FATAL_ERROR && entry == NULL)
-		{
-			res = PQmakeEmptyPGresult(conn->pg_conn, PGRES_FATAL_ERROR);
+		if (entry == NULL)
 			PQfireResultCreateEvents(conn->pg_conn, res);
-		}
 	}
+
 	return res;
 }
 
@@ -1355,27 +1506,35 @@ setup_full_connection_options(List *connection_options, const char ***all_keywor
 }
 
 /*
- * This will only open a connection to a specific node, but not do anything
- * else. In particular, it will not perform any validation nor configure the
- * connection since it cannot know that it connects to a data node database or
- * not. For that, please use the `remote_connection_open_with_options`
- * function.
+ * Open a connection and assign it the given node name.
+ *
+ * This will only open a connection to a specific node, but not do any other
+ * session initialization. In particular, it will not perform any validation
+ * nor configure the connection since it cannot know that it connects to a
+ * data node database or not. For that, please use the
+ * `remote_connection_open_session` function.
+ *
+ * The connection's life-cycle is tied to the current memory context via its
+ * delete callback. As a result, the connection will be automatically closed
+ * and freed when the memory context is deleted.
+ *
+ * This function does not (and should not) throw (PostgreSQL) errors. Instead,
+ * an error message is optionally returned via the "errmsg" parameter.
  */
 TSConnection *
-remote_connection_open_with_options_nothrow(const char *node_name, List *connection_options,
-											char **errmsg)
+remote_connection_open(const char *node_name, List *connection_options, char **errmsg)
 {
-	PGconn *volatile pg_conn = NULL;
-	TSConnection *ts_conn;
+	PGconn *pg_conn = NULL;
+	TSConnection *ts_conn = NULL;
 	const char **keywords;
 	const char **values;
+	PostgresPollingStatusType status;
 
 	if (NULL != errmsg)
 		*errmsg = NULL;
 
 	setup_full_connection_options(connection_options, &keywords, &values);
-
-	pg_conn = PQconnectdbParams(keywords, values, 0 /* Do not expand dbname param */);
+	pg_conn = PQconnectStartParams(keywords, values, 0 /* Do not expand dbname param */);
 
 	/* Cast to (char **) to silence warning with MSVC compiler */
 	pfree((char **) keywords);
@@ -1383,6 +1542,63 @@ remote_connection_open_with_options_nothrow(const char *node_name, List *connect
 
 	if (NULL == pg_conn)
 		return NULL;
+
+	if (PQstatus(pg_conn) == CONNECTION_BAD)
+	{
+		finish_connection(pg_conn, errmsg);
+		return NULL;
+	}
+
+	status = PGRES_POLLING_WRITING;
+
+	do
+	{
+		int io_flag;
+		int rc;
+
+		if (status == PGRES_POLLING_READING)
+			io_flag = WL_SOCKET_READABLE;
+#ifdef WIN32
+		/* Windows needs a different test while waiting for connection-made */
+		else if (PQstatus(pg_conn) == CONNECTION_STARTED)
+			io_flag = WL_SOCKET_CONNECTED;
+#endif
+		else
+			io_flag = WL_SOCKET_WRITEABLE;
+		/*
+		 * Wait for latch or socket event. Note that it is not possible to
+		 * reuse a WaitEventSet using the same socket file descriptor in each
+		 * iteration of the loop since PQconnectPoll() might change the file
+		 * descriptor across calls. Therefore, it is important to create a new
+		 * WaitEventSet in every iteration of the loop and retreiving the
+		 * correct file descriptor (socket) with PQsocket().
+		 */
+		rc = WaitLatchOrSocket(MyLatch,
+							   WL_EXIT_ON_PM_DEATH | WL_LATCH_SET | io_flag,
+							   PQsocket(pg_conn),
+							   0,
+							   PG_WAIT_EXTENSION);
+		if (rc & WL_LATCH_SET)
+		{
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (rc & io_flag)
+		{
+			/*
+			 * PQconnectPoll() is supposed to be non-blocking, but it
+			 * isn't. PQconnectPoll() will internally try to send a startup
+			 * packet and do DNS lookups (if necessary) and can therefore
+			 * block. So, if there is a network issue (e.g., black hole
+			 * routing) the connection attempt will hang on
+			 * PQconnectPoll(). There's nothing that can be done about it,
+			 * unless the blocking operations are moved out of PQconnectPoll()
+			 * and integrated with the wait loop.
+			 */
+			status = PQconnectPoll(pg_conn);
+		}
+	} while (status != PGRES_POLLING_OK && status != PGRES_POLLING_FAILED);
 
 	if (PQstatus(pg_conn) != CONNECTION_OK)
 	{
@@ -1399,22 +1615,15 @@ remote_connection_open_with_options_nothrow(const char *node_name, List *connect
 }
 
 /*
- * Opens a connection.
+ * Open a connection to a data node and perform basic session initialization.
  *
- * Raw connections are not part of the transaction and do not have transactions
- * auto-started. They must be explicitly closed by
- * remote_connection_close. Note that connections are allocated using malloc
- * and so if you do not call remote_connection_close, you'll have a memory
- * leak. Note that the connection cache handles all of this for you so use
- * that if you can.
+ * This function will raise errors on failures.
  */
 TSConnection *
-remote_connection_open_with_options(const char *node_name, List *connection_options,
-									bool set_dist_id)
+remote_connection_open_session(const char *node_name, List *connection_options, bool set_dist_id)
 {
 	char *err = NULL;
-	TSConnection *conn =
-		remote_connection_open_with_options_nothrow(node_name, connection_options, &err);
+	TSConnection *conn = remote_connection_open(node_name, connection_options, &err);
 
 	if (NULL == conn)
 		ereport(ERROR,
@@ -1465,6 +1674,15 @@ remote_connection_open_with_options(const char *node_name, List *connection_opti
 	PG_END_TRY();
 
 	return conn;
+}
+
+TSConnection *
+remote_connection_open_session_by_id(TSConnectionId id)
+{
+	ForeignServer *server = GetForeignServer(id.server_id);
+	List *connection_options = remote_connection_prepare_auth_options(server, id.user_id);
+
+	return remote_connection_open_session(server->servername, connection_options, true);
 }
 
 /*
@@ -1637,86 +1855,34 @@ remote_connection_get_connstr(const char *node_name)
 	return connstr_escape.data;
 }
 
-TSConnection *
-remote_connection_open_by_id(TSConnectionId id)
-{
-	ForeignServer *server = GetForeignServer(id.server_id);
-	List *connection_options = remote_connection_prepare_auth_options(server, id.user_id);
-
-	return remote_connection_open_with_options(server->servername, connection_options, true);
-}
-
-TSConnection *
-remote_connection_open(Oid server_id, Oid user_id)
-{
-	TSConnectionId id = remote_connection_id(server_id, user_id);
-
-	return remote_connection_open_by_id(id);
-}
-
-/*
- * Open a connection without throwing and error.
- *
- * Returns the connection pointer on success. On failure NULL is returned and
- * the errmsg (if given) is used to return an error message.
- */
-TSConnection *
-remote_connection_open_nothrow(Oid server_id, Oid user_id, char **errmsg)
-{
-	ForeignServer *server = GetForeignServer(server_id);
-	Oid fdwid = get_foreign_data_wrapper_oid(EXTENSION_FDW_NAME, false);
-	List *connection_options;
-	TSConnection *conn;
-
-	if (server->fdwid != fdwid)
-	{
-		elog(WARNING, "invalid node type for \"%s\"", server->servername);
-		return NULL;
-	}
-
-	connection_options = remote_connection_prepare_auth_options(server, user_id);
-	conn =
-		remote_connection_open_with_options_nothrow(server->servername, connection_options, errmsg);
-
-	if (NULL == conn)
-	{
-		if (NULL != errmsg && NULL == *errmsg)
-			*errmsg = "internal connection error";
-		return NULL;
-	}
-
-	if (PQstatus(conn->pg_conn) != CONNECTION_OK || !remote_connection_set_peer_dist_id(conn))
-	{
-		if (NULL != errmsg)
-			*errmsg = pchomp(PQerrorMessage(conn->pg_conn));
-		remote_connection_close(conn);
-		return NULL;
-	}
-
-	return conn;
-}
-
 #define PING_QUERY "SELECT 1"
 
 bool
 remote_connection_ping(const char *node_name)
 {
 	Oid server_id = get_foreign_server_oid(node_name, false);
-	TSConnection *conn = remote_connection_open_nothrow(server_id, GetUserId(), NULL);
+	ForeignServer *server = GetForeignServer(server_id);
+	Oid fdwid = get_foreign_data_wrapper_oid(EXTENSION_FDW_NAME, false);
+	List *connection_options;
+	TSConnection *conn;
 	bool success = false;
+
+	if (server->fdwid != fdwid)
+	{
+		elog(WARNING, "invalid node type for \"%s\"", server->servername);
+		return false;
+	}
+
+	connection_options = remote_connection_prepare_auth_options(server, GetUserId());
+	conn = remote_connection_open(server->servername, connection_options, NULL);
 
 	if (NULL == conn)
 		return false;
 
 	if (PQstatus(conn->pg_conn) == CONNECTION_OK)
 	{
-		if (1 == PQsendQuery(conn->pg_conn, PING_QUERY))
-		{
-			PGresult *res = PQgetResult(conn->pg_conn);
-
-			success = (PQresultStatus(res) == PGRES_TUPLES_OK);
-			PQclear(res);
-		}
+		PGresult *res = remote_connection_exec(conn, PING_QUERY);
+		success = (PQresultStatus(res) == PGRES_TUPLES_OK);
 	}
 
 	remote_connection_close(conn);
@@ -1727,18 +1893,9 @@ remote_connection_ping(const char *node_name)
 void
 remote_connection_close(TSConnection *conn)
 {
-	Assert(conn != NULL);
-
-	conn->closing_guard = true;
-
-	if (NULL != conn->pg_conn)
-		PQfinish(conn->pg_conn);
-
-	/* Assert that PQfinish detached this connection from the global list of
-	 * connections */
-	Assert(IS_DETACHED_ENTRY(&conn->ln));
-
-	remote_connection_free(conn);
+	/* The PQfinish callback handler will take care of freeing the resources,
+	 * including the TSConnection object. */
+	PQfinish(conn->pg_conn);
 }
 
 /*
@@ -1993,141 +2150,6 @@ void
 remote_result_close(PGresult *res)
 {
 	PQclear(res);
-}
-
-/*
- * Cleanup connections and results at the end of a (sub-)transaction.
- *
- * This function is called at the end of transactions and sub-transactions to
- * auto-cleanup connections and result objects.
- */
-static void
-remote_connections_cleanup(SubTransactionId subtxid, bool isabort)
-{
-	ListNode *curr = connections.next;
-	unsigned int num_connections = 0;
-	unsigned int num_results = 0;
-
-	while (curr != &connections)
-	{
-		TSConnection *conn = (TSConnection *) curr;
-
-		/* Move to next connection since closing the current one might
-		 * otherwise make the curr pointer invalid. */
-		curr = curr->next;
-
-		if (conn->autoclose && (subtxid == InvalidSubTransactionId || subtxid == conn->subtxid))
-		{
-			/* Closes the connection and frees all its PGresult objects */
-			remote_connection_close(conn);
-			num_connections++;
-		}
-		else
-		{
-			/* We're not closing the connection, but we should clean up any
-			 * lingering results */
-			ListNode *curr_result = conn->results.next;
-
-			while (curr_result != &conn->results)
-			{
-				ResultEntry *entry = (ResultEntry *) curr_result;
-
-				curr_result = curr_result->next;
-
-				if (subtxid == InvalidSubTransactionId || subtxid == entry->subtxid)
-				{
-					PQclear(entry->result);
-					num_results++;
-				}
-			}
-		}
-	}
-
-	if (subtxid == InvalidSubTransactionId)
-		elog(DEBUG3,
-			 "cleaned up %u connections and %u results at %s of transaction",
-			 num_connections,
-			 num_results,
-			 isabort ? "abort" : "commit");
-	else
-		elog(DEBUG3,
-			 "cleaned up %u connections and %u results at %s of sub-transaction %u",
-			 num_connections,
-			 num_results,
-			 isabort ? "abort" : "commit",
-			 subtxid);
-}
-
-static void
-remote_connection_xact_end(XactEvent event, void *unused_arg)
-{
-	/*
-	 * We are deep down in CommitTransaction code path. We do not want our
-	 * emit_log_hook_callback to interfere since it uses its own transaction
-	 */
-	emit_log_hook_type prev_emit_log_hook = emit_log_hook;
-	emit_log_hook = NULL;
-
-	switch (event)
-	{
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
-			/*
-			 * We expect that the waitpoint will be retried and then we
-			 * will return due to the process receiving a SIGTERM if
-			 * the advisory lock is exclusively held by a user call
-			 */
-			DEBUG_RETRY_WAITPOINT("remote_conn_xact_end");
-			remote_connections_cleanup(InvalidSubTransactionId, true);
-			break;
-		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-			/* Same retry behavior as above */
-			DEBUG_RETRY_WAITPOINT("remote_conn_xact_end");
-			remote_connections_cleanup(InvalidSubTransactionId, false);
-			break;
-		case XACT_EVENT_PREPARE:
-			/*
-			 * We expect that the waitpoint will be retried and then we
-			 * will return with a warning on crossing the retry count if
-			 * the advisory lock is exclusively held by a user call
-			 */
-			DEBUG_RETRY_WAITPOINT("remote_conn_xact_end");
-			break;
-		default:
-			/* other events are too early to use DEBUG_WAITPOINT.. */
-			break;
-	}
-
-	/* re-enable the emit_log_hook */
-	emit_log_hook = prev_emit_log_hook;
-}
-
-static void
-remote_connection_subxact_end(SubXactEvent event, SubTransactionId subtxid,
-							  SubTransactionId parent_subtxid, void *unused_arg)
-{
-	/*
-	 * We are deep down in CommitTransaction code path. We do not want our
-	 * emit_log_hook_callback to interfere since it uses its own transaction
-	 */
-	emit_log_hook_type prev_emit_log_hook = emit_log_hook;
-	emit_log_hook = NULL;
-
-	switch (event)
-	{
-		case SUBXACT_EVENT_ABORT_SUB:
-			remote_connections_cleanup(subtxid, true);
-			break;
-		case SUBXACT_EVENT_COMMIT_SUB:
-			remote_connections_cleanup(subtxid, false);
-			break;
-		default:
-			break;
-	}
-
-	/* re-enable the emit_log_hook */
-	emit_log_hook = prev_emit_log_hook;
 }
 
 bool
@@ -2422,15 +2444,10 @@ remote_connection_stats_get(void)
 void
 _remote_connection_init(void)
 {
-	RegisterXactCallback(remote_connection_xact_end, NULL);
-	RegisterSubXactCallback(remote_connection_subxact_end, NULL);
-
 	unset_libpq_envvar();
 }
 
 void
 _remote_connection_fini(void)
 {
-	UnregisterXactCallback(remote_connection_xact_end, NULL);
-	UnregisterSubXactCallback(remote_connection_subxact_end, NULL);
 }

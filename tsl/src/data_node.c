@@ -257,7 +257,6 @@ data_node_get_connection(const char *const data_node, RemoteTxnPrepStmtOption co
 	const ForeignServer *server;
 	TSConnectionId id;
 
-	Assert(data_node != NULL);
 	server = data_node_get_foreign_server(data_node, ACL_NO_CHECK, false, false);
 	id = remote_connection_id(server->serverid, GetUserId());
 
@@ -510,17 +509,19 @@ data_node_bootstrap_extension(TSConnection *conn)
 								quote_literal_cstr(EXTENSION_NAME));
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("%s", PQresultErrorMessage(res))));
+		remote_result_elog(res, ERROR);
 
 	if (PQntuples(res) == 0)
 	{
+		remote_result_close(res);
+
 		if (schema_oid != PG_PUBLIC_NAMESPACE)
 		{
-			PGresult *res = remote_connection_execf(conn,
-													"CREATE SCHEMA %s AUTHORIZATION %s",
-													schema_name_quoted,
-													quote_identifier(username));
+			res = remote_connection_execf(conn,
+										  "CREATE SCHEMA %s AUTHORIZATION %s",
+										  schema_name_quoted,
+										  quote_identifier(username));
+
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
 				const char *const sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
@@ -528,6 +529,8 @@ data_node_bootstrap_extension(TSConnection *conn)
 					(sqlstate && strcmp(sqlstate, ERRCODE_DUPLICATE_SCHEMA_STR) == 0);
 				if (!schema_exists)
 					remote_result_elog(res, ERROR);
+
+				remote_result_close(res);
 				/* If the schema already existed on the remote node, we got a
 				 * duplicate schema error and the schema was not created. In
 				 * that case, we log an error with a hint on how to fix the
@@ -538,6 +541,8 @@ data_node_bootstrap_extension(TSConnection *conn)
 						 errhint("Make sure that the data node does not contain any "
 								 "existing objects prior to adding it.")));
 			}
+
+			remote_result_close(res);
 		}
 
 		remote_connection_cmdf_ok(conn,
@@ -556,6 +561,7 @@ data_node_bootstrap_extension(TSConnection *conn)
 						   PQhost(remote_connection_get_pg_conn(conn)),
 						   PQport(remote_connection_get_pg_conn(conn)),
 						   PQgetvalue(res, 0, 1))));
+		remote_result_close(res);
 		data_node_validate_extension(conn);
 		return false;
 	}
@@ -592,7 +598,7 @@ connect_for_bootstrapping(const char *node_name, const char *const host, int32 p
 	{
 		List *node_options =
 			create_data_node_options(host, port, bootstrap_databases[i], username, password);
-		conn = remote_connection_open_with_options_nothrow(node_name, node_options, &err);
+		conn = remote_connection_open(node_name, node_options, &err);
 
 		if (conn)
 			return conn;
@@ -635,7 +641,8 @@ data_node_validate_extension_availability(TSConnection *conn)
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("%s", PQresultErrorMessage(res))));
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("failed to validate remote extension: %s", PQresultErrorMessage(res))));
 
 	if (PQntuples(res) == 0)
 		ereport(ERROR,
@@ -788,7 +795,7 @@ data_node_add_internal(PG_FUNCTION_ARGS, bool set_distid)
 		 * necessary. Instead using a more straightforward approach here since
 		 * we do not need 2PC support. */
 		node_options = create_data_node_options(host, port, dbname, username, password);
-		conn = remote_connection_open_with_options(node_name, node_options, false);
+		conn = remote_connection_open_session(node_name, node_options, false);
 		Assert(NULL != conn);
 		remote_connection_cmd_ok(conn, "BEGIN");
 
@@ -959,12 +966,14 @@ data_node_attach(PG_FUNCTION_ARGS)
 	if (NULL != space_dim)
 	{
 		List *data_node_names = NIL;
+		int num_partitions = space_dim->fd.num_slices;
 
 		if (num_nodes > space_dim->fd.num_slices)
 		{
 			if (repartition)
 			{
 				ts_dimension_set_number_of_slices(space_dim, num_nodes & 0xFFFF);
+				num_partitions = num_nodes;
 
 				ereport(NOTICE,
 						(errmsg("the number of partitions in dimension \"%s\" was increased to %u",
@@ -986,7 +995,7 @@ data_node_attach(PG_FUNCTION_ARGS)
 
 		data_node_names = ts_hypertable_get_available_data_node_names(ht, true);
 		ts_dimension_partition_info_recreate(space_dim->fd.id,
-											 num_nodes,
+											 num_partitions,
 											 data_node_names,
 											 ht->fd.replication_factor);
 	}
@@ -1450,6 +1459,7 @@ create_alter_data_node_tuple(TupleDesc tupdesc, const char *node_name, List *opt
 	MemSet(nulls, false, sizeof(nulls));
 
 	values[AttrNumberGetAttrOffset(Anum_alter_data_node_node_name)] = CStringGetDatum(node_name);
+	values[AttrNumberGetAttrOffset(Anum_alter_data_node_available)] = BoolGetDatum(true);
 
 	foreach (lc, options)
 	{
@@ -1768,7 +1778,7 @@ drop_data_node_database(const ForeignServer *server)
 		server = data_node_get_foreign_server(nodename, ACL_USAGE, true, false);
 		/* Open a connection to the bootstrap database using the new server options */
 		conn_options = remote_connection_prepare_auth_options(server, userid);
-		conn = remote_connection_open_with_options_nothrow(nodename, conn_options, &err);
+		conn = remote_connection_open(nodename, conn_options, &err);
 
 		if (NULL != conn)
 			break;
@@ -1841,7 +1851,6 @@ data_node_delete(PG_FUNCTION_ARGS)
 	if (drop_database)
 	{
 		TS_PREVENT_IN_TRANSACTION_BLOCK(true);
-		drop_data_node_database(server);
 	}
 
 	/* close any pending connections */
@@ -1872,6 +1881,9 @@ data_node_delete(PG_FUNCTION_ARGS)
 	};
 
 	parsetree = (Node *) &stmt;
+
+	if (drop_database)
+		drop_data_node_database(server);
 
 	/* Make sure event triggers are invoked so that all dropped objects
 	 * are collected during a cascading drop. This ensures all dependent

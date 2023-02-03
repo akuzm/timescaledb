@@ -331,36 +331,35 @@ add_errors_by_sqlerrcode(JsonbParseState *parse_state)
 	StringInfo command;
 	MemoryContext old_context = CurrentMemoryContext, spi_context;
 
-	const char *command_string =
-		"SELECT "
-		"job_type, jsonb_object_agg(sqlerrcode, count) "
-		"FROM"
-		"("
-		"	SELECT ("
-		"		CASE "
-		"			WHEN error_data ->> \'proc_schema\' = \'_timescaledb_internal\'"
-		" 			AND error_data ->> \'proc_name\' ~ "
-		"\'^policy_(retention|compression|reorder|refresh_continuous_"
-		"aggregate|telemetry|job_error_retention)$\' "
-		"			THEN error_data ->> \'proc_name\' "
-		"			ELSE \'user_defined_action\'"
-		"		END"
-		"	) as job_type, "
-		"	error_data ->> \'sqlerrcode\' as sqlerrcode, "
-		"	pg_catalog.COUNT(*) "
-		"	FROM "
-		"	_timescaledb_internal.job_errors "
-		"	WHERE error_data ->> \'sqlerrcode\' IS NOT NULL "
-		"	GROUP BY job_type, error_data->> \'sqlerrcode\' "
-		"	ORDER BY job_type"
-		") q "
-		"GROUP BY q.job_type";
+	const char *command_string = "SELECT "
+								 "job_type, jsonb_object_agg(sqlerrcode, count) "
+								 "FROM"
+								 "("
+								 "	SELECT ("
+								 "		CASE "
+								 "			WHEN proc_schema = \'_timescaledb_internal\'"
+								 " 			AND proc_name ~ "
+								 "\'^policy_(retention|compression|reorder|refresh_continuous_"
+								 "aggregate|telemetry|job_error_retention)$\' "
+								 "			THEN proc_name "
+								 "			ELSE \'user_defined_action\'"
+								 "		END"
+								 "	) as job_type, "
+								 "	sqlerrcode, "
+								 "	pg_catalog.COUNT(*) "
+								 "	FROM "
+								 "	timescaledb_information.job_errors "
+								 "	WHERE sqlerrcode IS NOT NULL "
+								 "	GROUP BY job_type, sqlerrcode "
+								 "	ORDER BY job_type"
+								 ") q "
+								 "GROUP BY q.job_type";
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 
-	/* SPI calls must be qualified otherwise they are unsafe */
-	res = SPI_exec("SET search_path TO pg_catalog, pg_temp", 0);
+	/* Lock down search_path */
+	res = SPI_exec("SET LOCAL search_path TO pg_catalog, pg_temp", 0);
 	if (res < 0)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), (errmsg("could not set search_path"))));
 
@@ -398,7 +397,6 @@ add_errors_by_sqlerrcode(JsonbParseState *parse_state)
 		old_context = MemoryContextSwitchTo(spi_context);
 	}
 
-	res = SPI_exec("RESET search_path", 0);
 	res = SPI_finish();
 
 	Assert(res == SPI_OK_FINISH);
@@ -462,8 +460,8 @@ add_job_stats_by_job_type(JsonbParseState *parse_state)
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI");
 
-	/* SPI calls must be qualified otherwise they are unsafe */
-	res = SPI_exec("SET search_path TO pg_catalog, pg_temp", 0);
+	/* Lock down search_path */
+	res = SPI_exec("SET LOCAL search_path TO pg_catalog, pg_temp", 0);
 	if (res < 0)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), (errmsg("could not set search_path"))));
 
@@ -525,7 +523,6 @@ add_job_stats_by_job_type(JsonbParseState *parse_state)
 		add_job_stats_internal(parse_state, TextDatumGetCString(jobtype_datum), &stats);
 		old_context = MemoryContextSwitchTo(spi_context);
 	}
-	res = SPI_exec("RESET search_path", 0);
 	res = SPI_finish();
 	Assert(res == SPI_OK_FINISH);
 }
