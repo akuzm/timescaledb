@@ -490,10 +490,13 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 		ParamPathInfo *param_info = (ParamPathInfo *) lfirst(ppi_cell);
 
 		/*
-		 * Guess if this data node scan is likely to be an index scan, and
-		 * factor that into the cost.
+		 * Check if we have an index path locally that matches the
+		 * parameterization. If so, we're going to have the same index path on
+		 * the data node, and it's going to be significantly cheaper that a seq
+		 * scan. We don't know precise values, but we have to discount it later
+		 * so that the remote index paths are preferred.
 		 */
-		double scan_cost_discount_multiplier = 1.;
+		bool index_matches_parameterization = false;
 		ListCell *path_cell;
 		foreach (path_cell, hyper_rel->pathlist)
 		{
@@ -506,14 +509,7 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 				 */
 				Assert(path->type == T_BitmapHeapPath || path->type == T_IndexPath);
 
-				/*
-				 * We have an index path with a matching parameterization for
-				 * the hypertable rel. This means that we also have a matching
-				 * index on the data nodes. As a hack, try to cost this path not
-				 * as a seq scan, but as an imaginary index scan that's cheaper
-				 * by a constant factor.
-				 */
-				scan_cost_discount_multiplier = 0.1;
+				index_matches_parameterization = true;
 				break;
 			}
 		}
@@ -538,8 +534,15 @@ add_data_node_scan_paths(PlannerInfo *root, RelOptInfo *data_node_rel, RelOptInf
 		run_cost += seq_page_cost * data_node_rel->pages;
 		rows *= remote_sel_sane;
 
-		/* Discount it if it's likely to be an index scan on the remote. */
-		run_cost *= scan_cost_discount_multiplier;
+		/*
+		 * For this parameterization, we're going to have an index scan on the
+		 * remote. We don't have a way to calculate the precise cost for it, so
+		 * at least discount it by a constant factor compared to the seq scan.
+		 */
+		if (index_matches_parameterization)
+		{
+			run_cost *= 0.1;
+		}
 
 		/* Run remote join clauses. */
 		QualCost remote_join_cost;
