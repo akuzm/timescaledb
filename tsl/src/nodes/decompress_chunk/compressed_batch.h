@@ -28,8 +28,8 @@ typedef struct CompressedColumnValues
 	DecompressionType decompression_type;
 
 	/* Where to put the decompressed datum. */
-	Datum *output_value;
-	bool *output_isnull;
+	Datum *restrict output_value;
+	bool *restrict output_isnull;
 
 	/*
 	 * The flattened source buffers for getting the decompressed datum.
@@ -52,17 +52,18 @@ typedef struct CompressedColumnValues
  */
 typedef struct DecompressBatchState
 {
-	TupleTableSlot *decompressed_scan_slot; /* A slot for the decompressed data */
 	/*
 	 * Compressed target slot. We have to keep a local copy when doing batch
 	 * sorted merge, because the segmentby column values might reference the
 	 * original tuple, and a batch outlives its source tuple.
 	 */
 	TupleTableSlot *compressed_slot;
-	uint16 total_batch_rows;
-	uint16 next_batch_row;
 	Size block_size_bytes; /* Block size to use for memory context */
 	MemoryContext per_batch_context;
+
+	TupleTableSlot *decompressed_scan_slot; /* A slot for the decompressed data */
+	uint16 total_batch_rows;
+	uint16 next_batch_row;
 
 	/*
 	 * Arrow-style bitmap that says whether the vector quals passed for a given
@@ -70,6 +71,11 @@ typedef struct DecompressBatchState
 	 * direction. Initialized to all ones, i.e. all rows pass.
 	 */
 	uint64 *restrict vector_qual_result;
+
+	bool reverse;
+	int num_compressed_columns;
+	ExprContext *postgres_qual_econtext;
+	ExprState *postgres_qual_estate;
 
 	CompressedColumnValues compressed_columns[FLEXIBLE_ARRAY_MEMBER];
 } DecompressBatchState;

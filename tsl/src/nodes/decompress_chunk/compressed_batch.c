@@ -568,6 +568,14 @@ compressed_batch_set_compressed_tuple(DecompressContext *dcontext,
 
 		batch_state->decompressed_scan_slot =
 			MakeSingleTupleTableSlot(dcontext->decompressed_slot_scan_tdesc, slot->tts_ops);
+
+		batch_state->reverse = dcontext->reverse;
+		batch_state->num_compressed_columns = dcontext->num_compressed_columns;
+		if (dcontext->ps)
+		{
+			batch_state->postgres_qual_estate = dcontext->ps->qual;
+			batch_state->postgres_qual_econtext = dcontext->ps->ps_ExprContext;
+		}
 	}
 	else
 	{
@@ -701,7 +709,7 @@ compressed_batch_set_compressed_tuple(DecompressContext *dcontext,
  * Construct the next tuple in the decompressed scan slot.
  * Doesn't check the quals.
  */
-static void
+static pg_attribute_always_inline void
 make_next_tuple(DecompressBatchState *batch_state, uint16 arrow_row, int num_compressed_columns)
 {
 	TupleTableSlot *decompressed_scan_slot = batch_state->decompressed_scan_slot;
@@ -770,19 +778,11 @@ make_next_tuple(DecompressBatchState *batch_state, uint16 arrow_row, int num_com
 	}
 
 	/*
-	 * It's a virtual tuple slot, so no point in clearing/storing it
-	 * per each row, we can just update the values in-place. This saves
-	 * some CPU. We have to store it after ExecQual returns false (the tuple
-	 * didn't pass the filter), or after a new batch. The standard protocol
-	 * is to clear and set the tuple slot for each row, but our output tuple
-	 * slots are read-only, and the memory is owned by this node, so it is
-	 * safe to violate this protocol.
+	 * Inline ExecStoreVirtualTuple because this is a hot loop.
 	 */
 	Assert(TTS_IS_VIRTUAL(decompressed_scan_slot));
-	if (TTS_EMPTY(decompressed_scan_slot))
-	{
-		ExecStoreVirtualTuple(decompressed_scan_slot);
-	}
+	decompressed_scan_slot->tts_flags &= ~TTS_FLAG_EMPTY;
+	decompressed_scan_slot->tts_nvalid = decompressed_scan_slot->tts_tupleDescriptor->natts;
 }
 
 static bool
@@ -800,21 +800,21 @@ vector_qual(DecompressBatchState *batch_state, uint16 arrow_row)
 }
 
 static bool
-postgres_qual(DecompressContext *dcontext, DecompressBatchState *batch_state)
+postgres_qual(DecompressBatchState *batch_state)
 {
-	TupleTableSlot *decompressed_scan_slot = batch_state->decompressed_scan_slot;
-	Assert(!TupIsNull(decompressed_scan_slot));
-
-	if (dcontext->ps == NULL || dcontext->ps->qual == NULL)
+	ExprState *estate = batch_state->postgres_qual_estate;
+	if (estate == NULL)
 	{
 		return true;
 	}
 
 	/* Perform the usual Postgres selection. */
-	ExprContext *econtext = dcontext->ps->ps_ExprContext;
+	ExprContext *econtext = batch_state->postgres_qual_econtext;
+	TupleTableSlot *decompressed_scan_slot = batch_state->decompressed_scan_slot;
+	Assert(!TupIsNull(decompressed_scan_slot));
 	econtext->ecxt_scantuple = decompressed_scan_slot;
 	ResetExprContext(econtext);
-	return ExecQual(dcontext->ps->qual, econtext);
+	return ExecQual(estate, econtext);
 }
 
 /*
@@ -827,18 +827,15 @@ compressed_batch_advance(DecompressContext *dcontext, DecompressBatchState *batc
 {
 	Assert(batch_state->total_batch_rows > 0);
 
-	TupleTableSlot *decompressed_scan_slot = batch_state->decompressed_scan_slot;
-	Assert(decompressed_scan_slot != NULL);
+	const bool reverse = batch_state->reverse;
+	const int num_compressed_columns = batch_state->num_compressed_columns;
+	const uint16 total_batch_rows = batch_state->total_batch_rows;
 
-	const bool reverse = dcontext->reverse;
-	const int num_compressed_columns = dcontext->num_compressed_columns;
-
-	for (; batch_state->next_batch_row < batch_state->total_batch_rows;
-		 batch_state->next_batch_row++)
+	for (uint16 current_batch_row = batch_state->next_batch_row;
+		current_batch_row < total_batch_rows; current_batch_row++)
 	{
-		const uint16 output_row = batch_state->next_batch_row;
 		const uint16 arrow_row =
-			unlikely(reverse) ? batch_state->total_batch_rows - 1 - output_row : output_row;
+			unlikely(reverse) ? batch_state->total_batch_rows - 1 - current_batch_row : current_batch_row;
 
 		if (!vector_qual(batch_state, arrow_row))
 		{
@@ -863,7 +860,7 @@ compressed_batch_advance(DecompressContext *dcontext, DecompressBatchState *batc
 
 		make_next_tuple(batch_state, arrow_row, num_compressed_columns);
 
-		if (!postgres_qual(dcontext, batch_state))
+		if (!postgres_qual(batch_state))
 		{
 			/*
 			 * The tuple didn't pass the qual, fetch the next one in the next
@@ -874,7 +871,7 @@ compressed_batch_advance(DecompressContext *dcontext, DecompressBatchState *batc
 		}
 
 		/* The tuple passed the qual. */
-		batch_state->next_batch_row++;
+		batch_state->next_batch_row = current_batch_row + 1;
 		return;
 	}
 
@@ -882,7 +879,7 @@ compressed_batch_advance(DecompressContext *dcontext, DecompressBatchState *batc
 	 * Reached end of batch. Check that the columns that we're decompressing
 	 * row-by-row have also ended.
 	 */
-	Assert(batch_state->next_batch_row == batch_state->total_batch_rows);
+	batch_state->next_batch_row = batch_state->total_batch_rows;
 	for (int i = 0; i < num_compressed_columns; i++)
 	{
 		CompressedColumnValues *column_values = &batch_state->compressed_columns[i];
@@ -898,6 +895,8 @@ compressed_batch_advance(DecompressContext *dcontext, DecompressBatchState *batc
 	}
 
 	/* Clear old slot state */
+	TupleTableSlot *decompressed_scan_slot = batch_state->decompressed_scan_slot;
+	Assert(decompressed_scan_slot != NULL);
 	ExecClearTuple(decompressed_scan_slot);
 }
 
@@ -940,7 +939,7 @@ compressed_batch_save_first_tuple(DecompressContext *dcontext, DecompressBatchSt
 	 * for the subsequent calls (matching tuple is in decompressed scan slot).
 	 */
 	const bool qual_passed =
-		vector_qual(batch_state, dcontext->reverse) && postgres_qual(dcontext, batch_state);
+		vector_qual(batch_state, dcontext->reverse) && postgres_qual(batch_state);
 	batch_state->next_batch_row++;
 
 	if (!qual_passed)
