@@ -485,6 +485,8 @@ compute_vector_quals(DecompressContext *dcontext, DecompressBatchState *batch_st
 	const int bitmap_bytes = sizeof(uint64) * (((uint64) batch_state->total_batch_rows + 63) / 64);
 	batch_state->vector_qual_result = palloc(bitmap_bytes);
 	memset(batch_state->vector_qual_result, 0xFF, bitmap_bytes);
+	uint64 last_word_mask = -1ULL;
+	const uint16 last_bitmap_word = batch_state->total_batch_rows / 64;
 	if (batch_state->total_batch_rows % 64 != 0)
 	{
 		/*
@@ -492,17 +494,34 @@ compute_vector_quals(DecompressContext *dcontext, DecompressBatchState *batch_st
 		 * bitmap word. Since all predicates are ANDed to the result bitmap,
 		 * we can do it here once instead of doing it in each predicate.
 		 */
-		const uint64 mask = ((uint64) -1) >> (64 - batch_state->total_batch_rows % 64);
-		batch_state->vector_qual_result[batch_state->total_batch_rows / 64] = mask;
+		last_word_mask = -1ULL >> (64 - batch_state->total_batch_rows % 64);
+		batch_state->vector_qual_result[last_bitmap_word] = last_word_mask;
 	}
 
 	/*
 	 * Compute the quals.
 	 */
-	return compute_qual_conjunction(dcontext,
+	bool have_matching_rows = compute_qual_conjunction(dcontext,
 									batch_state,
 									dcontext->vectorized_quals_constified,
 									batch_state->vector_qual_result);
+
+	/*
+	 * To save some time, don't test the vector qual for each row if we know that
+	 * all rows match.
+	 */
+	bool all_rows_match = true;
+	for (uint16 i = 0; i < last_bitmap_word; i++)
+	{
+		all_rows_match &= ~batch_state->vector_qual_result[i] == 0;
+	}
+	all_rows_match &= ((~batch_state->vector_qual_result[last_bitmap_word]) & last_word_mask) == 0;
+	if (all_rows_match)
+	{
+		batch_state->vector_qual_result = NULL;
+	}
+
+	return have_matching_rows;
 }
 
 /*
