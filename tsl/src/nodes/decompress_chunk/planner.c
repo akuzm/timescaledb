@@ -438,6 +438,11 @@ build_decompression_map(DecompressionMapContext *context, List *compressed_scan_
 	 * output targetlist, so that we can avoid a projection there.
 	 */
 	context->custom_scan_targetlist = follow_uncompressed_output_tlist(context);
+
+	fprintf(stderr, "followed uncompressed output tlist\n");
+	my_print(context->custom_scan_targetlist);
+	mybt();
+
 	if (context->custom_scan_targetlist != NIL)
 	{
 		/*
