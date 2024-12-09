@@ -85,26 +85,35 @@ skip_scan_plan_create(PlannerInfo *root, RelOptInfo *relopt, CustomPath *best_pa
 
 	OpExpr *op = fix_indexqual(index_path->indexinfo, path->skip_clause, path->scankey_attno);
 
-	Plan *plan = linitial(custom_plans);
-	if (IsA(plan, IndexScan))
+	Plan *scan_plan = linitial(custom_plans);
+	if (IsA(scan_plan, Result))
 	{
-		IndexScan *idx_plan = castNode(IndexScan, plan);
+		/*
+		 * We can have a gating Result node here if we had a pseudoconstant
+		 * clause (see create_gating_plan()).
+		 */
+		scan_plan = castNode(Result, scan_plan)->plan.lefttree;
+	}
+
+	if (IsA(scan_plan, IndexScan))
+	{
+		IndexScan *idx_plan = castNode(IndexScan, scan_plan);
 		skip_plan->scan = idx_plan->scan;
 
 		/* we prepend skip qual here so sort_indexquals will put it as first qual for that column */
 		idx_plan->indexqual =
 			sort_indexquals(index_path->indexinfo, lcons(op, idx_plan->indexqual));
 	}
-	else if (IsA(plan, IndexOnlyScan))
+	else if (IsA(scan_plan, IndexOnlyScan))
 	{
-		IndexOnlyScan *idx_plan = castNode(IndexOnlyScan, plan);
+		IndexOnlyScan *idx_plan = castNode(IndexOnlyScan, scan_plan);
 		skip_plan->scan = idx_plan->scan;
 		/* we prepend skip qual here so sort_indexquals will put it as first qual for that column */
 		idx_plan->indexqual =
 			sort_indexquals(index_path->indexinfo, lcons(op, idx_plan->indexqual));
 	}
 	else
-		elog(ERROR, "unsupported subplan type for SkipScan: %s", ts_get_node_name((Node *) plan));
+		elog(ERROR, "unsupported subplan type for SkipScan: %s", ts_get_node_name((Node *) scan_plan));
 
 	skip_plan->scan.plan.targetlist = tlist;
 	skip_plan->custom_scan_tlist = list_copy(tlist);
@@ -113,7 +122,7 @@ skip_scan_plan_create(PlannerInfo *root, RelOptInfo *relopt, CustomPath *best_pa
 	skip_plan->methods = &skip_scan_plan_methods;
 	skip_plan->custom_plans = custom_plans;
 	/* get position of skipped column in tuples produced by child scan */
-	TargetEntry *tle = tlist_member_match_var(path->distinct_var, plan->targetlist);
+	TargetEntry *tle = tlist_member_match_var(path->distinct_var, scan_plan->targetlist);
 
 	bool nulls_first = index_path->indexinfo->nulls_first[path->scankey_attno - 1];
 	if (index_path->indexscandir == BackwardScanDirection)

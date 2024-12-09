@@ -2,6 +2,12 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
+\c :TEST_DBNAME :ROLE_SUPERUSER
+-- helper function: float -> pseudorandom float [0..1]
+CREATE OR REPLACE FUNCTION mix(x anyelement) RETURNS float8 AS $$
+    SELECT hashfloat8(x::float8) / pow(2, 32) + 0.5
+$$ LANGUAGE SQL;
+
 CREATE TABLE IF NOT EXISTS timdat (
   dinr                  integer NOT NULL DEFAULT 0,
   lormnr                character(32) NOT NULL DEFAULT ' '::character(1),
@@ -13,11 +19,11 @@ CREATE TABLE IF NOT EXISTS timdat (
 
 INSERT INTO timdat (dinr,lormnr,cibin,tloan,dust_timdat)
 SELECT
-  floor(random() * 255 + 1)::int,
-  upper(substr(md5(random()::text), 1, 32)),
-  upper(substr(md5(random()::text), 1, 10)),
-  upper(substr(md5(random()::text), 1, 10)),
-  upper(substr(md5(random()::text), 1, 48))
+  floor(mix(n % 100) * 255 + 1)::int,
+  upper(substr(md5(mix(n + 1)::text), 1, 32)),
+  upper(substr(md5(mix(n + 2)::text), 1, 10)),
+  upper(substr(md5(mix(n + 3)::text), 1, 10)),
+  upper(substr(md5(mix(n + 4)::text), 1, 48))
 FROM generate_series(1,3000) n
 ;
 
@@ -34,21 +40,90 @@ CREATE INDEX kendat_dinr_cutdat_idx ON kendat (dinr, cutdat);
 
 INSERT INTO kendat (dinr,kind,dal,cibin,cutdat)
 SELECT
-  floor(random() * 255 + 1)::int,
-  floor(random() * 255 + 1)::int,
-  upper(substr(md5(random()::text), 1, 15)),
-  upper(substr(md5(random()::text), 1, 10)),
-  upper(substr(md5(random()::text), 1, 10))
+  floor(mix((n + 5) % 100) * 255 + 1)::int,
+  floor(mix(n + 6) * 255 + 1)::int,
+  upper(substr(md5(mix(n + 7)::text), 1, 15)),
+  upper(substr(md5(mix(n + 2)::text), 1, 10)),
+  upper(substr(md5(mix(n + 9)::text), 1, 10))
 FROM generate_series(1,3000) n
 ;
 
+-- Check that SkipScan subquery returns some rows
+SELECT DISTINCT timdat.cibin
+FROM timdat
+WHERE timdat.dinr = 159
+    AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522';
 
+-- No gating clause
 SELECT kendat.cibin, kendat.dal, kendat.cutdat
-    FROM kendat
-   WHERE kendat.dinr = 57
-   AND kendat.kind = 179
-     AND kendat.cibin NOT IN (SELECT DISTINCT timdat.cibin
-    FROM timdat
-   WHERE timdat.dinr =  57
-   AND kendat.kind = 179
-     AND timdat.lormnr = 'E1D299B260FB1C1A2A0196A6AADC039B');
+FROM kendat
+WHERE kendat.dinr = 159
+    AND kendat.kind = 196
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');
+
+-- Parameterized subplan
+WITH param AS MATERIALIZED (select unnest(array[195, 196, 197]) kind)
+SELECT kendat.cibin, kendat.dal, kendat.cutdat
+FROM kendat, param
+WHERE kendat.dinr = 159
+    AND kendat.kind = param.kind
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');
+
+-- Gating pseudoconstant clause under SkipScan is true
+SELECT kendat.cibin, kendat.dal, kendat.cutdat
+FROM kendat
+WHERE kendat.dinr = 159
+    AND kendat.kind = 196
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND kendat.kind = 196
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');
+
+-- Gating pseudoconstant clause under SkipScan is false
+SELECT kendat.cibin, kendat.dal, kendat.cutdat
+FROM kendat
+WHERE kendat.dinr = 159
+    AND kendat.kind = 196
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND kendat.kind = 196000
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');
+
+-- Gating pseudoconstant clause under SkipScan is parameterized and true
+WITH param AS MATERIALIZED (select unnest(array[195, 196, 197]) kind)
+SELECT kendat.cibin, kendat.dal, kendat.cutdat
+FROM kendat, param
+WHERE kendat.dinr = 159
+    AND kendat.kind = param.kind
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND kendat.kind = param.kind
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');
+
+
+-- Gating pseudoconstant clause under SkipScan is parameterized and false
+WITH param AS MATERIALIZED (select unnest(array[195, 196, 197]) kind)
+SELECT kendat.cibin, kendat.dal, kendat.cutdat
+FROM kendat, param
+WHERE kendat.dinr = 159
+    AND kendat.kind = param.kind
+    AND kendat.cibin NOT IN (
+        SELECT DISTINCT timdat.cibin
+        FROM timdat
+        WHERE timdat.dinr = 159
+            AND kendat.kind != param.kind
+            AND timdat.lormnr = 'B6EE18DA60E17E10298EC274CBF50522');

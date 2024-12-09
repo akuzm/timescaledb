@@ -88,7 +88,7 @@ typedef struct SkipScanState
 	/* rescan required before getting next tuple */
 	bool needs_rescan;
 
-	void *idx_scan;
+	void *idx_scan_plan;
 } SkipScanState;
 
 static bool has_nulls_first(SkipScanState *state);
@@ -102,17 +102,27 @@ skip_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	SkipScanState *state = (SkipScanState *) node;
 	state->ctx = AllocSetContextCreate(estate->es_query_cxt, "skipscan", ALLOCSET_DEFAULT_SIZES);
 
-	state->idx = (ScanState *) ExecInitNode(state->idx_scan, estate, eflags);
-	node->custom_ps = list_make1(state->idx);
+	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	PlanState *child_state = ExecInitNode(linitial(cscan->custom_plans), estate, eflags);
+	node->custom_ps = list_make1(child_state);
 
-	if (IsA(state->idx_scan, IndexScan))
+	if (IsA(child_state, ResultState))
+	{
+		state->idx = (ScanState *) castNode(ResultState, child_state)->ps.lefttree;
+	}
+	else
+	{
+		state->idx = (ScanState *) child_state;
+	}
+
+	if (IsA(state->idx_scan_plan, IndexScan))
 	{
 		IndexScanState *idx = castNode(IndexScanState, state->idx);
 		state->scan_keys = &idx->iss_ScanKeys;
 		state->num_scan_keys = &idx->iss_NumScanKeys;
 		state->scan_desc = &idx->iss_ScanDesc;
 	}
-	else if (IsA(state->idx_scan, IndexOnlyScan))
+	else if (IsA(state->idx_scan_plan, IndexOnlyScan))
 	{
 		IndexOnlyScanState *idx = castNode(IndexOnlyScanState, state->idx);
 		state->scan_keys = &idx->ioss_ScanKeys;
@@ -267,7 +277,7 @@ skip_scan_exec(CustomScanState *node)
 				break;
 
 			case SS_NULLS_FIRST:
-				result = state->idx->ps.ExecProcNode(&state->idx->ps);
+				result = ExecProcNode(linitial(state->cscan_state.custom_ps));
 
 				/*
 				 * if we found a NULL value we return it, otherwise
@@ -281,7 +291,7 @@ skip_scan_exec(CustomScanState *node)
 
 			case SS_NOT_NULL:
 			case SS_VALUES:
-				result = state->idx->ps.ExecProcNode(&state->idx->ps);
+				result = ExecProcNode(linitial(state->cscan_state.custom_ps));
 
 				if (!TupIsNull(result))
 				{
@@ -314,7 +324,7 @@ skip_scan_exec(CustomScanState *node)
 				break;
 
 			case SS_NULLS_LAST:
-				result = state->idx->ps.ExecProcNode(&state->idx->ps);
+				result = ExecProcNode(linitial(state->cscan_state.custom_ps));
 				skip_scan_switch_stage(state, SS_END);
 				return result;
 				break;
@@ -330,7 +340,7 @@ static void
 skip_scan_end(CustomScanState *node)
 {
 	SkipScanState *state = (SkipScanState *) node;
-	ExecEndNode(&state->idx->ps);
+	ExecEndNode(linitial(state->cscan_state.custom_ps));
 }
 
 static void
@@ -352,7 +362,7 @@ skip_scan_rescan(CustomScanState *node)
 	state->prev_datum = 0;
 
 	state->needs_rescan = false;
-	ExecReScan(&state->idx->ps);
+	ExecReScan(linitial(state->cscan_state.custom_ps));
 	MemoryContextReset(state->ctx);
 }
 
@@ -369,7 +379,12 @@ tsl_skip_scan_state_create(CustomScan *cscan)
 {
 	SkipScanState *state = (SkipScanState *) newNode(sizeof(SkipScanState), T_CustomScanState);
 
-	state->idx_scan = linitial(cscan->custom_plans);
+	Node *child_plan = linitial(cscan->custom_plans);
+	if (IsA(child_plan, Result))
+	{
+		child_plan = (Node *) castNode(Result, child_plan)->plan.lefttree;
+	}
+	state->idx_scan_plan = child_plan;
 	state->stage = SS_BEGIN;
 
 	state->distinct_col_attnum = linitial_int(cscan->custom_private);
