@@ -40,6 +40,7 @@ set(TEST_FILES
     reorder.sql
     size_utils_tsl.sql
     skip_scan.sql
+    skip_scan_pseudoconstant_gating_clause.sql
     transparent_decompression_join_index.sql
     vector_agg_functions.sql
     vector_agg_param.sql
