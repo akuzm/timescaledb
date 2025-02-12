@@ -3,3 +3,6 @@ UPDATE _timescaledb_internal.bgw_job_stat_history SET succeeded = FALSE WHERE su
 ALTER TABLE _timescaledb_internal.bgw_job_stat_history
     ALTER COLUMN succeeded SET NOT NULL,
     ALTER COLUMN succeeded SET DEFAULT FALSE;
+
+DROP FUNCTION _timescaledb_functions.ts_bloom1_matches(bytea, anyelement);
+
