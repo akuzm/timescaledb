@@ -57,13 +57,14 @@ get_existing_agg_path(const RelOptInfo *relation)
  * Get all subpaths from a Append, MergeAppend, or ChunkAppend path
  */
 static void
-get_subpaths_from_append_path(Path *path, List **subpaths, Path **append, Path **gather)
+get_subpaths_from_append_path(Path *path, List **subpaths, Path **out_append,
+							  Path **out_partial_agg, Path **out_gather)
 {
 	if (IsA(path, AppendPath))
 	{
 		AppendPath *append_path = castNode(AppendPath, path);
 		*subpaths = append_path->subpaths;
-		*append = path;
+		*out_append = path;
 		return;
 	}
 
@@ -71,7 +72,7 @@ get_subpaths_from_append_path(Path *path, List **subpaths, Path **append, Path *
 	{
 		MergeAppendPath *merge_append_path = castNode(MergeAppendPath, path);
 		*subpaths = merge_append_path->subpaths;
-		*append = path;
+		*out_append = path;
 		return;
 	}
 
@@ -79,26 +80,28 @@ get_subpaths_from_append_path(Path *path, List **subpaths, Path **append, Path *
 	{
 		CustomPath *custom_path = castNode(CustomPath, path);
 		*subpaths = custom_path->custom_paths;
-		*append = path;
+		*out_append = path;
 		return;
 	}
 
 	if (IsA(path, GatherPath))
 	{
-		*gather = path;
+		*out_gather = path;
 		get_subpaths_from_append_path(castNode(GatherPath, path)->subpath,
 									  subpaths,
-									  append,
+									  out_append,
+									  out_partial_agg,
 									  /* gather = */ NULL);
 		return;
 	}
 
 	if (IsA(path, GatherMergePath))
 	{
-		*gather = path;
+		*out_gather = path;
 		get_subpaths_from_append_path(castNode(GatherMergePath, path)->subpath,
 									  subpaths,
-									  append,
+									  out_append,
+									  out_partial_agg,
 									  /* gather = */ NULL);
 		return;
 	}
@@ -106,21 +109,39 @@ get_subpaths_from_append_path(Path *path, List **subpaths, Path **append, Path *
 	if (IsA(path, SortPath))
 	{
 		/* Can see GatherMerge -> Sort -> Partial HashAggregate in parallel plans. */
-		get_subpaths_from_append_path(castNode(SortPath, path)->subpath, subpaths, append, gather);
+		get_subpaths_from_append_path(castNode(SortPath, path)->subpath,
+									  subpaths,
+									  out_append,
+									  /* agg = */ out_partial_agg,
+									  /* gather = */ NULL);
 		return;
 	}
 
 	if (IsA(path, AggPath))
 	{
-		/* Can see GatherMerge -> Sort -> Partial HashAggregate in parallel plans. */
-		get_subpaths_from_append_path(castNode(AggPath, path)->subpath, subpaths, append, gather);
+		/*
+		 * We start with the top-level aggregation path, that can be "finalize"
+		 * path in case of parallel aggregation.
+		 * Then, we can also see GatherMerge -> Sort -> Partial HashAggregate in
+		 * parallel plans, and we also need to return that to the caller.
+		 */
+		*out_partial_agg = path;
+		get_subpaths_from_append_path(castNode(AggPath, path)->subpath,
+									  subpaths,
+									  out_append,
+									  /* agg = */ out_partial_agg,
+									  /* gather = */ out_gather);
 		return;
 	}
 
 	if (IsA(path, ProjectionPath))
 	{
 		ProjectionPath *projection = castNode(ProjectionPath, path);
-		get_subpaths_from_append_path(projection->subpath, subpaths, append, gather);
+		get_subpaths_from_append_path(projection->subpath,
+									  subpaths,
+									  out_append,
+									  out_partial_agg,
+									  out_gather);
 		return;
 	}
 
@@ -361,20 +382,58 @@ generate_agg_pushdown_path(PlannerInfo *root, Path *cheapest_total_path, RelOptI
 						   double d_num_groups, GroupPathExtraData *extra_data)
 {
 	/* Get subpaths */
-	List *subpaths = NIL;
+	List *chunk_paths = NIL;
 	Path *top_gather = NULL;
+	Path *source_partial_agg = NULL;
 	Path *top_append = NULL;
-	get_subpaths_from_append_path(cheapest_total_path, &subpaths, &top_append, &top_gather);
+	get_subpaths_from_append_path(cheapest_total_path,
+								  &chunk_paths,
+								  &top_append,
+								  &source_partial_agg,
+								  &top_gather);
 
 	/* No subpaths available or unsupported append node */
-	if (subpaths == NIL)
+	if (chunk_paths == NIL)
 	{
 		return;
 	}
 
 	Assert(top_append != NULL);
 
-	if (list_length(subpaths) < 2)
+	if (top_gather != NULL)
+	{
+		/*
+		 * The parallel aggregation is already split into optimal number of buckets,
+		 * no point in splitting it further per-chunk.
+		 *
+		 * The global plan structure is: Finalize Agg -> Gather
+		 * 	-> Parallel Partial Agg -> Parallel Append -> Parallel Chunk Scan.
+		 *
+		 * We need to create a copy of Parallel Partial Agg that is before Gather.
+		 * We're going to add it to the partially grouped relation, and the
+		 * add_partial_path() function will free it if it is rejected, but we
+		 * don't want to free the input path here.
+		 *
+		 * We don't have to create the copy of the underlying Parallel Append,
+		 * because that relation is not going to be replanned at this point.
+		 */
+		fprintf(stderr, "adding parallel path directly\n");
+		Assert(source_partial_agg != NULL);
+
+		AggPath *partial_agg_copy = makeNode(AggPath);
+		memcpy(partial_agg_copy, source_partial_agg, sizeof(AggPath));
+		partial_agg_copy->path.pathtarget = copy_pathtarget(partial_agg_copy->path.pathtarget);
+
+		//		Path *top_append_copy = copy_append_like_path(root, top_append,
+		//			chunk_paths, top_append->pathtarget);
+		//		partial_agg_copy->subpath = top_append_copy;
+
+		add_partial_path(partially_grouped_rel, &partial_agg_copy->path);
+
+		return;
+	}
+
+	if (list_length(chunk_paths) < 2)
 	{
 		/*
 		 * Doesn't make sense to add per-chunk aggregation paths if there's
@@ -388,9 +447,9 @@ generate_agg_pushdown_path(PlannerInfo *root, Path *cheapest_total_path, RelOptI
 	List *hashed_subpaths = NIL;
 
 	ListCell *lc;
-	foreach (lc, subpaths)
+	foreach (lc, chunk_paths)
 	{
-		Path *subpath = lfirst(lc);
+		Path *single_chunk_path = lfirst(lc);
 
 		/* Check if we have an append path under an append path (e.g., a partially compressed
 		 * chunk. The first append path merges the chunk results. The second append path merges the
@@ -401,13 +460,17 @@ generate_agg_pushdown_path(PlannerInfo *root, Path *cheapest_total_path, RelOptI
 		 */
 		List *partially_compressed_paths = NIL;
 		Path *partially_compressed_append = NULL;
+		Path *partially_compressed_agg = NULL;
 		Path *partially_compressed_gather = NULL;
-		get_subpaths_from_append_path(subpath,
+		get_subpaths_from_append_path(single_chunk_path,
 									  &partially_compressed_paths,
 									  &partially_compressed_append,
+									  &partially_compressed_agg,
 									  &partially_compressed_gather);
+		Assert(partially_compressed_agg == NULL);
 		Assert(partially_compressed_gather == NULL);
 
+		/* Create new append paths */
 		if (partially_compressed_append != NULL)
 		{
 			List *partially_compressed_sorted = NIL;
@@ -453,13 +516,12 @@ generate_agg_pushdown_path(PlannerInfo *root, Path *cheapest_total_path, RelOptI
 											  partial_grouping_target,
 											  d_num_groups,
 											  extra_data,
-											  subpath,
+											  single_chunk_path,
 											  &sorted_subpaths /* Result paths */,
 											  &hashed_subpaths /* Result paths */);
 		}
 	}
 
-	/* Create new append paths */
 	if (top_gather == NULL)
 	{
 		/*
@@ -530,8 +592,14 @@ contains_path_plain_or_sorted_agg(Path *path)
 {
 	List *subpaths = NIL;
 	Path *append = NULL;
+	Path *agg = NULL;
 	Path *gather = NULL;
-	get_subpaths_from_append_path(path, &subpaths, &append, &gather);
+	get_subpaths_from_append_path(path, &subpaths, &append, &agg, &gather);
+
+	if (subpaths == NIL)
+	{
+		my_print(path);
+	}
 
 	Ensure(subpaths != NIL, "Unable to determine aggregation type");
 
@@ -667,6 +735,7 @@ tsl_pushdown_partial_agg(PlannerInfo *root, Hypertable *ht, RelOptInfo *input_re
 	 * total cost, and a path with low startup cost. We must partialize both, so
 	 * loop through the entire pathlist.
 	 */
+	fprintf(stderr, "pushdown path generation\n");
 	ListCell *lc;
 	foreach (lc, output_rel->pathlist)
 	{
@@ -701,6 +770,8 @@ tsl_pushdown_partial_agg(PlannerInfo *root, Hypertable *ht, RelOptInfo *input_re
 	/* Prefer our paths */
 	output_rel->pathlist = NIL;
 	output_rel->partial_pathlist = NIL;
+
+	fprintf(stderr, "upperrel replanning\n");
 
 	/*
 	 * Finalize the created partially aggregated paths by adding a

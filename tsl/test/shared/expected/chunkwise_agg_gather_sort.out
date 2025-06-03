@@ -15,45 +15,33 @@ QUERY PLAN
    Group Key: _hyper_X_X_chunk.v0
    ->  Gather Merge
          Workers Planned: 2
-         ->  Sort
-               Sort Key: _hyper_X_X_chunk.v0
-               ->  Parallel Append
-                     ->  Partial GroupAggregate
-                           Group Key: _hyper_X_X_chunk.v0
-                           ->  Sort
-                                 Sort Key: _hyper_X_X_chunk.v0
-                                 ->  Seq Scan on _hyper_X_X_chunk
-                     ->  Partial GroupAggregate
-                           Group Key: _hyper_X_X_chunk.v0
-                           ->  Sort
-                                 Sort Key: _hyper_X_X_chunk.v0
-                                 ->  Seq Scan on _hyper_X_X_chunk
-                     ->  Partial GroupAggregate
-                           Group Key: _hyper_X_X_chunk.v0
-                           ->  Sort
-                                 Sort Key: _hyper_X_X_chunk.v0
-                                 ->  Seq Scan on _hyper_X_X_chunk
-(22 rows)
+         ->  Partial GroupAggregate
+               Group Key: _hyper_X_X_chunk.v0
+               ->  Sort
+                     Sort Key: _hyper_X_X_chunk.v0
+                     ->  Parallel Append
+                           ->  Seq Scan on _hyper_X_X_chunk
+                           ->  Seq Scan on _hyper_X_X_chunk
+                           ->  Seq Scan on _hyper_X_X_chunk
+(12 rows)
 
 reset enable_hashagg;
 :prefix
 select count(*) from metrics group by v0;
 QUERY PLAN
- Finalize HashAggregate
+ Finalize GroupAggregate
    Group Key: _hyper_X_X_chunk.v0
-   ->  Gather
+   ->  Gather Merge
          Workers Planned: 2
-         ->  Parallel Append
+         ->  Sort
+               Sort Key: _hyper_X_X_chunk.v0
                ->  Partial HashAggregate
                      Group Key: _hyper_X_X_chunk.v0
-                     ->  Seq Scan on _hyper_X_X_chunk
-               ->  Partial HashAggregate
-                     Group Key: _hyper_X_X_chunk.v0
-                     ->  Seq Scan on _hyper_X_X_chunk
-               ->  Partial HashAggregate
-                     Group Key: _hyper_X_X_chunk.v0
-                     ->  Seq Scan on _hyper_X_X_chunk
-(14 rows)
+                     ->  Parallel Append
+                           ->  Seq Scan on _hyper_X_X_chunk
+                           ->  Seq Scan on _hyper_X_X_chunk
+                           ->  Seq Scan on _hyper_X_X_chunk
+(12 rows)
 
 reset parallel_setup_cost;
 reset parallel_tuple_cost;
