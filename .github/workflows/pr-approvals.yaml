@@ -41,14 +41,14 @@ jobs:
             # Get the number of approvals in this pull request. Only count the
             # approvals by the timescale/database-eng team members.
             gh pr view $PR_NUMBER --json latestReviews > reviews_api.json
-            gh api /orgs/timescale/teams/database-eng/members --paginate > team_api.json
-            approvals=$(jq -n --slurpfile team_api team_api.json --slurpfile reviews_api reviews_api.json '
-                  ($team_api | add | map(.login) ) as $owners
+            approvals=$(jq '
+                  ([inputs]) as $owners
                   | ($reviews_api | add | [ .latestReviews[]?
                     | select(.authorAssociation == "MEMBER" and .state == "APPROVED")
                     | .author.login ] ) as $approving
                   | ($approving - ($approving - $owners))
-                  | length')
+                  | length
+                  ' -Rn CODEOWNERS --slurpfile reviews_api reviews_api.json)
 
             echo "approvals: $approvals, files: $files"
             if [[ $approvals -lt 2 && $files -gt 0 ]] ; then
