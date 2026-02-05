@@ -3,9 +3,12 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-TIMESCALE for a copy of the license.
  */
+#pragma once
 
 #include <postgres.h>
+
 #include "compression/arrow_c_data_interface.h"
+#include "nodes/columnar_scan/vector_predicates.h"
 
 /*
  * When we have a dictionary-encoded Arrow Array, and have run a predicate on
@@ -19,6 +22,36 @@ translate_bitmap_from_dictionary(const ArrowArray *arrow, const uint64 *dict_res
 	Assert(arrow->dictionary != NULL);
 
 	const size_t n = arrow->length;
+	const int num_result_words = (n + 63) / 64;
+
+	const BatchQualSummary summary =
+		get_vector_qual_summary(dict_result, arrow->dictionary->length);
+	if (summary == NoRowsPass)
+	{
+		for (int i = 0; i < num_result_words; i++)
+		{
+			final_result[i] = 0;
+		}
+
+		return;
+	}
+
+	if (summary == AllRowsPass)
+	{
+		for (int i = 0; i < num_result_words; i++)
+		{
+			final_result[i] = -1ULL;
+		}
+
+		if (n % 64 != 0)
+		{
+			const uint64 tail_mask = ~0ULL >> (64 - n % 64);
+			final_result[num_result_words] &= tail_mask;
+		}
+
+		return;
+	}
+
 	const int16 *indices = (int16 *) arrow->buffers[1];
 	for (size_t outer = 0; outer < n / 64; outer++)
 	{
