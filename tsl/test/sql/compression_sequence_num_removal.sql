@@ -5,9 +5,9 @@
 -- test query planning with hypertable which contains
 -- compressed chunks that depend on sequence number optimization
 -- which is removed in latest schema revision
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+\c :TEST_DBNAME :ROLE_SUPERUSER
 SET ROLE :ROLE_DEFAULT_PERM_USER;
-\set EXPLAIN 'EXPLAIN (VERBOSE, COSTS OFF)'
+\set EXPLAIN 'EXPLAIN (VERBOSE, BUFFERS OFF, COSTS OFF)'
 
 CREATE TABLE hyper(
     time INT NOT NULL,
@@ -48,7 +48,7 @@ ORDER BY ch1.id LIMIT 1 \gset
 SELECT schemaname || '.' || indexname AS "CHUNK_INDEX" FROM pg_indexes where tablename = :'CHUNK_NAME'
 LIMIT 1 \gset
 
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
 SET timescaledb.restoring TO ON;
 -- add sequence number column and fill in the correct sequences
 ALTER TABLE :CHUNK_FULL_NAME ADD COLUMN _ts_meta_sequence_num int;
@@ -72,7 +72,7 @@ ORDER BY ch1.id OFFSET 2 LIMIT 1 \gset
 SELECT schemaname || '.' || indexname AS "CHUNK_INDEX" FROM pg_indexes where tablename = :'CHUNK_NAME'
 LIMIT 1 \gset
 
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
 SET timescaledb.restoring TO ON;
 -- add sequence number column and fill in the correct sequences
 ALTER TABLE :CHUNK_FULL_NAME ADD COLUMN _ts_meta_sequence_num int;
@@ -133,7 +133,7 @@ WHERE ch1.hypertable_id = ht.id AND ht.table_name LIKE 'hyper'
 AND ch1.compressed_chunk_id = comp_ch.id
 ORDER BY ch1.id LIMIT 1 \gset
 
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
 SET timescaledb.restoring TO ON;
 -- add sequence number column and fill in the correct sequences
 ALTER TABLE :CHUNK_FULL_NAME ADD COLUMN _ts_meta_sequence_num int;
@@ -151,7 +151,7 @@ WHERE ch1.hypertable_id = ht.id AND ht.table_name LIKE 'hyper'
 AND ch1.compressed_chunk_id = comp_ch.id
 ORDER BY ch1.id OFFSET 3 LIMIT 1 \gset
 
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
 SET timescaledb.restoring TO ON;
 -- add sequence number column and fill in the correct sequences
 ALTER TABLE :CHUNK_FULL_NAME ADD COLUMN _ts_meta_sequence_num int;
@@ -199,7 +199,7 @@ WHERE ch1.hypertable_id = ht.id AND ht.table_name LIKE 'hyper'
 AND ch1.compressed_chunk_id = comp_ch.id
 ORDER BY ch1.id LIMIT 1 \gset
 
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
 SELECT :'CHUNK_FULL_NAME'::regclass::oid as "CHUNK_OID" \gset
 SELECT (power(2,31)+1)::bigint as "CHUNK_NEW_OID" \gset
 UPDATE pg_class SET oid = :CHUNK_NEW_OID
@@ -214,3 +214,47 @@ WHERE device_id = 1 ORDER BY time;
 SET ROLE :ROLE_DEFAULT_PERM_USER;
 
 DROP TABLE hyper;
+
+
+-- Test type coercion during metadata EquivalenceClass creation
+CREATE TABLE varchar(
+    time INT NOT NULL,
+    device_id varchar,
+	text varchar,
+    val INT);
+SELECT * FROM create_hypertable('varchar', 'time', chunk_time_interval => 10);
+
+-- test case with segmentby
+ALTER TABLE varchar SET (
+    timescaledb.compress,
+	timescaledb.compress_segmentby = 'device_id',
+    timescaledb.compress_orderby = 'text, time');
+
+INSERT INTO varchar SELECT t, t::text, t::text, 1 FROM generate_series(1, 10, 1) t;
+
+SELECT compress_chunk(show_chunks('varchar'));
+VACUUM ANALYZE varchar;
+
+SELECT * FROM varchar WHERE device_id = '1' ORDER BY text, time LIMIT 5;
+
+-- index scan
+SET enable_seqscan TO OFF;
+:EXPLAIN SELECT device_id, text FROM varchar
+GROUP BY device_id, text;
+SELECT device_id, text FROM varchar
+GROUP BY device_id, text;
+
+-- backwards index scan
+:EXPLAIN SELECT * FROM varchar
+ORDER BY device_id DESC, text DESC;
+SELECT * FROM varchar
+ORDER BY device_id DESC, text DESC;
+SET enable_seqscan TO DEFAULT;
+
+-- seq scan
+:EXPLAIN SELECT * FROM varchar
+ORDER BY device_id DESC, text DESC;
+SELECT * FROM varchar
+ORDER BY device_id DESC, text DESC;
+
+DROP TABLE varchar;

@@ -4,8 +4,8 @@
 
 SET timezone TO 'America/Los_Angeles';
 
-\set PREFIX 'EXPLAIN (costs off, summary off, timing off) '
-\set ANALYZE  'EXPLAIN (analyze, costs off, summary off, timing off) '
+\set PREFIX 'EXPLAIN (buffers off, costs off, summary off, timing off) '
+\set ANALYZE  'EXPLAIN (analyze, buffers off, costs off, summary off, timing off) '
 CREATE TABLE test1 (timec timestamptz , i integer ,
       b bigint, t text);
 SELECT table_name from create_hypertable('test1', 'timec', chunk_time_interval=> INTERVAL '7 days');
@@ -1009,3 +1009,235 @@ ON CONFLICT DO NOTHING;
 
 DROP TABLE t_1sec;
 
+-- regression test for SDC 3210
+
+CREATE TABLE gen_column(
+	"timestamp"                         timestamp with time zone NOT NULL,
+	device_id                           text,
+	device_id_generated 				text GENERATED ALWAYS AS (device_id) STORED,
+	speed                               double precision
+);
+
+ALTER TABLE gen_column ADD CONSTRAINT unique_device_timestamp_sensor
+	UNIQUE (device_id_generated, "timestamp");
+
+CREATE INDEX gen_column_timestamp_idx
+	ON gen_column
+	USING btree ("timestamp" DESC);
+
+SELECT create_hypertable(
+	relation => 'gen_column',
+	time_column_name => 'timestamp',
+	chunk_time_interval => interval '06:00:00',
+	create_default_indexes => false
+);
+
+ALTER TABLE gen_column SET (
+	timescaledb.compress,
+	timescaledb.compress_segmentby = 'device_id_generated',
+	timescaledb.compress_orderby='"timestamp"'
+);
+
+insert into gen_column ( "timestamp", device_id, speed) values
+( '2025-06-06 10:00:00', 'device_id_1', 100),
+( '2025-06-06 10:01:00', 'device_id_2', 100),
+( '2025-06-06 10:02:00', 'device_id_3', 100);
+
+SELECT compress_chunk(show_chunks('gen_column'));
+
+insert into gen_column ( "timestamp", device_id, speed) values
+( '2025-06-06 10:03:00', 'device_id_1', 100),
+( '2025-06-06 10:00:00', 'device_id_1', 110),
+( '2025-06-06 10:00:00', 'device_id_1', 110)
+ON CONFLICT DO NOTHING;
+
+-- should contain 2 rows for device_1 and one per any other device
+SELECT device_id_generated, count(*)
+FROM gen_column
+GROUP BY 1
+ORDER BY 1;
+
+SELECT decompress_chunk(show_chunks('gen_column'));
+
+ALTER TABLE gen_column SET (
+	timescaledb.compress,
+	timescaledb.compress_segmentby = '',
+	timescaledb.compress_orderby='"timestamp"'
+);
+SELECT compress_chunk(show_chunks('gen_column'));
+
+insert into gen_column ( "timestamp", device_id, speed) values
+( '2025-06-06 10:04:00', 'device_id_1', 100),
+( '2025-06-06 10:00:00', 'device_id_1', 110),
+( '2025-06-06 10:00:00', 'device_id_1', 110)
+ON CONFLICT DO NOTHING;
+
+-- should contain 3 rows for device_1 and one per any other device
+SELECT device_id_generated, count(*)
+FROM gen_column
+GROUP BY 1
+ORDER BY 1;
+
+DROP TABLE gen_column;
+
+-- regression test for SDC 3721
+create table generated_with_dropped (
+    timestamp timestamp with time zone not null,
+    a numeric(15,10),
+    b numeric(15,10),
+    c numeric(15,10) generated always as (a+b) stored,
+    to_be_dropped bigint not null,
+    d jsonb,
+    e bigint,
+    f text not null);
+
+select create_hypertable('generated_with_dropped', by_range('timestamp', '1 week'::interval));
+
+-- Dropping a column to verify we are using the correct
+-- tuple desc when generating generated column.
+alter table generated_with_dropped drop column to_be_dropped;
+
+-- populate the table with some data
+insert into generated_with_dropped (timestamp, a, b, d, e, f) values
+('2026-01-18 22:55:39+00', -104.8180690000, 39.7653270000, '{"test": 5}', 397000, 'test');
+
+-- compress everything
+ALTER TABLE generated_with_dropped SET(
+    timescaledb.enable_columnstore,
+    timescaledb.orderby = 'timestamp'
+);
+select compress_chunk(chunk) from show_chunks('generated_with_dropped') as chunk;
+
+-- This should not segfault
+insert into generated_with_dropped (f, timestamp, a, b, d, e) values
+('test1', '2026-01-18 22:56:08+00', -118.1709590000, 33.9069520000, '{"test": 5}', 327000);
+
+DROP TABLE generated_with_dropped;
+
+-- test insert into compressed chunk directly works
+-- to ensure maintenance operations work unhindered we dont
+-- want to block direct inserts into compressed chunks
+CREATE TABLE direct_compressed_insert (time timestamptz) WITH (tsdb.hypertable);
+
+INSERT INTO direct_compressed_insert SELECT generate_series('2024-01-01'::timestamptz, '2024-01-01 1:00:00'::timestamptz, '1 second');
+SELECT count(compress_chunk(c)) FROM show_chunks('direct_compressed_insert') c;
+SELECT format('%I.%I', schema_name, table_name) AS "CHUNK" FROM _timescaledb_catalog.chunk ORDER BY id DESC LIMIT 1 \gset
+
+CREATE TABLE compressed_batches AS SELECT * FROM :CHUNK;
+SELECT _ts_meta_count, count(*) FROM :CHUNK GROUP BY _ts_meta_count ORDER BY 1 DESC;
+
+-- should have not ModifyHypertable node
+EXPLAIN (costs off,timing off, summary off) INSERT INTO :CHUNK SELECT * FROM compressed_batches;
+INSERT INTO :CHUNK SELECT * FROM compressed_batches;
+
+SELECT _ts_meta_count, count(*) FROM :CHUNK GROUP BY _ts_meta_count ORDER BY 1 DESC;
+
+-- Test: unique constraint violation detection with single-value (default)
+-- columns in vectorized batch matching.
+
+CREATE TABLE sv_default(time timestamptz NOT NULL, device_id int)
+WITH (tsdb.hypertable, tsdb.compress_segmentby = 'device_id', tsdb.compress_orderby = 'time');
+
+INSERT INTO sv_default SELECT '2025-01-01'::timestamptz + format('%s day',i)::interval, 1 FROM generate_series(1, 2) i;
+SELECT count(compress_chunk(c)) FROM show_chunks('sv_default') c;
+
+-- Add column with non-null default: creates single-value column in compressed batch
+ALTER TABLE sv_default ADD COLUMN extra int DEFAULT 42;
+CREATE UNIQUE INDEX sv_default_unique ON sv_default(time, extra);
+
+SELECT * FROM sv_default;
+
+-- Duplicates should fail
+\set ON_ERROR_STOP 0
+INSERT INTO sv_default VALUES('2025-01-02', 1, 42);
+INSERT INTO sv_default VALUES('2025-01-03', 1, 42);
+\set ON_ERROR_STOP 1
+
+-- Non-duplicate should succeed
+INSERT INTO sv_default VALUES('2025-01-02', 1, 23);
+
+-- should be 3 rows total
+SELECT count(*) FROM sv_default;
+
+-- Same test with all-NULL column and NULLS NOT DISTINCT
+CREATE TABLE sv_null(time timestamptz NOT NULL, device_id int, tag text, value float)
+WITH (tsdb.hypertable, tsdb.compress_segmentby = 'device_id', tsdb.compress_orderby = 'time');
+
+-- Insert rows where tag is always NULL
+INSERT INTO sv_null SELECT '2025-01-01'::timestamptz + format('%s day',i)::interval, 1, NULL, i::float FROM generate_series(1, 2) i;
+SELECT count(compress_chunk(c)) FROM show_chunks('sv_null') c;
+
+CREATE UNIQUE INDEX sv_null_unique ON sv_null(time, tag) NULLS NOT DISTINCT;
+
+-- Duplicate of first row - should fail
+\set ON_ERROR_STOP 0
+INSERT INTO sv_null VALUES('2025-01-02', 1, NULL, 999);
+INSERT INTO sv_null VALUES('2025-01-03', 1, NULL, 999);
+\set ON_ERROR_STOP 1
+
+-- Non-duplicate should succeed
+INSERT INTO sv_null VALUES('2024-01-05', 1, NULL, 6.0);
+
+-- should be 3 rows total
+SELECT count(*) FROM sv_null;
+
+-- Test: generated stored columns should not be NULL in compressed chunks
+-- GitHub issue #9314
+CREATE TABLE i9314 (
+    time timestamptz NOT NULL,
+    value int,
+    doubled int GENERATED ALWAYS AS (value * 2) STORED
+) WITH (tsdb.hypertable, tsdb.chunk_interval = '180 day');
+
+-- Insert initial data and compress
+INSERT INTO i9314 VALUES ('2024-01-01', 1);
+SELECT compress_chunk(show_chunks('i9314'));
+
+-- Insert multiple rows into the compressed chunk
+-- All rows should have correct generated column values
+INSERT INTO i9314 VALUES
+    ('2024-01-02', 2),
+    ('2024-01-03', 3),
+    ('2024-01-04', 4);
+
+SELECT compress_chunk(show_chunks('i9314'));
+
+-- show explain to ensure its all compressed
+:PREFIX SELECT * FROM i9314 ORDER BY time;
+SELECT * FROM i9314 ORDER BY time;
+
+SET timescaledb.enable_direct_compress_insert = true;
+
+-- Insert >= 10 rows to trigger direct compress path
+INSERT INTO i9314 SELECT '2024-02-01'::timestamptz + format('%s day',i)::interval, i + 10 FROM generate_series(1, 10) i;
+
+:PREFIX SELECT * FROM i9314 ORDER BY time;
+SELECT * FROM i9314 ORDER BY time;
+
+-- test copy
+COPY i9314 FROM STDIN DELIMITER ',' CSV;
+2024-03-13,20
+2024-03-14,21
+2024-03-15,22
+2024-03-16,23
+2024-03-17,24
+\.
+
+SELECT compress_chunk(show_chunks('i9314'));
+
+:PREFIX SELECT * FROM i9314 ORDER BY time;
+SELECT * FROM i9314 ORDER BY time;
+
+SET timescaledb.enable_direct_compress_copy = true;
+COPY i9314 FROM STDIN DELIMITER ',' CSV;
+2024-04-13,30
+2024-04-14,31
+2024-04-15,32
+2024-04-16,33
+2024-04-17,34
+\.
+
+:PREFIX SELECT * FROM i9314 ORDER BY time;
+SELECT * FROM i9314 ORDER BY time;
+
+RESET timescaledb.enable_direct_compress_insert;

@@ -2,19 +2,29 @@
 name: Shellcheck
 "on":
   pull_request:
-    paths:
-      - '**.sh'
-      - .github/workflows/shellcheck.yaml
   push:
     branches:
       - main
       - ?.*.x
-    paths:
-      - '**.sh'
-      - .github/workflows/shellcheck.yaml
 jobs:
+  check_paths:
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: >-
+        ${{ github.event_name == 'push'
+          || (steps.filter.outputs.shell == 'true' && !contains(github.event.pull_request.labels.*.name, 'skip-ci'))
+         }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        id: filter
+        with:
+          filters: .github/filters.yaml
+
   shellcheck:
     name: Shellcheck
+    needs: [check_paths]
+    if: needs.check_paths.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -24,9 +34,23 @@ jobs:
         sudo apt-get install shellcheck
 
     - name: Checkout TimescaleDB
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         fetch-depth: 0
 
     - name: Run shellcheck
       run: scripts/shellcheck-ci.sh
+
+  report_status:
+    name: Shellcheck summary
+    needs: [check_paths, shellcheck]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # If the detector failed, or the matrix failed, exit with error
+          if [[ "${{ needs.shellcheck.result }}" == "failure" ]]; then
+            exit 1
+          fi
+          echo "All checks passed or were safely skipped."
+

@@ -54,6 +54,10 @@ for version in ${ALL_VERSIONS}; do
     if [ "${PG_MAJOR_VERSION}" -le 16 ]; then
         VERSIONS="${VERSIONS} ${version}"
     fi
+  elif [ "${minor_version}" -le 22 ]; then
+    if [ "${PG_MAJOR_VERSION}" -le 17 ]; then
+        VERSIONS="${VERSIONS} ${version}"
+    fi
   else
     VERSIONS="${VERSIONS} ${version}"
   fi
@@ -70,7 +74,7 @@ for version in ${VERSIONS}; do
   if [ ! -f "${PG_EXTENSION_DIR}/timescaledb--${version}.sql" ]; then
     echo "Building ${version}"
     git checkout ${version}
-    make -C "${BUILD_DIR}" -j4 > /dev/null
+    make -C "${BUILD_DIR}" -j "$(getconf _NPROCESSORS_ONLN)" > /dev/null
     sudo make -C "${BUILD_DIR}" install > /dev/null
     git checkout ${GIT_REF}
   fi
@@ -78,7 +82,7 @@ done
 
 # We want to use the latest loader for all the tests so we build it last
 git checkout ${GIT_REF}
-make -C "${BUILD_DIR}" -j4
+make -C "${BUILD_DIR}" -j "$(getconf _NPROCESSORS_ONLN)"
 sudo make -C "${BUILD_DIR}" install
 
 set +e
@@ -94,7 +98,9 @@ if [ -n "${VERSIONS}" ]; then
     fi
 
 
-    if [ "${ts_minor_version}" -ge 16 ]; then
+    if [ "${ts_minor_version}" -ge 20 ]; then
+        TEST_VERSION=v10
+    elif [ "${ts_minor_version}" -ge 16 ]; then
         TEST_VERSION=v9
     else
         TEST_VERSION=v8
@@ -115,6 +121,8 @@ echo -e "\nUpdate test finished for ${VERSIONS}\n"
 
 if [ $FAIL_COUNT -gt 0 ]; then
   echo -e "Failed versions: ${FAILED_VERSIONS}\n"
+  echo -e "Postgres errors:\n"
+  find update_test -name postgres.log -exec grep ERROR {} \;
 else
   echo -e "All tests succeeded.\n"
 fi

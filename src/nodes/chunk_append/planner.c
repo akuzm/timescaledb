@@ -40,16 +40,6 @@ static CustomScanMethods chunk_append_plan_methods = {
 bool
 ts_is_chunk_append_plan(Plan *plan)
 {
-	if (IsA(plan, Result))
-	{
-		if (castNode(Result, plan)->plan.lefttree &&
-			IsA(castNode(Result, plan)->plan.lefttree, CustomScan))
-		{
-			return castNode(CustomScan, castNode(Result, plan)->plan.lefttree)->methods ==
-				   &chunk_append_plan_methods;
-		}
-		return false;
-	}
 	return IsA(plan, CustomScan) &&
 		   castNode(CustomScan, plan)->methods == &chunk_append_plan_methods;
 }
@@ -131,6 +121,30 @@ ts_chunk_append_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path
 		tlist = ts_replace_rowid_vars(root, tlist, rel->relid);
 
 	cscan->scan.plan.targetlist = tlist;
+
+	/*
+	 * For parameterized paths (e.g., LATERAL joins), transform outer-relation
+	 * Vars to NestLoop Params. We store clauses in custom_private rather than
+	 * custom_exprs because chunk_ri_clauses reference chunk relations (after
+	 * adjust_appendrel_attrs), but setrefs.c processing of custom_exprs expects
+	 * Vars to reference the parent relation (scanrelid). Since custom_private
+	 * bypasses setrefs, we must transform outer Vars to Params ourselves.
+	 */
+	if (path->path.param_info && root->curOuterRels)
+	{
+		List *transformed_clauses = NIL;
+		ListCell *lc;
+		foreach (lc, clauses)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			RestrictInfo *newrinfo = makeNode(RestrictInfo);
+
+			memcpy(newrinfo, rinfo, sizeof(RestrictInfo));
+			newrinfo->clause = (Expr *) ts_replace_nestloop_params(root, (Node *) rinfo->clause);
+			transformed_clauses = lappend(transformed_clauses, newrinfo);
+		}
+		clauses = transformed_clauses;
+	}
 
 	ListCell *lc_plan, *lc_path;
 	forboth (lc_path, path->custom_paths, lc_plan, custom_plans)
@@ -358,7 +372,7 @@ ts_chunk_append_get_scan_plan(Plan *plan)
 			{
 				/*
 				 * The custom plan node is a scan itself. This handles the
-				 * DecompressChunk node.
+				 * ColumnarScan node.
 				 */
 				return (Scan *) plan;
 			}

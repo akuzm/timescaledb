@@ -9,11 +9,15 @@
 #include <utils/builtins.h>
 #include <utils/date.h>
 #include <utils/datetime.h>
+#include <utils/elog.h>
 #include <utils/fmgrprotos.h>
 #include <utils/timestamp.h>
+#include <utils/uuid.h>
 
+#include "export.h"
 #include "time_bucket.h"
 #include "utils.h"
+#include "uuid.h"
 
 #define TIME_BUCKET(period, timestamp, offset, min, max, result)                                   \
 	do                                                                                             \
@@ -344,34 +348,51 @@ ts_timestamptz_timezone_bucket(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
 
-	/* Convert to local timestamp according to timezone */
-	timestamp = DirectFunctionCall2(timestamptz_zone, tzname, timestamp);
+	/*
+	 * Apply offset in UTC space to avoid DST issues (issue #7059).
+	 * If we applied the offset after converting to local time, we could
+	 * create non-existent times during DST transitions.
+	 */
 	if (have_offset)
 	{
-		/* Apply offset. */
-		timestamp = DirectFunctionCall2(timestamp_mi_interval, timestamp, PG_GETARG_DATUM(4));
+		timestamp = DirectFunctionCall2(timestamptz_mi_interval, timestamp, PG_GETARG_DATUM(4));
 	}
+
+	/* Convert to local timestamp according to timezone */
+	Datum local_ts = DirectFunctionCall2(timestamptz_zone, tzname, timestamp);
 
 	if (have_origin)
 	{
 		Datum origin = DirectFunctionCall2(timestamptz_zone, tzname, PG_GETARG_DATUM(3));
-		timestamp = DirectFunctionCall3(ts_timestamp_bucket, period, timestamp, origin);
+		local_ts = DirectFunctionCall3(ts_timestamp_bucket, period, local_ts, origin);
 	}
 	else
 	{
-		timestamp = DirectFunctionCall2(ts_timestamp_bucket, period, timestamp);
+		local_ts = DirectFunctionCall2(ts_timestamp_bucket, period, local_ts);
+	}
+
+	/* Convert back to timestamptz */
+	Datum result = DirectFunctionCall2(timestamp_zone, tzname, local_ts);
+
+	/*
+	 * During DST fall-back, the same local time maps to two different UTC
+	 * times. PostgreSQL's timestamp_zone picks the later (standard time)
+	 * interpretation. If the original timestamp was in daylight time, the
+	 * bucket could start AFTER the timestamp. Fix by subtracting periods
+	 * until the bucket is at or before the timestamp (issue #9136).
+	 */
+	while (DatumGetTimestampTz(result) > DatumGetTimestampTz(timestamp))
+	{
+		result = DirectFunctionCall2(timestamptz_mi_interval, result, period);
 	}
 
 	if (have_offset)
 	{
-		/* Remove offset. */
-		timestamp = DirectFunctionCall2(timestamp_pl_interval, timestamp, PG_GETARG_DATUM(4));
+		/* Remove offset in UTC space. */
+		result = DirectFunctionCall2(timestamptz_pl_interval, result, PG_GETARG_DATUM(4));
 	}
 
-	/* Convert back to timezone */
-	timestamp = DirectFunctionCall2(timestamp_zone, tzname, timestamp);
-
-	PG_RETURN_DATUM(timestamp);
+	PG_RETURN_DATUM(result);
 }
 
 static inline void
@@ -457,6 +478,111 @@ ts_date_offset_bucket(PG_FUNCTION_ARGS)
 	time = DirectFunctionCall2(date_pl_interval, date, PG_GETARG_DATUM(2));
 	date = DirectFunctionCall1(timestamp_date, time);
 	PG_RETURN_DATUM(date);
+}
+
+static const char *
+uuid_to_str(const pg_uuid_t *uuid)
+{
+	return DatumGetCString(DirectFunctionCall1(uuid_out, UUIDPGetDatum(uuid)));
+}
+
+TS_FUNCTION_INFO_V1(ts_uuid_bucket);
+
+Datum
+ts_uuid_bucket(PG_FUNCTION_ARGS)
+{
+	pg_uuid_t *uuid = PG_GETARG_UUID_P(1);
+	Datum origin = (PG_NARGS() > 2 ? PG_GETARG_DATUM(2) : TimestampTzGetDatum(DEFAULT_ORIGIN));
+	TimestampTz timestamp;
+
+	if (!ts_uuid_v7_extract_timestamptz(uuid, &timestamp, false))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not a version 7 UUID: %s", uuid_to_str(uuid))));
+
+	PG_RETURN_DATUM(DirectFunctionCall3(ts_timestamptz_bucket,
+										PG_GETARG_DATUM(0),
+										TimestampTzGetDatum(timestamp),
+										origin));
+}
+
+TS_FUNCTION_INFO_V1(ts_uuid_offset_bucket);
+
+TSDLLEXPORT Datum
+ts_uuid_offset_bucket(PG_FUNCTION_ARGS)
+{
+	pg_uuid_t *uuid = PG_GETARG_UUID_P(1);
+	TimestampTz timestamp;
+
+	if (!ts_uuid_v7_extract_timestamptz(uuid, &timestamp, false))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not a version 7 UUID: %s", uuid_to_str(uuid))));
+	LOCAL_FCINFO(fcinfo_local, 3);
+	Datum result;
+
+	InitFunctionCallInfoData(*fcinfo_local, NULL, 3, InvalidOid, NULL, NULL);
+
+	fcinfo_local->args[0].value = PG_GETARG_DATUM(0); /* Period */
+	fcinfo_local->args[0].isnull = PG_ARGISNULL(0);
+	fcinfo_local->args[1].value = TimestampTzGetDatum(timestamp);
+	fcinfo_local->args[1].isnull = PG_ARGISNULL(1);
+	fcinfo_local->args[2].value = PG_GETARG_DATUM(2);
+	fcinfo_local->args[2].isnull = PG_ARGISNULL(2);
+
+	result = ts_timestamptz_offset_bucket(fcinfo_local);
+
+	/* Timestamp offset bucket does not return NULL */
+	Assert(!fcinfo_local->isnull);
+
+	return result;
+}
+
+TS_FUNCTION_INFO_V1(ts_uuid_timezone_bucket);
+
+/*
+ * time_bucket(bucket_width INTERVAL, ts uuid, timezone TEXT, origin uuid DEFAULT
+ * NULL, "offset" INTERVAL DEFAULT NULL) RETURNS TIMESTAMPTZ
+ */
+TSDLLEXPORT Datum
+ts_uuid_timezone_bucket(PG_FUNCTION_ARGS)
+{
+	/*
+	 * We need to check for NULL arguments here because the function cannot be
+	 * defined STRICT due to the optional arguments.
+	 */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		PG_RETURN_NULL();
+
+	pg_uuid_t *uuid = PG_GETARG_UUID_P(1);
+	TimestampTz timestamp;
+
+	if (!ts_uuid_v7_extract_timestamptz(uuid, &timestamp, false))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not a version 7 UUID: %s", uuid_to_str(uuid))));
+
+	LOCAL_FCINFO(fcinfo_local, 4);
+	Datum result;
+
+	InitFunctionCallInfoData(*fcinfo_local, NULL, 4, InvalidOid, NULL, NULL);
+
+	fcinfo_local->args[0].value = PG_GETARG_DATUM(0); /* Period */
+	fcinfo_local->args[0].isnull = PG_ARGISNULL(0);
+	fcinfo_local->args[1].value = TimestampTzGetDatum(timestamp);
+	fcinfo_local->args[1].isnull = PG_ARGISNULL(1);
+	fcinfo_local->args[2].value = PG_GETARG_DATUM(2);
+	fcinfo_local->args[2].isnull = PG_ARGISNULL(2);
+	fcinfo_local->args[3].value = PG_GETARG_DATUM(3);
+	fcinfo_local->args[3].isnull = PG_ARGISNULL(3);
+
+	result = ts_timestamptz_timezone_bucket(fcinfo_local);
+
+	/* The only case where the timestamp bucket function returns NULL is when passed NULL input
+	 * arguments, but we already checked for that above. */
+	Assert(!fcinfo_local->isnull);
+
+	return result;
 }
 
 TSDLLEXPORT int64
@@ -546,223 +672,4 @@ ts_time_bucket_by_type_extended(int64 interval, int64 timestamp, Oid timestamp_t
 	}
 
 	return ts_time_value_to_internal(time_bucketed, timestamp_type);
-}
-
-TS_FUNCTION_INFO_V1(ts_time_bucket_ng_timestamp);
-TSDLLEXPORT Datum
-ts_time_bucket_ng_timestamp(PG_FUNCTION_ARGS)
-{
-	DateADT ts_date;
-	Interval *interval = PG_GETARG_INTERVAL_P(0);
-	Timestamp timestamp = PG_GETARG_TIMESTAMP(1);
-
-	if (interval->time != 0)
-	{
-		if (interval->month != 0)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("interval can't combine months with minutes or hours")));
-		}
-
-		if (TIMESTAMP_NOT_FINITE(timestamp))
-			PG_RETURN_TIMESTAMP(timestamp);
-
-		/*
-		 * Handle minutes, hours and days.
-		 */
-		Timestamp origin = (PG_NARGS() > 2 ? PG_GETARG_TIMESTAMP(2) : DEFAULT_ORIGIN);
-		if (TIMESTAMP_NOT_FINITE(origin))
-			PG_RETURN_TIMESTAMP(origin);
-
-		Timestamp result;
-		int64 period = get_interval_period_timestamp_units(interval);
-		TIME_BUCKET_TS(period, timestamp, result, origin);
-
-		PG_RETURN_TIMESTAMP(result);
-	}
-
-	/*
-	 * Discard any time information and work with the date.
-	 */
-	ts_date = DatumGetDateADT(DirectFunctionCall1(timestamp_date, PG_GETARG_DATUM(1)));
-
-	if (PG_NARGS() > 2)
-	{
-		DateADT result;
-		DateADT origin = DatumGetDateADT(DirectFunctionCall1(timestamp_date, PG_GETARG_DATUM(2)));
-		result = DatumGetDateADT(DirectFunctionCall3(ts_time_bucket_ng_date,
-													 PG_GETARG_DATUM(0),
-													 DateADTGetDatum(ts_date),
-													 DateADTGetDatum(origin)));
-		return DirectFunctionCall1(date_timestamp, DateADTGetDatum(result));
-	}
-	else
-	{
-		DateADT result;
-		result = DatumGetDateADT(DirectFunctionCall2(ts_time_bucket_ng_date,
-													 PG_GETARG_DATUM(0),
-													 DateADTGetDatum(ts_date)));
-		return DirectFunctionCall1(date_timestamp, DateADTGetDatum(result));
-	}
-}
-
-TS_FUNCTION_INFO_V1(ts_time_bucket_ng_timestamptz);
-TSDLLEXPORT Datum
-ts_time_bucket_ng_timestamptz(PG_FUNCTION_ARGS)
-{
-	DateADT result;
-	Datum interval = PG_GETARG_DATUM(0);
-	DateADT ts_date = DatumGetDateADT(DirectFunctionCall1(timestamptz_date, PG_GETARG_DATUM(1)));
-
-	if (PG_NARGS() > 2)
-	{
-		DateADT origin = DatumGetDateADT(DirectFunctionCall1(timestamptz_date, PG_GETARG_DATUM(2)));
-		result = DatumGetDateADT(DirectFunctionCall3(ts_time_bucket_ng_date,
-													 interval,
-													 DateADTGetDatum(ts_date),
-													 DateADTGetDatum(origin)));
-	}
-	else
-	{
-		result = DatumGetDateADT(
-			DirectFunctionCall2(ts_time_bucket_ng_date, interval, DateADTGetDatum(ts_date)));
-	}
-
-	return DirectFunctionCall1(date_timestamptz, DateADTGetDatum(result));
-}
-
-TS_FUNCTION_INFO_V1(ts_time_bucket_ng_date);
-TSDLLEXPORT Datum
-ts_time_bucket_ng_date(PG_FUNCTION_ARGS)
-{
-	Interval *interval = PG_GETARG_INTERVAL_P(0);
-	DateADT date = PG_GETARG_DATEADT(1);
-	DateADT origin_date = 0;
-	int origin_year = 2000, origin_month = 1, origin_day = 1;
-	int year, month, day;
-	int delta, bucket_number;
-
-	if ((interval->time != 0) || ((interval->month != 0) && (interval->day != 0)))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("interval must be either days and weeks, or months and years")));
-	}
-
-	if ((interval->month == 0) && (interval->day == 0))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("interval must be at least one day")));
-	}
-
-	if (PG_NARGS() > 2)
-	{
-		origin_date = PG_GETARG_DATUM(2);
-		if (DATE_NOT_FINITE(origin_date))
-			PG_RETURN_DATEADT(origin_date);
-
-		j2date(origin_date + POSTGRES_EPOCH_JDATE, &origin_year, &origin_month, &origin_day);
-	}
-
-	if ((origin_day != 1) && (interval->month != 0))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("origin must be the first day of the month"),
-				 errhint("When using timestamptz-version of the function, 'origin' is "
-						 "converted to provided 'timezone'.")));
-	}
-
-	if (DATE_NOT_FINITE(date))
-		PG_RETURN_DATEADT(date);
-
-	if (interval->month != 0)
-	{
-		/* Handle months and years */
-
-		j2date(date + POSTGRES_EPOCH_JDATE, &year, &month, &day);
-		int32 result;
-		int32 offset = (origin_year * 12) + origin_month - 1;
-		int32 timestamp = (year * 12) + month - 1;
-		TIME_BUCKET(interval->month, timestamp, offset, PG_INT32_MIN, PG_INT32_MAX, result);
-
-		year = result / 12;
-		month = (result % 12) + 1;
-		day = 1;
-
-		date = date2j(year, month, day) - POSTGRES_EPOCH_JDATE;
-	}
-	else
-	{
-		/* Handle days and weeks */
-
-		if (date < origin_date)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("origin must be before the given date")));
-		}
-
-		delta = date - origin_date;
-		bucket_number = delta / interval->day;
-		date = origin_date + bucket_number * interval->day;
-	}
-
-	PG_RETURN_DATEADT(date);
-}
-
-TS_FUNCTION_INFO_V1(ts_time_bucket_ng_timezone);
-TSDLLEXPORT Datum
-ts_time_bucket_ng_timezone(PG_FUNCTION_ARGS)
-{
-	Timestamp result;
-	Datum timestamp;
-	Datum interval = PG_GETARG_DATUM(0);
-	Datum timestamptz = PG_GETARG_DATUM(1);
-	Datum tzname = PG_GETARG_DATUM(2);
-
-	/*
-	 * Convert 'timestamptz' to TIMESTAMP at given 'tzname'.
-	 * The code is equal to 'timestamptz AT TIME ZONE tzname'.
-	 */
-	timestamp = DirectFunctionCall2(timestamptz_zone, tzname, timestamptz);
-
-	/* Then treat resulting timestamp as a regular one */
-	result =
-		DatumGetTimestamp(DirectFunctionCall2(ts_time_bucket_ng_timestamp, interval, timestamp));
-	if (TIMESTAMP_NOT_FINITE(result))
-		PG_RETURN_TIMESTAMP(result);
-
-	PG_RETURN_DATUM(DirectFunctionCall2(timestamp_zone, tzname, TimestampGetDatum(result)));
-}
-
-TS_FUNCTION_INFO_V1(ts_time_bucket_ng_timezone_origin);
-TSDLLEXPORT Datum
-ts_time_bucket_ng_timezone_origin(PG_FUNCTION_ARGS)
-{
-	Timestamp result;
-	Datum timestamp, origin;
-	Datum interval = PG_GETARG_DATUM(0);
-	Datum timestamptz = PG_GETARG_DATUM(1);
-	Datum origintz = PG_GETARG_DATUM(2);
-	Datum tzname = PG_GETARG_DATUM(3);
-
-	/*
-	 * Convert 'origin' to TIMESTAMP at given 'tzname'.
-	 * The code is equal to 'origin AT TIME ZONE tzname'.
-	 */
-	origin = DirectFunctionCall2(timestamptz_zone, tzname, origintz);
-
-	/* Same for 'timestamptz' */
-	timestamp = DirectFunctionCall2(timestamptz_zone, tzname, timestamptz);
-
-	/* Then treat resulting 'timestamp' and 'origin' as a regular ones */
-	result = DatumGetTimestamp(
-		DirectFunctionCall3(ts_time_bucket_ng_timestamp, interval, timestamp, origin));
-	if (TIMESTAMP_NOT_FINITE(result))
-		PG_RETURN_TIMESTAMP(result);
-
-	PG_RETURN_DATUM(DirectFunctionCall2(timestamp_zone, tzname, TimestampGetDatum(result)));
 }

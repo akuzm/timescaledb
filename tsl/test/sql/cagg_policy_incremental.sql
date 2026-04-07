@@ -2,7 +2,7 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+\c :TEST_DBNAME :ROLE_SUPERUSER
 
 CREATE OR REPLACE FUNCTION ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(timeout INT = -1, mock_start_time INT = 0) RETURNS VOID
 AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
@@ -100,6 +100,7 @@ WHERE
 SELECT ts_bgw_params_reset_time(0, true);
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 CREATE MATERIALIZED VIEW conditions_by_day_manual_refresh
 WITH (timescaledb.continuous, timescaledb.materialized_only=true) AS
@@ -145,6 +146,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '1 hour')::bigint * 
 
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 SELECT count(*) FROM conditions_by_day;
 SELECT count(*) FROM conditions_by_day_manual_refresh;
@@ -162,6 +164,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '2 hour')::bigint * 
 
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Should have no differences
 SELECT
@@ -199,6 +202,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '3 hour')::bigint * 
 -- Should process all four batches in the past
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 SELECT count(*) FROM conditions_by_day;
 SELECT count(*) FROM conditions_by_day_manual_refresh;
@@ -245,6 +249,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '4 hour')::bigint * 
 -- Should fallback to single batch processing because there's no data to be refreshed on the original hypertable
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Should return zero rows
 SELECT count(*) FROM conditions_by_day;
@@ -268,6 +273,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '5 hour')::bigint * 
 -- Should fallback to single batch processing because the refresh size is too small
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Should return 10 rows because the bucket width is `1 day` and buckets per batch is `10`
 SELECT count(*) FROM conditions_by_day;
@@ -284,6 +290,7 @@ SELECT ts_bgw_params_reset_time(extract(epoch from interval '6 hour')::bigint * 
 -- Should fallback to single batch processing because the refresh size is too small
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Should return 1 row
 SELECT count(*) FROM conditions_by_day;
@@ -305,7 +312,8 @@ SELECT
         'conditions_by_day_manual_refresh',
         start_offset => INTERVAL '15 days',
         end_offset => NULL,
-        schedule_interval => INTERVAL '1 h'
+        schedule_interval => INTERVAL '1 h',
+        buckets_per_batch => 0 -- 0 means no batching, so it will refresh all buckets in one go
     ) AS job_id_manual \gset
 
 TRUNCATE bgw_log, conditions_by_day, conditions_by_day_manual_refresh, conditions;
@@ -323,6 +331,7 @@ FROM
 SELECT ts_bgw_params_reset_time(0, true);
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Both continuous aggregates should have the same data
 SELECT count(*) FROM conditions_by_day;
@@ -362,6 +371,7 @@ TRUNCATE bgw_log, conditions_by_day;
 SELECT ts_bgw_params_reset_time(0, true);
 SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
 SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
 
 -- Both continuous aggregates should have the same data
 SELECT count(*) FROM conditions_by_day;
@@ -375,7 +385,133 @@ FROM
     EXCEPT
     (SELECT * FROM conditions_by_day ORDER BY 1, 2)) AS diff;
 
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
-REASSIGN OWNED BY test_cagg_refresh_policy_user TO :ROLE_CLUSTER_SUPERUSER;
+
+-- Tests with Variable sized bucket
+SELECT delete_job(:job_id);
+TRUNCATE conditions;
+
+INSERT INTO conditions
+SELECT
+    t, d, 10
+FROM
+    generate_series(
+        '2025-01-01 00:00:00+00',
+        '2025-10-08 00:00:00+00',
+        '1 hour'::interval) AS t,
+    generate_series(1,5) AS d;
+
+CREATE MATERIALIZED VIEW conditions_by_month
+WITH (timescaledb.continuous, timescaledb.materialized_only=true) AS
+SELECT
+    time_bucket('1 month', time),
+    device_id,
+    count(*),
+    min(temperature),
+    max(temperature),
+    avg(temperature),
+    sum(temperature)
+FROM
+    conditions
+GROUP BY
+    1, 2
+WITH NO DATA;
+
+SELECT
+    add_continuous_aggregate_policy(
+        'conditions_by_month',
+        start_offset => INTERVAL '600 days',
+        end_offset => INTERVAL '7 days',
+        schedule_interval => INTERVAL '1 day',
+        refresh_newest_first => false
+    ) AS job_id \gset
+
+SELECT
+    config
+FROM
+    timescaledb_information.jobs
+WHERE
+    job_id = :'job_id';
+
+TRUNCATE bgw_log, conditions_by_day;
+
+SELECT ts_bgw_params_reset_time(0, true);
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
+SELECT * FROM sorted_bgw_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_materialization_ranges;
+
+SELECT delete_job(:job_id);
+------------------------------------------------------------------------------------------
+--Test that batched refresh with variable-length buckets doesn't leave remainders
+-------------------------------------------------------------------------------------------
+CREATE TABLE test_data (
+    time TIMESTAMPTZ NOT NULL,
+    value INT
+);
+
+SELECT public.create_hypertable(
+        relation => 'test_data',
+        time_column_name => 'time',
+        chunk_time_interval => interval '1 months'
+);
+-- Insert initial data
+INSERT INTO test_data
+SELECT time, 1
+FROM generate_series('2024-01-01'::timestamptz, '2024-12-31'::timestamptz, '1 day'::interval) time;
+
+-- Create continuous aggregate with monthly buckets and timezone (variable-length buckets)
+CREATE MATERIALIZED VIEW batch_test_cagg
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 month'::interval, time) AS bucket,
+    count(*) as count
+FROM test_data
+GROUP BY bucket
+WITH NO DATA;
+
+
+-- Add a policy to enable batched refresh (batch size is 30 days by default for monthly buckets)
+SELECT add_continuous_aggregate_policy('batch_test_cagg',
+    start_offset =>null,
+    end_offset => INTERVAL '1 month',
+    schedule_interval => INTERVAL '1 hour',
+    buckets_per_batch => 1
+
+) AS job_id \gset
+
+-- Run the policy job - this uses batched processing, 1 bucket per batch
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(0, true);
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
+-- Verify that invalidation log has no entries other than the left and right ends with -/+ infinity
+SELECT materialization_id,
+       _timescaledb_functions.to_timestamp(lowest_modified_value) as low,
+       _timescaledb_functions.to_timestamp(greatest_modified_value) as high
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id IN
+      (SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+       WHERE user_view_name = 'batch_test_cagg')
+  AND lowest_modified_value != -9223372036854775808 --  -infinity
+  AND greatest_modified_value != 9223372036854775807 -- +infinity
+ORDER BY low;
+
+--verify that there is no duplicate/overlapping refreshes.
+--Note that batch 1 and batch 12 contains 2 buckets instead of 1 bucket as set in the policy.
+--This is due to the fact that we currently cut a batch of 30 days for monthly cagg,
+--so first batch and batch containing February can have 2 buckets. After we have a cleaner solution to
+--cut an exact batch size for variable-length buckets, this should be fixed.
+
+SELECT * FROM sorted_bgw_log;
+
+--now run the refresh again, should not do anything
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(extract(epoch from interval '1 hour')::bigint * 1000000, true);
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
+SELECT * FROM sorted_bgw_log;
+
+--clean up
+DROP TABLE test_data CASCADE;
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+REASSIGN OWNED BY test_cagg_refresh_policy_user TO :ROLE_SUPERUSER;
 REVOKE ALL ON SCHEMA public FROM test_cagg_refresh_policy_user;
 DROP ROLE test_cagg_refresh_policy_user;

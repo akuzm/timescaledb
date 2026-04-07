@@ -66,23 +66,13 @@
 static void
 log_retention_boundary(int elevel, PolicyRetentionData *policy_data, const char *message)
 {
-	char *relname;
-	Datum boundary;
-	Oid outfuncid = InvalidOid;
-	bool isvarlena;
-
-	getTypeOutputInfo(policy_data->boundary_type, &outfuncid, &isvarlena);
-
-	relname = get_rel_name(policy_data->object_relid);
-	boundary = policy_data->boundary;
-
-	if (OidIsValid(outfuncid))
+	if (OidIsValid(policy_data->boundary_type))
 		elog(elevel,
 			 "%s \"%s\": dropping data %s %s",
 			 message,
-			 relname,
+			 get_rel_name(policy_data->object_relid),
 			 policy_data->use_creation_time ? "created before" : "older than",
-			 DatumGetCString(OidFunctionCall1(outfuncid, boundary)));
+			 ts_datum_to_string(policy_data->boundary, policy_data->boundary_type));
 }
 
 static void
@@ -168,7 +158,13 @@ get_window_boundary(const Dimension *dim, const Jsonb *config, int64 (*int_gette
 	else
 	{
 		Interval *lag = interval_getter(config);
-		return subtract_interval_from_now(lag, partitioning_type);
+		/*
+		 * For UUID (v7) partitioned hypertables, drop_chunks expects TIMESTAMPTZ
+		 * input, so we compute the boundary as TIMESTAMPTZ instead of UUID.
+		 */
+		if (IS_UUID_TYPE(partitioning_type))
+			partitioning_type = TIMESTAMPTZOID;
+		return ts_subtract_interval_from_now(lag, partitioning_type);
 	}
 }
 
@@ -176,8 +172,16 @@ static List *
 get_chunk_to_recompress(const Dimension *dim, const Jsonb *config)
 {
 	Oid partitioning_type = ts_dimension_get_partition_type(dim);
+	Oid boundary_type = partitioning_type;
 	StrategyNumber end_strategy = BTLessStrategyNumber;
 	int32 numchunks = policy_compression_get_maxchunks_per_job(config);
+
+	/*
+	 * For UUID-partitioned hypertables, the boundary is computed as TIMESTAMPTZ
+	 * by get_window_boundary, so we need to use TIMESTAMPTZOID for conversion.
+	 */
+	if (IS_UUID_TYPE(partitioning_type))
+		boundary_type = TIMESTAMPTZOID;
 
 	Datum boundary = get_window_boundary(dim,
 										 config,
@@ -189,7 +193,7 @@ get_chunk_to_recompress(const Dimension *dim, const Jsonb *config)
 													   -1,				/*start_value*/
 													   end_strategy,
 													   ts_time_value_to_internal(boundary,
-																				 partitioning_type),
+																				 boundary_type),
 													   false,
 													   true,
 													   numchunks);
@@ -317,7 +321,7 @@ policy_retention_read_and_validate_config(Jsonb *config, PolicyRetentionData *po
 	Cache *hcache;
 	const Dimension *open_dim;
 	Datum boundary;
-	Datum boundary_type;
+	Oid boundary_type;
 	ContinuousAgg *cagg;
 	Interval *(*interval_getter)(const Jsonb *);
 	interval_getter = policy_retention_get_drop_after_interval;
@@ -346,7 +350,16 @@ policy_retention_read_and_validate_config(Jsonb *config, PolicyRetentionData *po
 		use_creation_time = true;
 	}
 	else
+	{
 		boundary_type = ts_dimension_get_partition_type(open_dim);
+		/*
+		 * For UUID (v7) partitioned hypertables, drop_chunks expects TIMESTAMPTZ
+		 * input (the timestamp is extracted from the UUID internally). We need to
+		 * pass the boundary as TIMESTAMPTZ, not as UUID.
+		 */
+		if (IS_UUID_TYPE(boundary_type))
+			boundary_type = TIMESTAMPTZOID;
+	}
 
 	boundary =
 		get_window_boundary(open_dim, config, policy_retention_get_drop_after_int, interval_getter);
@@ -378,10 +391,12 @@ policy_refresh_cagg_execute(int32 job_id, Jsonb *config)
 {
 	PolicyContinuousAggData policy_data;
 
-	StringInfo str = makeStringInfo();
-	JsonbToCStringIndent(str, &config->root, VARSIZE(config));
+	StringInfoData str;
+	initStringInfo(&str);
+	JsonbToCStringIndent(&str, &config->root, VARSIZE(config));
 
 	policy_refresh_cagg_read_and_validate_config(config, &policy_data);
+	bool extend_last_bucket = !policy_refresh_cagg_check_if_last_policy(&policy_data);
 
 	bool enable_osm_reads_old = ts_guc_enable_osm_reads;
 
@@ -393,7 +408,7 @@ policy_refresh_cagg_execute(int32 job_id, Jsonb *config)
 						PGC_S_SESSION);
 	}
 
-	CaggRefreshContext context = { .callctx = CAGG_REFRESH_POLICY };
+	ContinuousAggRefreshContext context = { .callctx = CAGG_REFRESH_POLICY };
 
 	/* Try to split window range into a list of ranges */
 	List *refresh_window_list =
@@ -425,8 +440,10 @@ policy_refresh_cagg_execute(int32 job_id, Jsonb *config)
 										context,
 										refresh_window->start_isnull,
 										refresh_window->end_isnull,
-										false,
-										policy_data.process_hypertable_invalidations);
+										(context.callctx != CAGG_REFRESH_POLICY_BATCHED),
+										false, /* force */
+										policy_data.process_hypertable_invalidations,
+										extend_last_bucket);
 		if (processing_batch >= policy_data.max_batches_per_execution &&
 			processing_batch < context.number_of_batches &&
 			policy_data.max_batches_per_execution > 0)
@@ -671,7 +688,7 @@ policy_process_hyper_inval_execute(int32 job_id, Jsonb *config)
 	int32 hypertable_id = policy_data.hypertable->fd.id;
 
 	/* We serialized on the invalidation threshold, so we get and lock it. */
-	invalidation_threshold_get(hypertable_id, dimtype);
+	invalidation_threshold_get(hypertable_id);
 	invalidation_process_hypertable_log(hypertable_id, dimtype);
 	ts_cache_release(&policy_data.hcache);
 
@@ -719,8 +736,18 @@ job_execute(BgwJob *job)
 	Oid proc;
 	FuncExpr *funcexpr;
 	MemoryContext parent_ctx = CurrentMemoryContext;
-	StringInfo query;
+	StringInfoData query;
 	Portal portal = ActivePortal;
+
+	/* Check for work_mem setting in config and apply it */
+	if (job->fd.config)
+	{
+		char *work_mem_setting = ts_jsonb_get_str_field(job->fd.config, "work_mem");
+		if (work_mem_setting != NULL)
+		{
+			SetConfigOption("work_mem", work_mem_setting, PGC_USERSET, PGC_S_SESSION);
+		}
+	}
 
 	if (job->fd.config)
 		elog(DEBUG1,
@@ -794,12 +821,12 @@ job_execute(BgwJob *job)
 	 * any job, not just custom jobs. We just provide more detailed
 	 * information here that we are actually calling a specific custom
 	 * function. */
-	query = makeStringInfo();
-	appendStringInfo(query,
+	initStringInfo(&query);
+	appendStringInfo(&query,
 					 "CALL %s.%s()",
 					 quote_identifier(NameStr(job->fd.proc_schema)),
 					 quote_identifier(NameStr(job->fd.proc_name)));
-	pgstat_report_activity(STATE_RUNNING, query->data);
+	pgstat_report_activity(STATE_RUNNING, query.data);
 
 	switch (prokind)
 	{

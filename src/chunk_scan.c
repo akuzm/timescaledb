@@ -70,14 +70,8 @@ ts_chunk_scan_by_chunk_ids(const Hyperspace *hs, const List *chunk_ids, unsigned
 			continue;
 		}
 		bool isnull;
-		Datum datum = slot_getattr(ti->slot, Anum_chunk_dropped, &isnull);
-		const bool is_dropped = isnull ? false : DatumGetBool(datum);
-		if (is_dropped)
-		{
-			continue;
-		}
 
-		/* We found a chunk that is not dropped. First, try to lock it. */
+		/* We found a chunk. First, try to lock it. */
 		Name schema_name = DatumGetName(slot_getattr(ti->slot, Anum_chunk_schema_name, &isnull));
 		Assert(!isnull);
 		Name table_name = DatumGetName(slot_getattr(ti->slot, Anum_chunk_table_name, &isnull));
@@ -131,10 +125,7 @@ ts_chunk_scan_by_chunk_ids(const Hyperspace *hs, const List *chunk_ids, unsigned
 	for (int i = 0; i < locked_chunk_count; i++)
 	{
 		Chunk *chunk = locked_chunks[i];
-
-		ts_get_rel_info(chunk->table_id, &chunk->amoid, &chunk->relkind);
-
-		Assert(OidIsValid(chunk->amoid) || chunk->fd.osm_chunk);
+		chunk->relkind = get_rel_relkind(chunk->table_id);
 	}
 
 	/*
@@ -185,9 +176,7 @@ ts_chunk_scan_by_chunk_ids(const Hyperspace *hs, const List *chunk_ids, unsigned
 			 */
 			const int slice_id = constraint->fd.dimension_slice_id;
 			DimensionSlice *slice_ptr =
-				ts_dimension_slice_scan_iterator_get_by_id(&slice_iterator,
-														   slice_id,
-														   /* tuplock = */ NULL);
+				ts_dimension_slice_scan_iterator_get_by_id(&slice_iterator, slice_id);
 			if (slice_ptr == NULL)
 			{
 				elog(ERROR, "dimension slice %d is not found", slice_id);

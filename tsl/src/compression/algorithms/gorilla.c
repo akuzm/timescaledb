@@ -16,12 +16,14 @@
 
 #include "gorilla.h"
 
-#include "adts/bit_array.h"
 #include "compression/arrow_c_data_interface.h"
 #include "compression/compression.h"
 #include "float_utils.h"
+#include "guc.h"
 #include "simple8b_rle.h"
 #include "simple8b_rle_bitmap.h"
+
+#include "adts/bit_array.h"
 
 /*
  * Gorilla compressed data is stored as
@@ -426,6 +428,7 @@ compressed_gorilla_data_serialize(CompressedGorillaData *input)
 	data = palloc0(compressed_size);
 	compressed = (GorillaCompressed *) data;
 	SET_VARSIZE(&compressed->vl_len_, compressed_size);
+	Assert(compressed_size % 4 == 0);
 
 	compressed->last_value = input->header->last_value;
 	compressed->compression_algorithm = COMPRESSION_ALGORITHM_GORILLA;
@@ -637,9 +640,8 @@ gorilla_decompression_iterator_try_next_forward_internal(GorillaDecompressionIte
 			};
 		}
 
-		if (null.val != 0)
+		if ((null.val & 1) != 0)
 		{
-			CheckCompressedData(null.val == 1);
 			return (DecompressResultInternal){
 				.is_null = true,
 			};
@@ -782,9 +784,8 @@ gorilla_decompression_iterator_try_next_reverse_internal(GorillaDecompressionIte
 				.is_done = true,
 			};
 
-		if (null.val != 0)
+		if ((null.val & 1) != 0)
 		{
-			Assert(null.val == 1);
 			return (DecompressResultInternal){
 				.is_null = true,
 			};

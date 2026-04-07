@@ -7,6 +7,7 @@
 #include <postgres.h>
 #include <nodes/execnodes.h>
 #include <nodes/extensible.h>
+#include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
 #include <optimizer/clauses.h>
 #include <optimizer/optimizer.h>
@@ -20,6 +21,8 @@
 
 #include "gapfill.h"
 #include "gapfill_internal.h"
+#include "import/list.h"
+#include "utils.h"
 
 static CustomScanMethods gapfill_plan_methods = {
 	.CustomName = "GapFill",
@@ -37,6 +40,70 @@ typedef struct gapfill_walker_context
 	} call;
 	int count;
 } gapfill_walker_context;
+
+/*
+ * Replace Aggref with const NULL
+ */
+static Node *
+gapfill_aggref_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Aggref))
+		return (Node *)
+			makeConst(((Aggref *) node)->aggtype, -1, InvalidOid, -2, UnassignedDatum, true, false);
+
+	return expression_tree_mutator(node, gapfill_aggref_mutator, context);
+}
+
+/*
+ * Check if an expression is NOT a runtime constant.
+ *
+ */
+static bool
+contains_nonconstant_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		return true;
+	}
+
+	if (IsA(node, SubLink))
+	{
+		return true;
+	}
+
+	if (IsA(node, PlaceHolderVar))
+	{
+		return true;
+	}
+
+	if (IsA(node, Param))
+	{
+		Param *param = castNode(Param, node);
+		/* PARAM_EXTERN are external query parameters, constant for query duration */
+		return param->paramkind != PARAM_EXTERN;
+	}
+
+	if (check_functions_in_node(node,
+								contains_volatile_functions_checker,
+								/* context = */ NULL))
+	{
+		return true;
+	}
+
+	return expression_tree_walker(node, contains_nonconstant_walker, context);
+}
+
+static bool
+contains_nonconstant_expr(Node *node)
+{
+	return contains_nonconstant_walker(node, NULL);
+}
 
 /*
  * FuncExpr is time_bucket_gapfill function call
@@ -142,7 +209,7 @@ gapfill_correct_order(PlannerInfo *root, Path *subpath, FuncExpr *func)
 		EquivalenceMember *em = linitial(pk->pk_eclass->ec_members);
 
 		/* time_bucket_gapfill is last element */
-		if (BTLessStrategyNumber == pk->pk_strategy && IsA(em->em_expr, FuncExpr) &&
+		if (pk->pk_cmptype == COMPARE_LT && IsA(em->em_expr, FuncExpr) &&
 			((FuncExpr *) em->em_expr)->funcid == func->funcid)
 		{
 			int i;
@@ -181,11 +248,38 @@ gapfill_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *
 	cscan->scan.plan.targetlist = tlist;
 	cscan->custom_plans = custom_plans;
 	cscan->custom_scan_tlist = tlist;
+
+	/* When we have original target entries like (agg + group_expr)
+	 * we will replace agg with NULL and put resulting expression into exec-fixed "targetlist",
+	 * but we need to fix "group_expr" to refer to exec targetlist group column.
+	 * Only then we can safely put (NULL + group_column_exec) entry into exec-fixed targetlist.
+	 */
+	List *mutated_agg_exprs = NIL;
+	if (contain_agg_clause((Node *) tlist))
+	{
+		TargetEntry *tle;
+		ListCell *lc;
+		foreach (lc, tlist)
+		{
+			tle = lfirst(lc);
+			if (contain_agg_clause((Node *) tle))
+			{
+				Node *entry = copyObject((Node *) tle);
+				entry = gapfill_aggref_mutator(entry, NULL);
+				mutated_agg_exprs = lappend(mutated_agg_exprs, entry);
+			}
+		}
+	}
+	cscan->custom_exprs = list_make1(mutated_agg_exprs);
+
 	cscan->flags = path->flags;
 	cscan->methods = &gapfill_plan_methods;
 
-	cscan->custom_private =
-		list_make4(gfpath->func, root->parse->groupClause, root->parse->jointree, args);
+	cscan->custom_private = ts_new_list(T_List, GFP_Count);
+	lfirst(list_nth_cell(cscan->custom_private, GFP_GapfillFunc)) = gfpath->func;
+	lfirst(list_nth_cell(cscan->custom_private, GFP_GroupClause)) = root->parse->groupClause;
+	lfirst(list_nth_cell(cscan->custom_private, GFP_JoinTree)) = root->parse->jointree;
+	lfirst(list_nth_cell(cscan->custom_private, GFP_Args)) = args;
 
 	return &cscan->scan.plan;
 }
@@ -376,7 +470,7 @@ gapfill_path_create(PlannerInfo *root, Path *subpath, FuncExpr *func)
 			if (!pk_func && IsA(em->em_expr, FuncExpr) &&
 				((FuncExpr *) em->em_expr)->funcid == func->funcid)
 			{
-				if (BTLessStrategyNumber == pk->pk_strategy)
+				if (pk->pk_cmptype == COMPARE_LT)
 					pk_func = pk;
 				else
 					pk_func = make_canonical_pathkey(root,
@@ -438,27 +532,45 @@ plan_add_gapfill(PlannerInfo *root, RelOptInfo *group_rel)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("multiple time_bucket_gapfill calls not allowed")));
 
-	if (context.count == 1)
+	/*
+	 * Check for non-constant timezone parameter. Gapfill needs a consistent
+	 * timezone to generate gap timestamps, so column references and
+	 * subqueries are not supported.
+	 *
+	 * The timezone variant has 5 arguments after PostgreSQL fills in
+	 * defaults: (bucket_width, ts, timezone, start, finish). The
+	 * non-timezone variant has 4: (bucket_width, ts, start, finish).
+	 */
+	FuncExpr *func = context.call.func;
+	int nargs = list_length(func->args);
+	if (nargs == 5)
 	{
-		List *copy = group_rel->pathlist;
-		group_rel->pathlist = NIL;
-		group_rel->cheapest_total_path = NULL;
-		group_rel->cheapest_startup_path = NULL;
-		group_rel->cheapest_unique_path = NULL;
-
-		/* Parameterized paths pathlist is currently deleted instead of being processed */
-		list_free(group_rel->ppilist);
-		group_rel->ppilist = NULL;
-
-		list_free(group_rel->cheapest_parameterized_paths);
-		group_rel->cheapest_parameterized_paths = NULL;
-
-		foreach (lc, copy)
-		{
-			add_path(group_rel, gapfill_path_create(root, lfirst(lc), context.call.func));
-		}
-		list_free(copy);
+		Expr *tz_arg = lthird(func->args);
+		if (contains_nonconstant_expr((Node *) tz_arg))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("time_bucket_gapfill does not support non-constant timezone"),
+					 errhint("Use a constant timezone value.")));
 	}
+	List *copy = group_rel->pathlist;
+	group_rel->pathlist = NIL;
+	group_rel->cheapest_total_path = NULL;
+	group_rel->cheapest_startup_path = NULL;
+	group_rel->cheapest_unique_path = NULL;
+
+	/*
+	 * cheapest_parameterized_paths will be rebuilt by set_cheapest()
+	 * after this hook returns. We must not delete ppilist as it contains
+	 * ParamPathInfo entries needed for parameterized paths (e.g. LATERAL).
+	 */
+	list_free(group_rel->cheapest_parameterized_paths);
+	group_rel->cheapest_parameterized_paths = NULL;
+
+	foreach (lc, copy)
+	{
+		add_path(group_rel, gapfill_path_create(root, lfirst(lc), context.call.func));
+	}
+	list_free(copy);
 }
 
 static inline bool

@@ -45,10 +45,9 @@ typedef struct FinalizeQueryInfo
 	List *final_seltlist;	/* select target list for finalize query */
 	Node *final_havingqual; /* having qual for finalize query */
 	Query *final_userquery; /* user query used to compute the finalize_query */
-	bool finalized;			/* finalized form? */
 } FinalizeQueryInfo;
 
-typedef struct MatTableColumnInfo
+typedef struct MaterializationHypertableColumnInfo
 {
 	List *matcollist;		 /* column defns for materialization tbl*/
 	List *partial_seltlist;	 /* tlist entries for populating the materialization table columns */
@@ -59,9 +58,9 @@ typedef struct MatTableColumnInfo
 									matpartcolname */
 	int matpartcolno;			 /*index of partitioning column in matcollist */
 	char *matpartcolname;		 /*name of the partition column */
-} MatTableColumnInfo;
+} MaterializationHypertableColumnInfo;
 
-typedef struct CAggTimebucketInfo
+typedef struct ContinuousAggTimeBucketInfo
 {
 	int32 htid;						/* hypertable id */
 	int32 parent_mat_hypertable_id; /* parent materialization hypertable id */
@@ -73,23 +72,23 @@ typedef struct CAggTimebucketInfo
 	int64 htpartcol_interval_len;	/* interval length setting for primary partitioning column */
 
 	/* General bucket information */
-	ContinuousAggsBucketFunction *bf;
-} CAggTimebucketInfo;
+	ContinuousAggBucketFunction *bf;
+} ContinuousAggTimeBucketInfo;
 
-typedef enum CaggRefreshCallContext
+typedef enum ContinuousAggRefreshCallContext
 {
 	CAGG_REFRESH_CREATION,
 	CAGG_REFRESH_WINDOW,
 	CAGG_REFRESH_POLICY,
 	CAGG_REFRESH_POLICY_BATCHED
-} CaggRefreshCallContext;
+} ContinuousAggRefreshCallContext;
 
-typedef struct CaggRefreshContext
+typedef struct ContinuousAggRefreshContext
 {
-	CaggRefreshCallContext callctx;
+	ContinuousAggRefreshCallContext callctx;
 	int32 processing_batch;
 	int32 number_of_batches;
-} CaggRefreshContext;
+} ContinuousAggRefreshContext;
 
 #define IS_TIME_BUCKET_INFO_TIME_BASED(bucket_function)                                            \
 	(bucket_function->bucket_width_type == INTERVALOID)
@@ -109,14 +108,13 @@ typedef struct CaggRefreshContext
 		(selquery)->rtable = NULL;                                                                 \
 	} while (0);
 
-extern CAggTimebucketInfo cagg_validate_query(const Query *query, const bool finalized,
-											  const char *cagg_schema, const char *cagg_name,
-											  const bool is_cagg_create);
+extern ContinuousAggTimeBucketInfo cagg_validate_query(const Query *query, const char *cagg_schema,
+													   const char *cagg_name,
+													   const bool is_cagg_create);
 extern Query *destroy_union_query(Query *q);
 extern void RemoveRangeTableEntries(Query *query);
-extern Query *build_union_query(CAggTimebucketInfo *tbinfo, int matpartcolno, Query *q1, Query *q2,
-								int materialize_htid);
-extern void mattablecolumninfo_init(MatTableColumnInfo *matcolinfo, List *grouplist);
+extern Query *build_union_query(ContinuousAggTimeBucketInfo *tbinfo, int matpartcolno, Query *q1,
+								Query *q2, int materialize_htid);
 extern bool function_allowed_in_cagg_definition(Oid funcid);
 extern Oid get_watermark_function_oid(void);
 extern Oid cagg_get_boundary_converter_funcoid(Oid typoid);
@@ -149,4 +147,29 @@ cagg_get_time_min(const ContinuousAgg *cagg)
 	return ts_time_get_min(cagg->partition_type);
 }
 
-ContinuousAggsBucketFunction *ts_cagg_get_bucket_function_info(Oid view_oid);
+ContinuousAggBucketFunction *ts_cagg_get_bucket_function_info(Oid view_oid);
+
+/* Methods checking validity of Caggs and Cagg rewrites */
+extern bool cagg_query_supported(const Query *query, StringInfo hint, StringInfo detail,
+								 const bool for_rewrites);
+extern bool cagg_query_rtes_supported(RangeTblEntry *rte, RangeTblEntry **ht_rte, StringInfo detail,
+									  const bool for_rewrites);
+extern const Dimension *cagg_hypertable_dim_supported(RangeTblEntry *ht_rte, Hypertable *ht,
+													  StringInfo msg, StringInfo detail,
+													  StringInfo hint, const bool for_rewrites);
+extern bool function_allowed_in_cagg_definition(Oid funcid);
+extern void caggtimebucketinfo_init(ContinuousAggTimeBucketInfo *src, int32 hypertable_id,
+									Oid hypertable_oid, AttrNumber hypertable_partition_colno,
+									Oid hypertable_partition_coltype,
+									int64 hypertable_partition_col_interval,
+									int32 parent_mat_hypertable_id);
+extern ContinuousAggBucketFunction *cagg_get_bucket_function_info(Oid view_oid);
+extern bool time_bucket_info_has_fixed_width(const ContinuousAggBucketFunction *bf);
+
+extern bool cagg_timebucket_equal(ContinuousAggBucketFunction *bf1,
+								  ContinuousAggBucketFunction *bf2);
+
+extern bool caggtimebucket_validate_common(ContinuousAggBucketFunction *bf, List *groupClause,
+										   List *targetList, List *rtable, int ht_partcolno,
+										   StringInfo msg, bool is_cagg_create,
+										   const bool for_rewrites);

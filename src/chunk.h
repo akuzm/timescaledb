@@ -33,7 +33,6 @@ typedef enum ChunkCompressionStatus
 	CHUNK_COMPRESS_NONE = 0,
 	CHUNK_COMPRESS_UNORDERED,
 	CHUNK_COMPRESS_ORDERED,
-	CHUNK_DROPPED
 } ChunkCompressionStatus;
 
 typedef enum ChunkOperation
@@ -66,7 +65,6 @@ typedef struct Chunk
 	char relkind;
 	Oid table_id;
 	Oid hypertable_relid;
-	Oid amoid; /* Table access method used by chunk */
 
 	/*
 	 * The hypercube defines the chunks position in the N-dimensional space.
@@ -102,7 +100,7 @@ typedef struct ChunkScanCtx
 	const Hypertable *ht;
 	const Point *point;
 	unsigned int num_complete_chunks;
-	int num_processed;
+	uint64 num_processed;
 	bool early_abort;
 	LOCKMODE lockmode;
 
@@ -156,23 +154,32 @@ extern ChunkVec *ts_chunk_vec_add_from_tuple(ChunkVec **chunks, TupleInfo *ti);
 #define DEFAULT_CHUNK_VEC_SIZE 10
 
 extern void ts_chunk_formdata_fill(FormData_chunk *fd, const TupleInfo *ti);
-extern Chunk *ts_chunk_find_for_point(const Hypertable *ht, const Point *p);
+extern int32 ts_chunk_point_find_chunk_id(const Hypertable *ht, const Point *p,
+										  const ScanTupLock *slice_lock);
+extern Chunk *ts_chunk_find_for_point(const Hypertable *ht, const Point *p, LOCKMODE lockmode);
 extern Chunk *ts_chunk_create_for_point(const Hypertable *ht, const Point *p, const char *schema,
-										const char *prefix);
+										const char *prefix, LOCKMODE chunk_lockmode);
 List *ts_chunk_id_find_in_subspace(Hypertable *ht, List *dimension_vecs);
 
 extern TSDLLEXPORT Chunk *ts_chunk_create_base(int32 id, int16 num_constraints, const char relkind);
 extern TSDLLEXPORT ChunkStub *ts_chunk_stub_create(int32 id, int16 num_constraints);
 extern TSDLLEXPORT Chunk *ts_chunk_copy(const Chunk *chunk);
-extern TSDLLEXPORT Chunk *ts_chunk_get_by_name_with_memory_context(const char *schema_name,
-																   const char *table_name,
-																   MemoryContext mctx,
-																   bool fail_if_not_found);
+extern TSDLLEXPORT Chunk *
+ts_chunk_get_by_name_with_memory_context(const char *schema_name, const char *table_name,
+										 LOCKMODE chunk_lockmode, const ScanTupLock *slice_lock,
+										 MemoryContext mctx, bool fail_if_not_found);
 extern TSDLLEXPORT void ts_chunk_insert_lock(const Chunk *chunk, LOCKMODE lock);
 
 extern TSDLLEXPORT Oid ts_chunk_create_table(const Chunk *chunk, const Hypertable *ht,
 											 const char *tablespacename);
+extern TSDLLEXPORT Chunk *ts_chunk_get_by_id_with_slice_lock(int32 id, LOCKMODE chunk_lockmode,
+															 const ScanTupLock *slice_lock,
+															 bool fail_if_not_found);
+
 extern TSDLLEXPORT Chunk *ts_chunk_get_by_id(int32 id, bool fail_if_not_found);
+extern TSDLLEXPORT Chunk *ts_chunk_get_by_relid_locked(Oid relid, LOCKMODE lockmode,
+													   const ScanTupLock *slice_lock,
+													   bool fail_if_not_found);
 extern TSDLLEXPORT Chunk *ts_chunk_get_by_relid(Oid relid, bool fail_if_not_found);
 extern TSDLLEXPORT void ts_chunk_free(Chunk *chunk);
 extern bool ts_chunk_exists(const char *schema_name, const char *table_name);
@@ -191,8 +198,7 @@ extern int ts_chunk_delete_by_hypertable_id(int32 hypertable_id);
 extern TSDLLEXPORT int ts_chunk_delete_by_name(const char *schema, const char *table,
 											   DropBehavior behavior);
 extern int ts_chunk_delete_by_relid_and_relname(Oid relid, const char *schemaname,
-												const char *tablename, DropBehavior behavior,
-												bool preserve_chunk_catalog_row);
+												const char *tablename, DropBehavior behavior);
 extern bool ts_chunk_set_name(Chunk *chunk, const char *newname);
 extern bool ts_chunk_set_schema(Chunk *chunk, const char *newschema);
 extern TSDLLEXPORT List *ts_chunk_get_window(int32 dimension_id, int64 point, int count,
@@ -207,8 +213,6 @@ extern TSDLLEXPORT bool ts_chunk_is_frozen(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_set_compressed_chunk(Chunk *chunk, int32 compressed_chunk_id);
 extern TSDLLEXPORT bool ts_chunk_clear_compressed_chunk(Chunk *chunk);
 extern TSDLLEXPORT void ts_chunk_drop(const Chunk *chunk, DropBehavior behavior, int32 log_level);
-extern TSDLLEXPORT void ts_chunk_drop_preserve_catalog_row(const Chunk *chunk,
-														   DropBehavior behavior, int32 log_level);
 extern TSDLLEXPORT List *ts_chunk_do_drop_chunks(Hypertable *ht, int64 older_than, int64 newer_than,
 												 int32 log_level, Oid time_type, Oid arg_type,
 												 bool older_newer);
@@ -219,6 +223,7 @@ extern TSDLLEXPORT Chunk *ts_chunk_get_compressed_chunk_parent(const Chunk *chun
 extern TSDLLEXPORT bool ts_chunk_is_unordered(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_is_partial(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_is_compressed(const Chunk *chunk);
+extern TSDLLEXPORT bool ts_chunk_needs_compression(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_needs_recompression(const Chunk *chunk);
 extern TSDLLEXPORT bool ts_chunk_validate_chunk_status_for_operation(const Chunk *chunk,
 																	 ChunkOperation cmd,
@@ -227,6 +232,7 @@ extern TSDLLEXPORT bool ts_chunk_validate_chunk_status_for_operation(const Chunk
 extern TSDLLEXPORT bool ts_chunk_contains_compressed_data(const Chunk *chunk);
 extern TSDLLEXPORT ChunkCompressionStatus ts_chunk_get_compression_status(int32 chunk_id);
 extern TSDLLEXPORT Datum ts_chunk_id_from_relid(PG_FUNCTION_ARGS);
+extern TSDLLEXPORT Datum ts_chunk_status_text(PG_FUNCTION_ARGS);
 extern TSDLLEXPORT List *ts_chunk_get_chunk_ids_by_hypertable_id(int32 hypertable_id);
 extern TSDLLEXPORT List *ts_chunk_get_by_hypertable_id(int32 hypertable_id);
 
@@ -234,18 +240,24 @@ extern TSDLLEXPORT int64 ts_chunk_primary_dimension_start(const Chunk *chunk);
 
 extern TSDLLEXPORT int64 ts_chunk_primary_dimension_end(const Chunk *chunk);
 extern Chunk *ts_chunk_build_from_tuple_and_stub(Chunk **chunkptr, TupleInfo *ti,
-												 const ChunkStub *stub);
+												 const ChunkStub *stub,
+												 const ScanTupLock *slice_lock);
 
+extern TM_Result ts_chunk_lock_for_creating_compressed_chunk(int32 chunk_id,
+															 int32 *compressed_chunk_id);
 extern ScanIterator ts_chunk_scan_iterator_create(MemoryContext result_mcxt);
 extern void ts_chunk_scan_iterator_set_chunk_id(ScanIterator *it, int32 chunk_id);
 extern bool ts_chunk_lock_if_exists(Oid chunk_oid, LOCKMODE chunk_lockmode);
 int ts_chunk_get_osm_chunk_id(int hypertable_id);
 extern TSDLLEXPORT void ts_chunk_merge_on_dimension(const Hypertable *ht, Chunk *chunk,
 													const Chunk *merge_chunk, int32 dimension_id);
+extern TSDLLEXPORT void ts_chunk_detach_by_relid(Oid relid);
 
-#define chunk_get_by_name(schema_name, table_name, fail_if_not_found)                              \
+#define chunk_get_by_name(schema_name, table_name, chunk_lockmode, slice_lock, fail_if_not_found)  \
 	ts_chunk_get_by_name_with_memory_context(schema_name,                                          \
 											 table_name,                                           \
+											 chunk_lockmode,                                       \
+											 slice_lock,                                           \
 											 CurrentMemoryContext,                                 \
 											 fail_if_not_found)
 
@@ -259,14 +271,11 @@ extern TSDLLEXPORT void ts_chunk_merge_on_dimension(const Hypertable *ht, Chunk 
 	do                                                                                             \
 	{                                                                                              \
 		Assert(chunk);                                                                             \
-		Assert(!(chunk)->fd.dropped);                                                              \
 		Assert((chunk)->fd.id > 0);                                                                \
 		Assert((chunk)->fd.hypertable_id > 0);                                                     \
 		Assert(OidIsValid((chunk)->table_id));                                                     \
 		Assert(OidIsValid((chunk)->hypertable_relid));                                             \
-		Assert((chunk)->constraints);                                                              \
 		Assert((chunk)->cube);                                                                     \
-		Assert((chunk)->cube->num_slices == (chunk)->constraints->num_dimension_constraints);      \
 		Assert((chunk)->relkind == RELKIND_RELATION || (chunk)->relkind == RELKIND_FOREIGN_TABLE); \
 	} while (0)
 

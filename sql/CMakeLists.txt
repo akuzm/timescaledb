@@ -46,54 +46,26 @@ set(MOD_FILES
     updates/2.19.3--2.20.0.sql
     updates/2.20.0--2.20.1.sql
     updates/2.20.1--2.20.2.sql
-    updates/2.20.2--2.20.3.sql)
+    updates/2.20.2--2.20.3.sql
+    updates/2.20.3--2.21.0.sql
+    updates/2.21.0--2.21.1.sql
+    updates/2.21.1--2.21.2.sql
+    updates/2.21.2--2.21.3.sql
+    updates/2.21.3--2.21.4.sql
+    updates/2.21.4--2.22.0.sql
+    updates/2.22.0--2.22.1.sql
+    updates/2.22.1--2.23.0.sql
+    updates/2.23.0--2.23.1.sql
+    updates/2.23.1--2.24.0.sql
+    updates/2.24.0--2.25.0.sql
+    updates/2.25.0--2.25.1.sql
+    updates/2.25.1--2.25.2.sql
+    updates/2.25.2--2.26.0.sql
+    updates/2.26.0--2.26.1.sql)
 
 # The downgrade file to generate a downgrade script for the current version, as
 # specified in version.config
 set(CURRENT_REV_FILE reverse-dev.sql)
-
-# Files for generating old downgrade scripts. This should only include files for
-# downgrade from one version to its previous version since we do not support
-# skipping versions when downgrading.
-set(OLD_REV_FILES
-    2.9.1--2.9.0.sql
-    2.9.2--2.9.1.sql
-    2.9.3--2.9.2.sql
-    2.10.0--2.9.3.sql
-    2.10.1--2.10.0.sql
-    2.10.2--2.10.1.sql
-    2.10.3--2.10.2.sql
-    2.11.0--2.10.3.sql
-    2.11.1--2.11.0.sql
-    2.11.2--2.11.1.sql
-    2.12.0--2.11.2.sql
-    2.12.1--2.12.0.sql
-    2.12.2--2.12.1.sql
-    2.13.0--2.12.2.sql
-    2.13.1--2.13.0.sql
-    2.14.0--2.13.1.sql
-    2.14.1--2.14.0.sql
-    2.14.2--2.14.1.sql
-    2.15.0--2.14.2.sql
-    2.15.1--2.15.0.sql
-    2.15.2--2.15.1.sql
-    2.15.3--2.15.2.sql
-    2.16.0--2.15.3.sql
-    2.16.1--2.16.0.sql
-    2.17.0--2.16.1.sql
-    2.17.1--2.17.0.sql
-    2.17.2--2.17.1.sql
-    2.18.0--2.17.2.sql
-    2.18.1--2.18.0.sql
-    2.18.2--2.18.1.sql
-    2.19.0--2.18.2.sql
-    2.19.1--2.19.0.sql
-    2.19.2--2.19.1.sql
-    2.19.3--2.19.2.sql
-    2.20.0--2.19.3.sql
-    2.20.1--2.20.0.sql
-    2.20.2--2.20.1.sql
-    2.20.3--2.20.2.sql)
 
 set(MODULE_PATHNAME "$libdir/timescaledb-${PROJECT_VERSION_MOD}")
 set(LOADER_PATHNAME "$libdir/timescaledb")
@@ -121,51 +93,16 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/updates
     FILES
     ${CURRENT_REV_FILE})
-  if(GENERATE_OLD_DOWNGRADE_SCRIPTS)
-    foreach(_downgrade_file ${OLD_REV_FILES})
-      if(${_downgrade_file} MATCHES
-         "([0-9]+\\.[0-9]+\\.*[0-9]*)--([0-9]+\\.[0-9]+\\.*[0-9]*).sql")
-        set(_source_version ${CMAKE_MATCH_1})
-        set(_target_version ${CMAKE_MATCH_2})
-        generate_downgrade_script(
-          SOURCE_VERSION
-          ${_source_version}
-          TARGET_VERSION
-          ${_target_version}
-          INPUT_DIRECTORY
-          ${CMAKE_CURRENT_SOURCE_DIR}/updates
-          FILES
-          ${_downgrade_file})
-      else()
-        message(FATAL_ERROR "${_downgrade_file} is not a downgrade file")
-      endif()
-    endforeach()
-  endif()
 endif()
 
-# Function to replace @MODULE_PATHNAME@ in source files, producing an output
-# file in the build dir
+# Function to replace @VARIABLE@ in source files, producing output files in the
+# build dir. When SUFFIX is provided, it is appended to each output filename
+# (used for version-specific copies like version_check.sql).
 function(version_files SRC_FILE_LIST OUTPUT_FILE_LIST)
+  cmake_parse_arguments(_vf "" "SUFFIX" "" ${ARGN})
   set(result "")
   foreach(unversioned_file ${SRC_FILE_LIST})
-    set(versioned_file ${unversioned_file})
-    list(APPEND result ${CMAKE_CURRENT_BINARY_DIR}/${versioned_file})
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${unversioned_file})
-      configure_file(${unversioned_file} ${versioned_file} @ONLY)
-    endif()
-  endforeach(unversioned_file)
-  set(${OUTPUT_FILE_LIST}
-      "${result}"
-      PARENT_SCOPE)
-endfunction()
-
-# Function to replace @VARIABLE@ in source files, producing an output file in
-# the build dir.  Unlike the previous function we need to build a versioned file
-# for every version we create an update script for.
-function(version_check_file SRC_FILE_LIST OUTPUT_FILE_LIST)
-  set(result "")
-  foreach(unversioned_file ${SRC_FILE_LIST})
-    set(versioned_file ${unversioned_file}-${START_VERSION})
+    set(versioned_file ${unversioned_file}${_vf_SUFFIX})
     list(APPEND result ${CMAKE_CURRENT_BINARY_DIR}/${versioned_file})
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${unversioned_file})
       configure_file(${unversioned_file} ${versioned_file} @ONLY)
@@ -188,54 +125,34 @@ version_files("${MOD_FILES}" MOD_FILES_VERSIONED)
 version_files("updates/latest-dev.sql" LASTEST_MOD_VERSIONED)
 version_files("notice.sql" NOTICE_FILE)
 
-# Function to concatenate all files in SRC_FILE_LIST into file OUTPUT_FILE
+# Function to concatenate all files in SRC_FILE_LIST into file OUTPUT_FILE. When
+# STRIP_REPLACE is set, strips `OR REPLACE` from the output to prevent privilege
+# escalation attacks in CREATE scripts.
 function(cat_files SRC_FILE_LIST OUTPUT_FILE)
   if(WIN32)
     set("SRC_ARG" "-DSRC_FILE_LIST=${SRC_FILE_LIST}")
   else()
     set("SRC_ARG" "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'")
   endif()
+  set(_extra_args)
+  if(STRIP_REPLACE)
+    list(APPEND _extra_args "-DSTRIP_REPLACE=ON")
+  endif()
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}
     DEPENDS ${SRC_FILE_LIST}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMAND ${CMAKE_COMMAND} "${SRC_ARG}" "-DOUTPUT_FILE=${OUTPUT_FILE}" -P
-            cat.cmake
+    COMMAND ${CMAKE_COMMAND} "${SRC_ARG}" "-DOUTPUT_FILE=${OUTPUT_FILE}"
+            ${_extra_args} -P cat.cmake
     COMMENT "Generating ${OUTPUT_FILE}")
 endfunction()
 
-# Concatenate all files in SRC_FILE_LIST into file OUTPUT_FILE Additionally
-# strips out `OR REPLACE` from the generated file as this would allow a
-# privilege escalation attack when present in the CREATE script
-function(cat_create_files SRC_FILE_LIST OUTPUT_FILE)
-  if(WIN32)
-    set("SRC_ARG" "-DSRC_FILE_LIST=${SRC_FILE_LIST}")
-  else()
-    set("SRC_ARG" "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'")
-  endif()
-  if(WIN32)
-    add_custom_command(
-      OUTPUT ${OUTPUT_FILE}
-      DEPENDS ${SRC_FILE_LIST}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-      COMMAND ${CMAKE_COMMAND} "${SRC_ARG}" "-DOUTPUT_FILE=${OUTPUT_FILE}"
-              "-DSTRIP_REPLACE=ON" -P cat.cmake
-      COMMENT "Generating ${OUTPUT_FILE}")
-  else()
-    add_custom_command(
-      OUTPUT ${OUTPUT_FILE}
-      DEPENDS ${SRC_FILE_LIST}
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-      COMMAND ${CMAKE_COMMAND} "'-DSRC_FILE_LIST=${SRC_FILE_LIST}'"
-              "-DOUTPUT_FILE=${OUTPUT_FILE}" "-DSTRIP_REPLACE=ON" -P cat.cmake
-      COMMENT "Generating ${OUTPUT_FILE}")
-  endif()
-endfunction()
-
 # Generate the extension file used with CREATE EXTENSION
-cat_create_files(
+set(STRIP_REPLACE ON)
+cat_files(
   "${PRE_INSTALL_SOURCE_FILES_VERSIONED};${SOURCE_FILES_VERSIONED};${NOTICE_FILE}"
   ${CMAKE_CURRENT_BINARY_DIR}/${INSTALL_FILE})
+set(STRIP_REPLACE OFF)
 add_custom_target(sqlfile ALL
                   DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${INSTALL_FILE})
 
@@ -266,6 +183,10 @@ set(UPDATE_SCRIPTS "")
 # path longer as we move back in history
 set(CURR_MOD_FILES "${LASTEST_MOD_VERSIONED}")
 
+# Generate the post-update file once (same for all update scripts)
+set(POST_FILES_PROCESSED ${POST_UPDATE_FILES_VERSIONED}.processed)
+cat_files("${POST_UPDATE_FILES_VERSIONED}" ${POST_FILES_PROCESSED})
+
 # Now loop through the modfiles and generate the update files
 foreach(transition_mod_file ${MOD_FILES_LIST})
 
@@ -276,18 +197,15 @@ foreach(transition_mod_file ${MOD_FILES_LIST})
   set(START_VERSION ${CMAKE_MATCH_1})
   set(END_VERSION ${CMAKE_MATCH_2})
   set(PRE_FILES ${PRE_UPDATE_FILES_VERSIONED})
-  set(POST_FILES_PROCESSED ${POST_UPDATE_FILES_VERSIONED}.processed)
-  cat_files(
-    "${SET_POST_UPDATE_STAGE};${POST_UPDATE_FILES_VERSIONED};${UNSET_UPDATE_STAGE}"
-    ${POST_FILES_PROCESSED})
   # Check for version-specific update code with fixes
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/updates/${START_VERSION}.sql)
     version_files("updates/${START_VERSION}.sql" ORIGIN_MOD_FILE)
     list(APPEND PRE_FILES ${ORIGIN_MOD_FILE})
   endif()
 
-  version_check_file("updates/version_check.sql" VERSION_CHECK_VERSIONED)
-  list(PREPEND PRE_FILES ${VERSION_CHECK_VERSIONED})
+  version_files("updates/version_check.sql" VERSION_CHECK_VERSIONED SUFFIX
+                -${START_VERSION})
+  list(PREPEND PRE_FILES "header.sql;${VERSION_CHECK_VERSIONED}")
 
   # There might not have been any changes in the modfile, in which case the
   # modfile need not be present

@@ -8,18 +8,10 @@ name: Regression Windows
     branches:
       - main
       - ?.*.x
+      - prerelease_test
       - trigger/windows_tests
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE*'
-      - NOTICE
-      - 'bootstrap*'
+      - trigger/regression
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE*'
-      - NOTICE
-      - 'bootstrap*'
   workflow_dispatch:
 jobs:
   config:
@@ -29,10 +21,11 @@ jobs:
       pg15_latest: ${{ steps.config.outputs.pg15_latest }}
       pg16_latest: ${{ steps.config.outputs.pg16_latest }}
       pg17_latest: ${{ steps.config.outputs.pg17_latest }}
+      pg18_latest: ${{ steps.config.outputs.pg18_latest }}
 
     steps:
     - name: Checkout source code
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
     - name: Read configuration
       id: config
       run: python .github/gh_config_reader.py
@@ -45,28 +38,43 @@ jobs:
           echo "build_type=['Debug','Release']" >>$GITHUB_OUTPUT
         fi
 
+  check_paths:
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: >-
+        ${{ github.event_name == 'push'
+          || (steps.filter.outputs.src == 'true' && !contains(github.event.pull_request.labels.*.name, 'skip-ci'))
+         }}
+      run_installcheck: ${{ github.event_name == 'push' || steps.filter.outputs.windows-workflow == 'true' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        id: filter
+        with:
+          filters: .github/filters.yaml
+
   build:
     # Change the JOB_NAME variable below when changing the name.
-    name: PG${{ matrix.pg }} ${{ matrix.build_type }} ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    needs: config
+    name: PG${{ matrix.versions.pg }} ${{ matrix.build_type }} windows
+    runs-on: windows-2025
+    needs: [config, check_paths]
+    if: needs.check_paths.outputs.run_ci == 'true'
     strategy:
       fail-fast: false
       matrix:
-        pg: [ 15, 16, 17 ]
-        os: [ windows-2022 ]
+        versions:
+          - { pg: 15, pg_version: "${{ needs.config.outputs.pg15_latest }}" }
+          - { pg: 16, pg_version: "${{ needs.config.outputs.pg16_latest }}" }
+          - { pg: 17, pg_version: "${{ needs.config.outputs.pg17_latest }}" }
+          - { pg: 18, pg_version: "${{ needs.config.outputs.pg18_latest }}" }
         build_type: ${{ fromJson(needs.config.outputs.build_type) }}
-        pg_config: ["-cfsync=off -cstatement_timeout=60s"]
-        include:
-          - pg: 15
-            pg_version: "15.12"
-#            pg_version: ${{ needs.config.outputs.pg15_latest }}
-          - pg: 16
-            pg_version: "16.8"
-#            pg_version: ${{ needs.config.outputs.pg16_latest }}
-          - pg: 17
-            pg_version: "17.4"
-#            pg_version: ${{ needs.config.outputs.pg17_latest }}
+        pg_config: ["-cfsync=off -cstatement_timeout=60s -clisten_addresses=0.0.0.0"]
+        event_name: ["${{ github.event_name }}"]
+        exclude:
+          - versions: { pg: 15, pg_version: "${{ needs.config.outputs.pg15_latest }}" }
+            event_name: "pull_request"
+          - versions: { pg: 16, pg_version: "${{ needs.config.outputs.pg16_latest }}" }
+            event_name: "pull_request"
     env:
       # PostgreSQL configuration
       PGPORT: 55432
@@ -74,26 +82,55 @@ jobs:
       TABLESPACE1: D:\tablespace1\
       TABLESPACE2: D:\tablespace2\
       IGNORES: >-
-        compress_bloom_sparse_debug
-        compressed_copy
-        compression_algos
         bgw_launcher
         chunk_adaptive
+        compress_bloom_sparse_compat
+        compress_bloom_sparse_debug
+        compress_composite_bloom_debug
+        compress_qualpushdown_saop
+        compress_sort_transform
+        compression_algos
+        compression_uuid
+        direct_compress_copy
+        merge_append_partially_compressed
         metadata
         telemetry
-        net
-      SKIPS: >-
-        bgw_db_scheduler
-        bgw_db_scheduler_fixed
-        hypercore_vectoragg
+        vector_agg_expr
+        vector_agg_byte
+        vector_agg_filter
         vector_agg_groupagg
         vector_agg_grouping
+        vector_agg_planning-*
         vector_agg_text
-        vector_agg_uuid_segmentby
+        vector_agg_uuid
         vectorized_aggregation
+        ${{ matrix.versions.pg < 16 && 'columnar_scan_cost' || '' }}
+      SKIPS: >-
+        create_hypertable
+        create_table_with
+        bgw_db_scheduler
+        bgw_db_scheduler_fixed
     steps:
+
+    - name: Remove Existing PostgreSQL
+      shell: powershell
+      run: |
+        # Search for any installed application package containing 'PostgreSQL' in the name.
+        $PostgresPackages = Get-Package -Name "*PostgreSQL*" -Provider Programs -ErrorAction SilentlyContinue
+        if ($PostgresPackages) {
+            Write-Host "Found $($PostgresPackages.Count) PostgreSQL package(s) to uninstall."
+            # Use Uninstall-Package with -Force for a silent, non-interactive removal.
+            $PostgresPackages | Uninstall-Package -Force
+            # Manually remove common installation paths and data folders
+            # to ensure no conflicts with the new installation.
+            Remove-Item "C:\Program Files\PostgreSQL" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item "C:\PostgreSQL" -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "No registered PostgreSQL installation found. Skipping uninstall step."
+        }
+
     - name: Setup WSL
-      uses: Vampire/setup-wsl@v3.1.4
+      uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
       with:
         distribution: Debian
 
@@ -107,6 +144,8 @@ jobs:
     - name: Install additional packages in WSL
       shell: wsl-bash {0}
       run: |
+        # Workaround for https://github.com/Vampire/setup-wsl/issues/76
+        sed -i 's#ftp.debian.org/debian bullseye-backports#archive.debian.org/debian bullseye-backports#' /etc/apt/sources.list
         apt-get update
         apt-get install --yes --no-install-recommends cmake gawk gcc git gnupg jq make postgresql-client postgresql-common tree
 
@@ -119,7 +158,7 @@ jobs:
         git config --global core.eol lf
 
     - name: Checkout TimescaleDB source
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     # We are going to rebuild Postgres daily, so that it doesn't suddenly break
     # ages after the original problem.
@@ -139,99 +178,118 @@ jobs:
       # --extract-only and launch our own test instance, which is
       # probably better anyway since it gives us more control.
     - name: Cache PostgreSQL installation
-      uses: actions/cache@v4
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
       id: cache-postgresql
       with:
-        path: ~\PostgreSQL\${{ matrix.pg }}
+        path: C:\Progra~1\PostgreSQL\${{ matrix.versions.pg }}
         key: "${{ runner.os }}-build-pg${{ matrix.pkg_version }}\
           -${{ steps.get-date.outputs.date }}-${{ hashFiles('.github/**') }}"
 
-    # Force install PostgreSQL 17 since the package still on moderation
-    # https://community.chocolatey.org/packages/postgresql17
-    - name: Install PostgreSQL ${{ matrix.pg }} (using ${{ matrix.pg_version }})
+    - name: Install PostgreSQL ${{ matrix.versions.pg }} (using ${{ matrix.versions.pg_version }})
       if: github.event_name != 'schedule' && steps.cache-postgresql.outputs.cache-hit != 'true'
       run: |
-        choco feature disable --name=usePackageExitCodes
-        choco feature disable --name=showDownloadProgress
-        choco install postgresql${{ matrix.pg }} --version ${{ matrix.pg_version }} `
-          --force -y --install-args="'--prefix $HOME\PostgreSQL\${{ matrix.pg }} --extract-only yes'"
+        $version = ${{ matrix.versions.pg_version }}
+        $version = $version.Replace('"', '') + "-1"
+        winget install --id PostgreSQL.PostgreSQL.${{ matrix.versions.pg }} --version $version --force --accept-source-agreements --accept-package-agreements --disable-interactivity
 
     # This is for nightly builds. Here we pick the latest version of the package.
-    - name: Install PostgreSQL ${{ matrix.pg }}
+    - name: Install PostgreSQL ${{ matrix.versions.pg }}
       if: github.event_name == 'schedule' && steps.cache-postgresql.outputs.cache-hit != 'true'
       run: |
-        choco feature disable --name=usePackageExitCodes
-        choco feature disable --name=showDownloadProgress
-        choco install postgresql${{ matrix.pg }} `
-          --force -y --install-args="'--prefix $HOME\PostgreSQL\${{ matrix.pg }} --extract-only yes'"
+        winget install --id PostgreSQL.PostgreSQL.${{ matrix.versions.pg }} --force --accept-source-agreements --accept-package-agreements --disable-interactivity
 
     - name: Configure TimescaleDB
       run: cmake -B build_win -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
-        -DPG_PATH="$HOME/PostgreSQL/${{ matrix.pg }}" `
-        -DOPENSSL_ROOT_DIR="$HOME/PostgreSQL/${{ matrix.pg }}" -DASSERTIONS=ON `
+        -DPG_CONFIG=C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_config `
+        -DASSERTIONS=ON `
         -DTEST_PG_LOG_DIRECTORY="log"
+
     - name: Build TimescaleDB
       run: cmake --build build_win --config ${{ matrix.build_type }}
+
     - name: Install TimescaleDB
       run: cmake --install build_win --config ${{ matrix.build_type }}
 
-    - name: Setup postgres cluster
+    - name: Enable crash dumps for postgres.exe (WER LocalDumps)
+      if: needs.check_paths.outputs.run_installcheck == 'true'
+      shell: powershell
       run: |
-        ~/PostgreSQL/${{ matrix.pg }}/bin/initdb -U postgres -A trust --locale=en_US --encoding=UTF8
+        $DumpDir = Join-Path $env:GITHUB_WORKSPACE "crashdumps"
+        New-Item -ItemType Directory -Force -Path $DumpDir | Out-Null
+
+        $Key = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\postgres.exe"
+        New-Item -Path $Key -Force | Out-Null
+        New-ItemProperty -Path $Key -Name DumpFolder -Value $DumpDir -PropertyType ExpandString -Force | Out-Null
+        New-ItemProperty -Path $Key -Name DumpCount -Value 10 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $Key -Name DumpType -Value 2 -PropertyType DWord -Force | Out-Null
+
+        Write-Host "Configured WER LocalDumps for postgres.exe => $DumpDir"
+
+    - name: Setup postgres cluster
+      if: needs.check_paths.outputs.run_installcheck == 'true'
+      run: |
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/initdb -U postgres -A trust --locale=en_US --encoding=UTF8
         mkdir -p ${{ env.TABLESPACE1 }}\_default
         mkdir -p ${{ env.TABLESPACE2 }}\_default
         icacls ${{ env.TABLESPACE1 }} /grant runneradmin:F /T
         icacls ${{ env.TABLESPACE2 }} /grant runneradmin:F /T
         copy build_win/test/postgresql.conf ${{ env.PGDATA }}
-        copy build_win/test/pg_hba.conf ${{ env.PGDATA }}
         icacls . /grant runneradmin:F /T
-        ~/PostgreSQL/${{ matrix.pg }}/bin/pg_ctl start -o "${{ matrix.pg_config }}" --log=postmaster.log
-        ~/PostgreSQL/${{ matrix.pg }}/bin/pg_isready -U postgres -d postgres --timeout=60
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'CREATE USER root SUPERUSER LOGIN;'
+        Add-Content ${{ env.PGDATA }}\pg_hba.conf "host all all 0.0.0.0/0 trust"
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_ctl start -o "${{ matrix.pg_config }}" --log=postmaster.log
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_isready -U postgres -d postgres --timeout=60
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'CREATE USER root SUPERUSER LOGIN;'
         echo "PG version:"
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SELECT version();'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SELECT version();'
         echo "Log configuration:"
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SHOW logging_collector;'
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SHOW log_filename;'
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SHOW log_directory;'
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SELECT pg_current_logfile();'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SHOW logging_collector;'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SHOW log_filename;'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SHOW log_directory;'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SELECT pg_current_logfile();'
         echo "Data directory:"
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'SHOW data_directory;'
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'SHOW data_directory;'
+
+        New-NetFirewallRule -DisplayName "Allow PG from WSL" -Direction Inbound -LocalPort 55432 -Protocol TCP -Action Allow
 
     - name: Install postgres for test runner
+      if: needs.check_paths.outputs.run_installcheck == 'true'
       shell: wsl-bash {0}
       run: |
         yes | /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh || true
         echo 'Acquire::Retries "10";' >> /etc/apt/apt.conf.d/99retries
         echo 'Acquire::http::Timeout "240";' >> /etc/apt/apt.conf.d/99retries
         echo 'Acquire::https::Timeout "240";' >> /etc/apt/apt.conf.d/99retries
-        apt-get install -y --force-yes postgresql-server-dev-${{ matrix.pg }}
+        apt-get install -y --force-yes postgresql-server-dev-${{ matrix.versions.pg }}
 
     - name: Run tests
+      if: needs.check_paths.outputs.run_installcheck == 'true'
       shell: wsl-bash {0}
       env:
         WSLENV: "IGNORES:SKIPS"
       run: |
         export TEST_TABLESPACE1_PREFIX='${{ env.TABLESPACE1 }}'
         export TEST_TABLESPACE2_PREFIX='${{ env.TABLESPACE2 }}'
-        cmake -B build_wsl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DTEST_PGPORT_LOCAL=${{ env.PGPORT }}
+        WIN_HOST=$(ip route show default | awk '{print $3}')
+        cmake -B build_wsl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DTEST_PGPORT_LOCAL=${{ env.PGPORT }} -DTEST_PGHOST=$WIN_HOST
 
         make -C build_wsl isolationchecklocal | tee -a installcheck.log
         make -C build_wsl regresschecklocal IGNORES="${IGNORES}" SKIPS="${SKIPS}" | tee -a installcheck.log
 
     - name: Setup postgres cluster for TSL tests
+      if: needs.check_paths.outputs.run_installcheck == 'true'
       run: |
-        ~/PostgreSQL/${{ matrix.pg }}/bin/pg_ctl stop
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_ctl stop
         timeout 10
         Remove-Item -Recurse ${{ env.PGDATA }}
-        ~/PostgreSQL/${{ matrix.pg }}/bin/initdb -U postgres -A trust --locale=en_US --encoding=UTF8
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/initdb -U postgres -A trust --locale=en_US --encoding=UTF8
         copy build_win/tsl/test/postgresql.conf ${{ env.PGDATA }}
-        copy build_win/tsl/test/pg_hba.conf ${{ env.PGDATA }}
-        ~/PostgreSQL/${{ matrix.pg }}/bin/pg_ctl start -o "${{ matrix.pg_config }}" --log="postmaster.log"
-        ~/PostgreSQL/${{ matrix.pg }}/bin/pg_isready -U postgres -d postgres --timeout=30
-        ~/PostgreSQL/${{ matrix.pg }}/bin/psql -U postgres -d postgres -c 'CREATE USER root SUPERUSER LOGIN;'
+        Add-Content ${{ env.PGDATA }}\pg_hba.conf "host all all 0.0.0.0/0 trust"
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_ctl start -o "${{ matrix.pg_config }}" --log="postmaster.log"
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/pg_isready -U postgres -d postgres --timeout=30
+        C:\Progra~1/PostgreSQL/${{ matrix.versions.pg }}/bin/psql -U postgres -d postgres -c 'CREATE USER root SUPERUSER LOGIN;'
 
     - name: Run TSL tests
+      if: needs.check_paths.outputs.run_installcheck == 'true'
       shell: wsl-bash {0}
       env:
         WSLENV: "IGNORES:SKIPS"
@@ -254,27 +312,55 @@ jobs:
         grep -e 'FAILED' -e 'failed (ignored)' -e 'not ok' installcheck.log || true
         cat regression.log
 
+    - name: Extract stack traces from crash dumps
+      if: always()
+      shell: powershell
+      run: |
+        $DumpDir = Join-Path $env:GITHUB_WORKSPACE "crashdumps"
+        if (!(Test-Path $DumpDir)) { Write-Host "No crashdumps directory found."; exit 0 }
+
+        $Dumps = Get-ChildItem -Path $DumpDir -Filter "*.dmp" -Recurse -ErrorAction SilentlyContinue
+        if (!$Dumps) { Write-Host "No .dmp files found in $DumpDir."; exit 0 }
+
+        $SymbolCache = Join-Path $DumpDir "symbols"
+        New-Item -ItemType Directory -Force -Path $SymbolCache | Out-Null
+
+        $Out = Join-Path $DumpDir "stacktraces.txt"
+        foreach ($Dump in $Dumps) {
+          Add-Content -Path $Out -Value ("==== " + $Dump.FullName + " ====")
+          & cdb.exe -z $Dump.FullName -c ".symfix $SymbolCache; .reload; !analyze -v; kv; q" | Out-File -FilePath $Out -Append -Encoding utf8
+        }
+
+    - name: Upload crash dumps and stack traces
+      if: always()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: Crash dumps PG${{ matrix.versions.pg }} ${{ matrix.build_type }} windows
+        path: |
+          crashdumps\**
+        if-no-files-found: ignore
+
     - name: Save regression diffs
       if: always() && steps.collectlogs.outputs.regression_diff == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
-        name: Regression ${{ matrix.pg }} diff ${{ matrix.os }} ${{ matrix.build_type }} Build
+        name: Regression ${{ matrix.versions.pg }} diff ${{ matrix.os }} ${{ matrix.build_type }} Build
         path: |
           regression.log
           installcheck.log
 
     - name: Save PostgreSQL log
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
-        name: PostgreSQL ${{ matrix.pg }} log ${{ matrix.os }} ${{ matrix.build_type }} Build
+        name: PostgreSQL ${{ matrix.versions.pg }} log ${{ matrix.os }} ${{ matrix.build_type }} Build
         path: ${{ env.PGDATA }}\log\postmaster.log
 
     - name: Upload CMake Logs
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
-        name: CMake Logs ${{ matrix.pg }} ${{ matrix.os }} ${{ matrix.build_type }}
+        name: CMake Logs ${{ matrix.versions.pg }} ${{ matrix.os }} ${{ matrix.build_type }}
         path: |
             build_win/CMakeCache.txt
             build_win/CMakeFiles/CMakeConfigureLog.yaml
@@ -298,7 +384,7 @@ jobs:
         # GitHub Actions allow you neither to use the env context for the job name,
         # nor to access the job name from the step context, so we have to
         # duplicate it to work around this nonsense.
-        JOB_NAME: PG${{ matrix.pg }} ${{ matrix.build_type }} ${{ matrix.os }}
+        JOB_NAME: PG${{ matrix.versions.pg }} ${{ matrix.build_type }} ${{ matrix.os }}
         CI_STATS_DB: ${{ secrets.CI_STATS_DB }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
         GITHUB_REF_NAME: ${{ github.ref_name }}
@@ -316,3 +402,16 @@ jobs:
         fi
         export GITHUB_PR_NUMBER
         scripts/upload_ci_stats.sh
+
+  report_status:
+    name: Regression Windows summary
+    needs: [check_paths, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # If the detector failed, or the matrix failed, exit with error
+          if [[ "${{ needs.build.result }}" == "failure" ]]; then
+            exit 1
+          fi
+          echo "All checks passed or were safely skipped."

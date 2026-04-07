@@ -37,13 +37,13 @@ select generate_series('2018-12-01 00:00'::timestamp, '2018-12-31 00:00'::timest
 select add_compression_policy('conditions', '60d'::interval) AS compressjob_id
 \gset
 
-select * from _timescaledb_config.bgw_job where id = :compressjob_id;
+select * from _timescaledb_catalog.bgw_job where id = :compressjob_id;
 select * from alter_job(:compressjob_id, schedule_interval=>'1s');
 --enable maxchunks to 1 so that only 1 chunk is compressed by the job
 SELECT alter_job(id,config:=jsonb_set(config,'{maxchunks_to_compress}', '1'))
- FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
+ FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id;
 
-select * from _timescaledb_config.bgw_job where id >= 1000 ORDER BY id;
+select * from _timescaledb_catalog.bgw_job where id >= 1000 ORDER BY id;
 insert into conditions
 select now()::timestamp, 'TOK', 'sony', 55, 75;
 
@@ -53,7 +53,7 @@ CALL run_job(:compressjob_id);
 select chunk_name, pg_size_pretty(before_compression_total_bytes) before_total,
 pg_size_pretty( after_compression_total_bytes)  after_total
 from chunk_compression_stats('conditions') where compression_status like 'Compressed' order by chunk_name;
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk ORDER BY id;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk FROM _timescaledb_catalog.chunk ORDER BY id;
 
 -- TEST 4 --
 --cannot set another policy
@@ -66,7 +66,7 @@ select add_compression_policy('conditions', '30d'::interval, if_not_exists=>true
 --TEST 5 --
 -- drop the policy --
 select remove_compression_policy('conditions');
-select count(*) from _timescaledb_config.bgw_job WHERE id>=1000;
+select count(*) from _timescaledb_catalog.bgw_job WHERE id>=1000;
 
 --TEST 6 --
 -- try to execute the policy after it has been dropped --
@@ -99,7 +99,7 @@ ALTER TABLE test_table_smallint SET (timescaledb.compress);
 select add_compression_policy( 'test_table_smallint', compress_after=> '1 day'::interval );
 \set ON_ERROR_STOP 1
 SELECT add_compression_policy('test_table_smallint', 2::SMALLINT) AS compressjob_id \gset
-SELECT * FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
+SELECT * FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id;
 
 --will compress all chunks that need compression
 CALL run_job(:compressjob_id);
@@ -120,7 +120,7 @@ INSERT INTO test_table_integer SELECT generate_series(1,5), 10;
 
 ALTER TABLE test_table_integer SET (timescaledb.compress);
 SELECT add_compression_policy('test_table_integer', 2::INTEGER) AS compressjob_id \gset
-SELECT * FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
+SELECT * FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id;
 
 --will compress all chunks that need compression
 CALL run_job(:compressjob_id);
@@ -141,7 +141,7 @@ INSERT INTO test_table_bigint SELECT generate_series(1,5), 10;
 
 ALTER TABLE test_table_bigint SET (timescaledb.compress);
 SELECT add_compression_policy('test_table_bigint', 2::BIGINT) AS compressjob_id \gset
-SELECT * FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
+SELECT * FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id;
 
 --will compress all chunks that need compression
 CALL run_job(:compressjob_id);
@@ -204,9 +204,9 @@ SELECT add_compression_policy AS job_id
   FROM add_compression_policy('conditions', INTERVAL '1 day') \gset
 -- job compresses only 1 chunk at a time --
 SELECT alter_job(id,config:=jsonb_set(config,'{maxchunks_to_compress}', '1'))
- FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+ FROM _timescaledb_catalog.bgw_job WHERE id = :job_id;
 SELECT alter_job(id,config:=jsonb_set(config,'{verbose_log}', 'true'))
- FROM _timescaledb_config.bgw_job WHERE id = :job_id;
+ FROM _timescaledb_catalog.bgw_job WHERE id = :job_id;
 set client_min_messages TO LOG;
 CALL run_job(:job_id);
 set client_min_messages TO NOTICE;
@@ -226,7 +226,7 @@ FROM generate_series('2018-12-01 00:00'::timestamp, '2018-12-31 00:00'::timestam
 
 ALTER TABLE test_table_frozen SET (timescaledb.compress);
 select add_compression_policy( 'test_table_frozen', compress_after=> '1 day'::interval ) as compressjob_id \gset
-SELECT * FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id;
+SELECT * FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id;
 SELECT show_chunks('test_table_frozen') as first_chunk LIMIT 1 \gset
 
 --will compress all chunks that need compression
@@ -296,7 +296,7 @@ CALL run_job(:JOB_COMPRESS);
 SELECT chunk_status FROM compressed_chunk_info_view WHERE hypertable_name = 'metrics2';
 
 -- disable reindex in compress job
-SELECT alter_job(id,config:=jsonb_set(config,'{reindex}','false'), next_start => '2000-01-01 00:00:00+00'::timestamptz) FROM _timescaledb_config.bgw_job WHERE id = :JOB_COMPRESS;
+SELECT alter_job(id,config:=jsonb_set(config,'{reindex}','false'), next_start => '2000-01-01 00:00:00+00'::timestamptz) FROM _timescaledb_catalog.bgw_job WHERE id = :JOB_COMPRESS;
 
 -- do an INSERT so recompress has something to do
 INSERT INTO metrics2 SELECT '2000-01-01' FROM generate_series(1,3000);
@@ -305,7 +305,7 @@ SELECT chunk_schema, chunk_name FROM compressed_chunk_info_view WHERE hypertable
 SELECT format('%I.%I', :'chunk_schema', :'chunk_name') AS "RECOMPRESS_CHUNK_NAME"; \gset
 
 -- get size of the chunk that needs recompression
-VACUUM ANALYZE metrics2;
+VACUUM ANALYZE :RECOMPRESS_CHUNK_NAME;
 
 SELECT pg_indexes_size(:'RECOMPRESS_CHUNK_NAME') AS "SIZE_BEFORE_REINDEX"; \gset
 
@@ -315,16 +315,15 @@ CALL run_job(:JOB_COMPRESS);
 SELECT chunk_status FROM compressed_chunk_info_view WHERE chunk_schema = :'chunk_schema' AND chunk_name = :'chunk_name';
 
 -- index size should not have decreased
-VACUUM ANALYZE metrics2;
-SELECT
-pg_size_pretty(pg_table_size(:'RECOMPRESS_CHUNK_NAME')) AS table_only,
-pg_size_pretty(pg_indexes_size(:'RECOMPRESS_CHUNK_NAME')) AS indexes,
-pg_size_pretty(pg_total_relation_size(:'RECOMPRESS_CHUNK_NAME')) AS total;
+VACUUM ANALYZE :RECOMPRESS_CHUNK_NAME;
 
-SELECT pg_indexes_size(:'RECOMPRESS_CHUNK_NAME') = :SIZE_BEFORE_REINDEX as size_unchanged;
+-- index size can vary, vacuuming can even increase the size of the index
+-- just check that the index size hasn't decreased, this can only happen
+-- when running VACUUM FULL or REINDEX TABLE
+SELECT pg_indexes_size(:'RECOMPRESS_CHUNK_NAME') >= :SIZE_BEFORE_REINDEX as size_unchanged;
 
 -- enable reindex in compress job
-SELECT alter_job(id,config:=jsonb_set(config,'{reindex}','true'), next_start => '2000-01-01 00:00:00+00'::timestamptz) FROM _timescaledb_config.bgw_job WHERE id = :JOB_COMPRESS;
+SELECT alter_job(id,config:=jsonb_set(config,'{reindex}','true'), next_start => '2000-01-01 00:00:00+00'::timestamptz) FROM _timescaledb_catalog.bgw_job WHERE id = :JOB_COMPRESS;
 
 -- do an INSERT so recompress has something to do
 INSERT INTO metrics2 SELECT '2000-01-01';
@@ -356,7 +355,7 @@ SELECT
     initial_start => now() - interval '1 day'
   ) as compressjob_id \gset
 
-SELECT config AS compressjob_config FROM _timescaledb_config.bgw_job WHERE id = :compressjob_id \gset
+SELECT config AS compressjob_config FROM _timescaledb_catalog.bgw_job WHERE id = :compressjob_id \gset
 SELECT FROM alter_job(:compressjob_id, config => jsonb_set(:'compressjob_config'::jsonb, '{recompress}', 'true'));
 
 -- 31 uncompressed chunks (0 - uncompressed, 1 - compressed)
@@ -375,7 +374,7 @@ WITH chunks AS (
   FROM _timescaledb_catalog.chunk c
   INNER JOIN _timescaledb_catalog.hypertable h on (h.id = c.hypertable_id)
   WHERE h.table_name = 'test_compression_policy_errors'
-  ORDER BY c.id LIMIT 20
+  ORDER BY c.id
 )
 UPDATE _timescaledb_catalog.chunk
 SET status = 3
@@ -385,7 +384,7 @@ WHERE chunk.id = chunks.id
 
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 
--- After the mess 20 = status 3 and 11 = status 0
+-- After the mess 30 = status 3
 SELECT c.status, count(*)
 FROM _timescaledb_catalog.chunk c
 INNER JOIN _timescaledb_catalog.hypertable h on (h.id = c.hypertable_id)
@@ -397,7 +396,7 @@ ORDER BY 2 DESC;
 SET client_min_messages TO ERROR;
 \set VERBOSITY default
 -- This should fail with
--- 20 chunks failed to compress and 11 chunks compressed successfully
+-- 31 chunks failed to compress
 CALL run_job(:compressjob_id);
 \set VERBOSITY terse
 \set ON_ERROR_STOP 1

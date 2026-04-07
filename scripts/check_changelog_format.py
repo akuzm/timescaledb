@@ -35,9 +35,7 @@ def run_query(query):
 def get_referenced_issues(pr_number):
     """Get the numbers of issue fixed by the given pull request."""
 
-    ref_result = run_query(
-        string.Template(
-            """
+    ref_result = run_query(string.Template("""
         query {
             repository(owner: "timescale", name: "timescaledb") {
               pullRequest(number: $pr_number) {
@@ -51,9 +49,7 @@ def get_referenced_issues(pr_number):
               }
             }
           }
-          """
-        ).substitute({"pr_number": pr_number})
-    )
+          """).substitute({"pr_number": pr_number}))
 
     # The above returns {'data': {'repository': {'pullRequest': {'closingIssuesReferences': {'edges': [{'node': {'number': 4944}}]}}}}}
 
@@ -69,7 +65,13 @@ def get_referenced_issues(pr_number):
 
 # Check if a line matches any of the specified patterns
 def is_valid_line(line):
-    patterns = [r"^Fixes:\s*.*$", r"^Implements:\s*.*$", r"^Thanks:\s*.*$"]
+    patterns = [
+        r"^Fixes:\s*.*$",
+        r"^Implements:\s*.*$",
+        r"^Thanks:\s*.*$",
+        r"^Backward-Incompatible Change:\s*.*$",
+        r"^Setting:\s*.*$",
+    ]
     for pattern in patterns:
         if re.match(pattern, line):
             return True
@@ -91,6 +93,12 @@ def main():
         sys.exit(1)
 
     file_name = sys.argv[1]
+
+    # Check if the file exists
+    if not os.path.exists(file_name):
+        print(f"{file_name} does not exist")
+        sys.exit(1)
+
     this_pr_number = int(os.environ["PR_NUMBER"])
     pr_issues = set(get_referenced_issues(this_pr_number))
 

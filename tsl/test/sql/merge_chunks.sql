@@ -183,7 +183,6 @@ select * from mergeme;
 rollback;
 
 -- Test mixing hypercore TAM with compression without TAM
-alter table _timescaledb_internal._hyper_1_1_chunk set access method hypercore;
 select * from chunk_info;
 
 begin;
@@ -198,7 +197,6 @@ rollback;
 select * from chunk_info;
 
 -- Only Hypercore TAM and non-compressed chunks
-alter table _timescaledb_internal._hyper_1_3_chunk set access method hypercore;
 
 begin;
 select sum(temp) from mergeme;
@@ -208,14 +206,12 @@ select count(*) as num_orphaned_slices from orphaned_slices;
 select sum(temp) from mergeme;
 
 -- Test that indexes work after merge
-set timescaledb.enable_columnarscan = false;
 set enable_seqscan = false;
 analyze mergeme;
-explain (costs off)
+explain (buffers off, costs off)
 select * from mergeme where device = 1;
 select * from mergeme where device = 1;
 select * from _timescaledb_internal._hyper_1_1_chunk where device = 1;
-reset timescaledb.enable_columnarscan;
 reset enable_seqscan;
 rollback;
 
@@ -295,7 +291,6 @@ from generate_series('2024-01-01'::timestamptz, '2024-01-04', '0.5s') t;
 
 -- Compress two chunks, one using access method
 select compress_chunk('_timescaledb_internal._hyper_1_1_chunk');
-alter table _timescaledb_internal._hyper_1_2_chunk set access method hypercore;
 
 -- Show partitions before merge
 select * from partitions;
@@ -356,6 +351,7 @@ set timescaledb.enable_merge_multidim_chunks = true;
 -- Merge all chunks until only 1 remains.  Also check that metadata is
 -- merged.
 ---
+begin;
 select * from compression_size_fraction;
 select count(*), sum(device), round(sum(temp)::numeric, 4) from mergeme;
 call merge_chunks(ARRAY['_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_4_chunk','_timescaledb_internal._hyper_1_5_chunk', '_timescaledb_internal._hyper_1_12_chunk']);
@@ -378,3 +374,131 @@ select * from compression_size_fraction;
 select count(*), sum(device), round(sum(temp)::numeric, 4) from mergeme;
 select * from partitions;
 select * from chunk_info;
+rollback;
+
+----------------------------
+-- Test concurrent merges --
+----------------------------
+
+create view chunks_being_merged as
+select
+    chunk_relid,
+    n as new_chunk_id,
+    (select count(indexrelid::regclass) from pg_index where indrelid=new_relid) as num_new_indexes
+from (select *, dense_rank() over (order by new_relid) as n from _timescaledb_catalog.chunk_rewrite) cr ORDER BY chunk_relid::text COLLATE "C";
+grant select on chunks_being_merged to public;
+
+
+-- Concurrent merge cannot run in a transaction block
+\set ON_ERROR_STOP 0
+begin;
+call merge_chunks_concurrently(ARRAY['_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_4_chunk','_timescaledb_internal._hyper_1_5_chunk', '_timescaledb_internal._hyper_1_12_chunk']);
+rollback;
+
+select debug_waitpoint_enable('merge_chunks_fail');
+call merge_chunks_concurrently(ARRAY['_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_4_chunk','_timescaledb_internal._hyper_1_5_chunk', '_timescaledb_internal._hyper_1_12_chunk']);
+\set ON_ERROR_STOP 1
+
+select * from chunks_being_merged;
+reset role;
+
+-- Manually drop a temp heap to create a situation where the failed merge heap is already gone.
+select new_relid from _timescaledb_catalog.chunk_rewrite
+where chunk_relid = '_timescaledb_internal._hyper_1_1_chunk'::regclass \gset
+drop table :new_relid;
+
+-- Test that it is only possible to clean up own merges.
+set role :ROLE_1;
+create table mergeme_role1(time timestamptz not null, device int, temp float);
+select create_hypertable('mergeme_role1', 'time', chunk_time_interval => interval '1 day');
+
+insert into mergeme_role1 values ('2024-01-01', 1, 1.0), ('2024-01-02', 2, 2.0);
+select show_chunks('mergeme_role1');
+
+-- Fail merge to create multiple entries in chunk_rewrite with different owners
+\set ON_ERROR_STOP 0
+call merge_chunks('_timescaledb_internal._hyper_4_18_chunk', '_timescaledb_internal._hyper_4_19_chunk', concurrently => true);
+\set ON_ERROR_STOP 1
+select * from chunks_being_merged;
+
+set role :ROLE_DEFAULT_PERM_USER;
+-- Save non-cleaned information
+create table pre_cleaned_chunks as select * from _timescaledb_catalog.chunk_rewrite;
+
+-- Should only clean up its own failed merges
+call _timescaledb_functions.chunk_rewrite_cleanup();
+select * from chunks_being_merged;
+
+set role :ROLE_1;
+
+call _timescaledb_functions.chunk_rewrite_cleanup();
+-- Everything cleaned up
+select * from chunks_being_merged;
+
+set role :ROLE_DEFAULT_PERM_USER;
+
+-- None of the pre-cleaned chunks should remain after cleanup. Check by joining
+-- the pre-cleaned relids with pg_class. The count of the join should be zero if the
+-- relations no longer exist in pg_class.
+select count(*) from pre_cleaned_chunks;
+select count(*) from pre_cleaned_chunks cc join pg_class c on (c.oid = cc.new_relid);
+
+-- Fail merges again to test superuser cleanup
+\set ON_ERROR_STOP 0
+call merge_chunks_concurrently(ARRAY['_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_4_chunk','_timescaledb_internal._hyper_1_5_chunk', '_timescaledb_internal._hyper_1_12_chunk']);
+set role :ROLE_1;
+call merge_chunks('_timescaledb_internal._hyper_4_18_chunk', '_timescaledb_internal._hyper_4_19_chunk', concurrently => true);
+\set ON_ERROR_STOP 1
+set role :ROLE_DEFAULT_PERM_USER;
+select debug_waitpoint_release('merge_chunks_fail');
+
+select * from chunks_being_merged;
+-- Reset to superuser
+reset role;
+select current_user;
+call _timescaledb_functions.chunk_rewrite_cleanup();
+select * from chunks_being_merged;
+
+drop table pre_cleaned_chunks;
+
+-- Test successful merges in concurrent mode
+call merge_chunks('_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_4_chunk', concurrently => true);
+call merge_chunks_concurrently(ARRAY['_timescaledb_internal._hyper_1_1_chunk', '_timescaledb_internal._hyper_1_5_chunk', '_timescaledb_internal._hyper_1_12_chunk']);
+
+drop view chunks_being_merged;
+
+-- Test: Verify merged chunks remain in publication
+\c :TEST_DBNAME :ROLE_SUPERUSER
+SET timescaledb.enable_chunk_auto_publication = true;
+
+CREATE TABLE pub_merge_test(time timestamptz not null, device int, temp float);
+SELECT create_hypertable('pub_merge_test', 'time', chunk_time_interval => interval '1 day');
+
+-- Insert data to create multiple chunks
+INSERT INTO pub_merge_test VALUES
+    ('2024-01-01 01:00', 1, 1.0),
+    ('2024-01-02 01:00', 2, 2.0);
+
+-- Create publication
+CREATE PUBLICATION test_merge_pub FOR TABLE pub_merge_test;
+
+-- Verify chunks before merge
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'test_merge_pub'
+ORDER BY schemaname, tablename;
+
+-- Merge chunks
+SELECT show_chunks('pub_merge_test') as chunk1 ORDER BY 1 LIMIT 1 OFFSET 0 \gset
+SELECT show_chunks('pub_merge_test') as chunk2 ORDER BY 1 LIMIT 1 OFFSET 1 \gset
+CALL merge_chunks(:'chunk1', :'chunk2');
+
+-- Verify merged chunk remains in publication
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'test_merge_pub'
+ORDER BY schemaname, tablename;
+
+-- Cleanup
+DROP PUBLICATION test_merge_pub CASCADE;
+DROP TABLE pub_merge_test CASCADE;

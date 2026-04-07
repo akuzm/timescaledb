@@ -21,6 +21,7 @@
 #include "hypertable_cache.h"
 #include "job.h"
 #include "job_api.h"
+#include "policies_v2.h"
 
 /* Default max runtime for a custom job is unlimited for now */
 #define DEFAULT_MAX_RUNTIME 0
@@ -203,23 +204,9 @@ static BgwJob *
 find_job(int32 job_id, bool null_job_id, bool missing_ok)
 {
 	BgwJob *job;
-	bool got_lock;
-	LOCKTAG tag;
 
 	if (null_job_id && !missing_ok)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("job ID cannot be NULL")));
-
-	/* The job table manipulation functions in job.c use an advisory lock
-	 * rather than a row lock to prevent the job from being modified while
-	 * running. Since we use this function to find a job for either running
-	 * manually or for altering it, we need to grab that advisory lock here as
-	 * well. */
-	got_lock = ts_lock_job_id(job_id,
-							  RowShareLock,
-							  /* session_lock */ false,
-							  &tag,
-							  /* block */ true);
-	Ensure(got_lock, "could not get lock on job id %d", job_id);
 
 	job = ts_bgw_job_find(job_id, CurrentMemoryContext, !missing_ok);
 
@@ -398,6 +385,45 @@ job_alter(PG_FUNCTION_ARGS)
 				 "%s.%s",
 				 NameStr(job->fd.check_schema),
 				 NameStr(job->fd.check_name));
+
+	/*
+	 * If the CAgg refresh policy job is being altered, then always check for overlap.
+	 * There is probably a better place to do this, but we choose to do this here since we need
+	 * access to the job_id, which we don't have inside the `policy_check` function called above.
+	 */
+	if (namestrcmp(&job->fd.proc_name, POLICY_REFRESH_CAGG_PROC_NAME) == 0)
+	{
+		int32 materialization_id =
+			policy_continuous_aggregate_get_mat_hypertable_id(job->fd.config);
+		ContinuousAgg *cagg =
+			ts_continuous_agg_find_by_mat_hypertable_id(materialization_id, false);
+		PolicyRefreshOffsetOverlapResult res =
+			policy_refresh_cagg_check_for_overlaps(cagg, job->fd.config, job->fd.id);
+		switch (res)
+		{
+			case POLICY_REFRESH_OFFSET_OVERLAP_NONE:
+				break;
+			case POLICY_REFRESH_OFFSET_OVERLAP_EQUAL:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+
+						 errmsg("continuous aggregate refresh policy already exists for "
+								"\"%s\"",
+								get_rel_name(cagg->relid)),
+						 errdetail("A refresh policy with the same start and end offset already "
+								   "exists for "
+								   "continuous aggregate \"%s\".",
+								   get_rel_name(cagg->relid))));
+				break;
+			case POLICY_REFRESH_OFFSET_OVERLAP:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("refresh interval overlaps with an existing continuous aggregate "
+								"policy on \"%s\"",
+								get_rel_name(cagg->relid))));
+				break;
+		}
+	}
 
 	if (unregister_check)
 	{

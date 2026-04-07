@@ -4,8 +4,7 @@
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 
--- Uncomment to run this test with hypercore TAM
---set timescaledb.default_hypercore_use_access_method=true;
+SET timescaledb.enable_columnarindexscan TO off;
 
 -- helper function: float -> pseudorandom float [-0.5..0.5]
 CREATE OR REPLACE FUNCTION mix(x anyelement) RETURNS float8 AS $$
@@ -51,7 +50,7 @@ select count(compress_chunk(x)) from show_chunks('aggfns') x;
 
 alter table aggfns add column ss int default 11;
 alter table aggfns add column cfloat8 float8 default '13';
-alter table aggfns add column x text default '11';
+alter table aggfns add column x text collate "C" default '11';
 
 insert into aggfns
 select *, ss::text as x from (
@@ -133,7 +132,7 @@ select
             function, variable)
 from
     unnest(array[
-        'explain (costs off) ',
+        'explain (buffers off, costs off) ',
         null]) explain,
     unnest(array[
         't',
@@ -147,7 +146,8 @@ from
         'cts',
         'ctstz',
         'cdate',
-        '*']) variable,
+        '*',
+        'x']) variable,
     unnest(array[
         'min',
         'max',
@@ -169,6 +169,7 @@ from
 where
     true
     and (explain is null /* or condition is null and grouping = 's' */)
+    and (variable != 'x' or function in ('min'))
     and (variable != '*' or function = 'count')
     and (variable not in ('t', 'cts', 'ctstz', 'cdate') or function in ('min', 'max'))
     -- This is not vectorized yet

@@ -23,6 +23,7 @@
 #include <fmgr.h>
 #include <funcapi.h>
 #include <nodes/makefuncs.h>
+#include <nodes/nodeFuncs.h>
 #include <parser/parse_coerce.h>
 #include <parser/parse_func.h>
 #include <parser/scansup.h>
@@ -31,22 +32,25 @@
 #include <utils/builtins.h>
 #include <utils/catcache.h>
 #include <utils/date.h>
+#include <utils/elog.h>
 #include <utils/fmgroids.h>
 #include <utils/fmgrprotos.h>
 #include <utils/lsyscache.h>
 #include <utils/relcache.h>
 #include <utils/snapmgr.h>
 #include <utils/syscache.h>
+#include <utils/timestamp.h>
+#include <utils/uuid.h>
 
 #include "compat/compat.h"
 #include "chunk.h"
 #include "cross_module_fn.h"
 #include "debug_point.h"
-#include "guc.h"
 #include "hypertable_cache.h"
 #include "jsonb_utils.h"
 #include "time_utils.h"
 #include "utils.h"
+#include "uuid.h"
 
 typedef struct
 {
@@ -55,7 +59,6 @@ typedef struct
 } priv_map;
 
 TS_FUNCTION_INFO_V1(ts_pg_timestamp_to_unix_microseconds);
-TS_FUNCTION_INFO_V1(ts_makeaclitem);
 
 /*
  * Convert a Postgres TIMESTAMP to BIGINT microseconds relative the UNIX epoch.
@@ -148,7 +151,7 @@ ts_time_value_to_internal(Datum time_val, Oid type_oid)
 		elog(ERROR, "unknown time type \"%s\"", format_type_be(type_oid));
 	}
 
-	if (IS_INTEGER_TYPE(type_oid))
+	if (IS_INTEGER_TYPE(type_oid) || IS_UUID_TYPE(type_oid))
 	{
 		/* Integer time types have no distinction between min, max and
 		 * infinity. We don't want min and max to be turned into infinity for
@@ -189,6 +192,30 @@ ts_time_value_to_internal(Datum time_val, Oid type_oid)
 			res = DirectFunctionCall1(ts_pg_timestamp_to_unix_microseconds, tz);
 
 			return DatumGetInt64(res);
+		case UUIDOID:
+		{
+			uint64 unixtime_ms = 0;
+
+			/*
+			 * Extract the unix timestamp from the UUID. Note that we cannot
+			 * use the (optional) sub-milliseconds part because there is no
+			 * way to know whether it represents time or is random.
+			 *
+			 * If the UUID is not v7, error out.
+			 */
+			if (!ts_uuid_v7_extract_unixtime(DatumGetUUIDP(time_val), &unixtime_ms, NULL))
+			{
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s is not a version 7 UUID",
+							   DatumGetCString(DirectFunctionCall1(uuid_out, time_val))),
+						errdetail(
+							"UUID \"time\" partitioning columns only support version 7 UUIDs."));
+			}
+
+			/* Convert to microseconds */
+			return unixtime_ms * 1000;
+		}
 		default:
 			elog(ERROR, "unknown time type \"%s\"", format_type_be(type_oid));
 			return -1;
@@ -258,6 +285,16 @@ ts_time_value_to_internal_or_infinite(Datum time_val, Oid type_oid)
 				}
 			}
 
+			/*
+			 * Timestamp is valid in PostgreSQL but exceeds TimescaleDB's
+			 * supported range (TS_TIMESTAMP_END < END_TIMESTAMP due to the
+			 * Unix epoch shift). Treat as +infinity to avoid errors during
+			 * chunk exclusion. No equivalent check is needed on the lower
+			 * bound since TS_TIMESTAMP_MIN == MIN_TIMESTAMP.
+			 */
+			if (ts >= TS_TIMESTAMP_END)
+				return PG_INT64_MAX;
+
 			return ts_time_value_to_internal(time_val, type_oid);
 		}
 		case TIMESTAMPTZOID:
@@ -275,6 +312,10 @@ ts_time_value_to_internal_or_infinite(Datum time_val, Oid type_oid)
 				}
 			}
 
+			/* See comment in TIMESTAMPOID case above. */
+			if (ts >= TS_TIMESTAMP_END)
+				return PG_INT64_MAX;
+
 			return ts_time_value_to_internal(time_val, type_oid);
 		}
 		case DATEOID:
@@ -291,6 +332,10 @@ ts_time_value_to_internal_or_infinite(Datum time_val, Oid type_oid)
 					return PG_INT64_MAX;
 				}
 			}
+
+			/* See comment in TIMESTAMPOID case above. */
+			if (d >= TS_DATE_END)
+				return PG_INT64_MAX;
 
 			return ts_time_value_to_internal(time_val, type_oid);
 		}
@@ -338,6 +383,17 @@ ts_internal_to_time_value(int64 value, Oid type)
 			return DirectFunctionCall1(ts_pg_unix_microseconds_to_timestamp, Int64GetDatum(value));
 		case DATEOID:
 			return DirectFunctionCall1(ts_pg_unix_microseconds_to_date, Int64GetDatum(value));
+		case UUIDOID:
+		{
+			/*
+			 * Convert the internal unixtime in ms to a UUID with the
+			 * non-timestamp bits set to zero. We do not set the version
+			 * either, because for ranges we only care about the prefix in
+			 * order to divide the whole UUID space into a set of slices.
+			 */
+			const pg_uuid_t *uuid = ts_create_uuid_v7_from_unixtime_us(value, true, false);
+			return UUIDPGetDatum(uuid);
+		}
 		default:
 			if (ts_type_is_int8_binary_compatible(type))
 				return Int64GetDatum(value);
@@ -365,6 +421,7 @@ ts_internal_to_time_int64(int64 value, Oid type)
 			return value;
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
+		case UUIDOID:
 			/* we continue ts_time_value_to_internal's incorrect handling of TIMESTAMPs for
 			 * compatibility */
 			return DatumGetInt64(
@@ -381,16 +438,23 @@ ts_internal_to_time_int64(int64 value, Oid type)
 }
 
 TSDLLEXPORT char *
-ts_internal_to_time_string(int64 value, Oid type)
+ts_datum_to_string(Datum value, Oid type)
 {
-	Datum time_datum = ts_internal_to_time_value(value, type);
 	Oid typoutputfunc;
 	bool typIsVarlena;
 	FmgrInfo typoutputinfo;
 
 	getTypeOutputInfo(type, &typoutputfunc, &typIsVarlena);
 	fmgr_info(typoutputfunc, &typoutputinfo);
-	return OutputFunctionCall(&typoutputinfo, time_datum);
+	return OutputFunctionCall(&typoutputinfo, value);
+}
+
+TSDLLEXPORT char *
+ts_internal_to_time_string(int64 value, Oid type)
+{
+	Datum time_datum = ts_internal_to_time_value(value, type);
+
+	return ts_datum_to_string(time_datum, type);
 }
 
 TS_FUNCTION_INFO_V1(ts_pg_unix_microseconds_to_interval);
@@ -761,14 +825,27 @@ ts_get_appendrelinfo(PlannerInfo *root, Index rti, bool missing_ok)
  * This function was moved to postgres main in PG13 but was removed
  * again in PG15. So we use our own implementation for PG15+.
  */
-Expr *
-ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+EquivalenceMember *
+ts_find_em_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 {
+	EquivalenceMember *em;
+#if PG18_GE
+	/* Use specialized iterator to include child ems.
+	 *
+	 * https://github.com/postgres/postgres/commit/d69d45a5
+	 */
+	EquivalenceMemberIterator it;
+
+	setup_eclass_member_iterator(&it, ec, bms_make_singleton(rel->relid));
+	while ((em = eclass_member_iterator_next(&it)) != NULL)
+	{
+#else
 	ListCell *lc_em;
 
 	foreach (lc_em, ec->ec_members)
 	{
-		EquivalenceMember *em = lfirst(lc_em);
+		em = lfirst(lc_em);
+#endif
 
 		if (bms_is_subset(em->em_relids, rel->relids) && !bms_is_empty(em->em_relids))
 		{
@@ -777,12 +854,19 @@ ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 			 * taken entirely from this relation, we'll be content to choose
 			 * any one of those.
 			 */
-			return em->em_expr;
+			return em;
 		}
 	}
 
-	/* We didn't find any suitable equivalence class expression */
+	/* We didn't find any suitable equivalence class member */
 	return NULL;
+}
+
+Expr *
+ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+{
+	EquivalenceMember *em = ts_find_em_for_rel(ec, rel);
+	return em ? em->em_expr : NULL;
 }
 
 bool
@@ -926,16 +1010,28 @@ ts_subtract_integer_from_now(PG_FUNCTION_ARGS)
 	const Dimension *dim = hyperspace_get_open_dimension(ht->space, 0);
 
 	if (!dim)
-		elog(ERROR, "hypertable has no open partitioning dimension");
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("hypertable has no open partitioning dimension")));
+	}
 
 	Oid partitioning_type = ts_dimension_get_partition_type(dim);
 
 	if (!IS_INTEGER_TYPE(partitioning_type))
-		elog(ERROR, "hypertable has no integer partitioning dimension");
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("hypertable has no integer partitioning dimension")));
+	}
 
 	Oid now_func = ts_get_integer_now_func(dim, true);
 	if (!OidIsValid(now_func))
-		elog(ERROR, "could not find valid integer_now function for hypertable");
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not find valid integer_now function for hypertable")));
+	}
 
 	int64 res = ts_sub_integer_from_now(lag, partitioning_type, now_func);
 	ts_cache_release(&hcache);
@@ -1223,7 +1319,7 @@ ts_hypertable_approximate_size(PG_FUNCTION_ARGS)
 	init_scan_by_hypertable_id(&iterator, ht->fd.id);
 	ts_scanner_foreach(&iterator)
 	{
-		bool isnull, dropped, is_osm_chunk;
+		bool isnull, is_osm_chunk;
 		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
 		Datum id = slot_getattr(ti->slot, Anum_chunk_id, &isnull);
 		Datum comp_id = DatumGetInt32(slot_getattr(ti->slot, Anum_chunk_id, &isnull));
@@ -1232,12 +1328,6 @@ ts_hypertable_approximate_size(PG_FUNCTION_ARGS)
 		RelationSize chunk_relsize, compressed_chunk_relsize;
 
 		if (isnull)
-			continue;
-
-		/* only consider chunks that are not dropped */
-		dropped = DatumGetBool(slot_getattr(ti->slot, Anum_chunk_dropped, &isnull));
-		Assert(!isnull);
-		if (dropped)
 			continue;
 
 		chunk_id = DatumGetInt32(id);
@@ -1624,106 +1714,6 @@ ts_table_has_tuples(Oid table_relid, LOCKMODE lockmode)
 }
 
 /*
- * This is copied from PostgreSQL 16.0 since versions before 16.0 does not
- * support lists for privileges.
- */
-static AclMode
-ts_convert_any_priv_string(text *priv_type_text, const priv_map *privileges)
-{
-	AclMode result = 0;
-	char *priv_type = text_to_cstring(priv_type_text);
-	char *chunk;
-	char *next_chunk;
-
-	/* We rely on priv_type being a private, modifiable string */
-	for (chunk = priv_type; chunk; chunk = next_chunk)
-	{
-		int chunk_len;
-		const priv_map *this_priv;
-
-		/* Split string at commas */
-		next_chunk = strchr(chunk, ',');
-		if (next_chunk)
-			*next_chunk++ = '\0';
-
-		/* Drop leading/trailing whitespace in this chunk */
-		while (*chunk && isspace((unsigned char) *chunk))
-			chunk++;
-		chunk_len = strlen(chunk);
-		while (chunk_len > 0 && isspace((unsigned char) chunk[chunk_len - 1]))
-			chunk_len--;
-		chunk[chunk_len] = '\0';
-
-		/* Match to the privileges list */
-		for (this_priv = privileges; this_priv->name; this_priv++)
-		{
-			if (pg_strcasecmp(this_priv->name, chunk) == 0)
-			{
-				result |= this_priv->value;
-				break;
-			}
-		}
-		if (!this_priv->name)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unrecognized privilege type: \"%s\"", chunk)));
-	}
-
-	pfree(priv_type);
-	return result;
-}
-
-/*
- * This is copied from PostgreSQL 16.0 since versions before 16.0 does not
- * support lists for privileges but we need that.
- */
-Datum
-ts_makeaclitem(PG_FUNCTION_ARGS)
-{
-	Oid grantee = PG_GETARG_OID(0);
-	Oid grantor = PG_GETARG_OID(1);
-	text *privtext = PG_GETARG_TEXT_PP(2);
-	bool goption = PG_GETARG_BOOL(3);
-	AclItem *result;
-	AclMode priv;
-	static const priv_map any_priv_map[] = {
-		{ "SELECT", ACL_SELECT },
-		{ "INSERT", ACL_INSERT },
-		{ "UPDATE", ACL_UPDATE },
-		{ "DELETE", ACL_DELETE },
-		{ "TRUNCATE", ACL_TRUNCATE },
-		{ "REFERENCES", ACL_REFERENCES },
-		{ "TRIGGER", ACL_TRIGGER },
-		{ "EXECUTE", ACL_EXECUTE },
-		{ "USAGE", ACL_USAGE },
-		{ "CREATE", ACL_CREATE },
-		{ "TEMP", ACL_CREATE_TEMP },
-		{ "TEMPORARY", ACL_CREATE_TEMP },
-		{ "CONNECT", ACL_CONNECT },
-#if PG16_GE
-		{ "SET", ACL_SET },
-		{ "ALTER SYSTEM", ACL_ALTER_SYSTEM },
-#endif
-#if PG17_GE
-		{ "MAINTAIN", ACL_MAINTAIN },
-#endif
-		{ "RULE", 0 }, /* ignore old RULE privileges */
-		{ NULL, 0 }
-	};
-
-	priv = ts_convert_any_priv_string(privtext, any_priv_map);
-
-	result = (AclItem *) palloc(sizeof(AclItem));
-
-	result->ai_grantee = grantee;
-	result->ai_grantor = grantor;
-
-	ACLITEM_SET_PRIVS_GOPTIONS(*result, priv, (goption ? priv : ACL_NO_RIGHTS));
-
-	PG_RETURN_ACLITEM_P(result);
-}
-
-/*
  * heap_form_tuple using NullableDatum array instead of two arrays for
  * values and nulls
  */
@@ -1759,33 +1749,10 @@ ts_update_placeholder(PG_FUNCTION_ARGS)
 /*
  * Get relation information from the syscache in one call.
  *
- * Returns relkind and access method used. Both are non-optional.
+ * Returns relid and relkind. All are non-optional.
  */
 void
-ts_get_rel_info(Oid relid, Oid *amoid, char *relkind)
-{
-	HeapTuple tuple;
-	Form_pg_class cform;
-
-	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", relid);
-
-	cform = (Form_pg_class) GETSTRUCT(tuple);
-	*amoid = cform->relam;
-	*relkind = cform->relkind;
-	ReleaseSysCache(tuple);
-}
-
-/*
- * Get relation information from the syscache in one call.
- *
- * Returns relid, relkind and access method used. All are non-optional.
- */
-void
-ts_get_rel_info_by_name(const char *relnamespace, const char *relname, Oid *relid, Oid *amoid,
-						char *relkind)
+ts_get_rel_info_by_name(const char *relnamespace, const char *relname, Oid *relid, char *relkind)
 {
 	HeapTuple tuple;
 	Form_pg_class cform;
@@ -1798,7 +1765,6 @@ ts_get_rel_info_by_name(const char *relnamespace, const char *relname, Oid *reli
 
 	cform = (Form_pg_class) GETSTRUCT(tuple);
 	*relid = cform->oid;
-	*amoid = cform->relam;
 	*relkind = cform->relkind;
 	ReleaseSysCache(tuple);
 }
@@ -1820,20 +1786,6 @@ ts_get_rel_am(Oid relid)
 	ReleaseSysCache(tuple);
 
 	return amoid;
-}
-
-static Oid hypercore_amoid = InvalidOid;
-
-bool
-ts_is_hypercore_am(Oid amoid)
-{
-	if (!OidIsValid(hypercore_amoid))
-		hypercore_amoid = get_table_am_oid(TS_HYPERCORE_TAM_NAME, true);
-
-	if (!OidIsValid(amoid) || !OidIsValid(hypercore_amoid))
-		return false;
-
-	return amoid == hypercore_amoid;
 }
 
 /*
@@ -1871,7 +1823,7 @@ relation_set_reloption_impl(Relation rel, List *options, LOCKMODE lockmode)
 
 	/* Generate new proposed reloptions (text array) */
 	Datum newOptions =
-		transformRelOptions(isnull ? (Datum) 0 : datum, options, NULL, NULL, false, false);
+		transformRelOptions(isnull ? UnassignedDatum : datum, options, NULL, NULL, false, false);
 	(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
 
 	if (newOptions)
@@ -1992,4 +1944,65 @@ ts_get_attr_expr(Relation rel, AttrNumber attno)
 	}
 
 	return expr;
+}
+
+char *
+ts_list_to_string(List *list, append_cell_func append)
+{
+	StringInfoData info;
+	ListCell *lc;
+
+	initStringInfo(&info);
+
+	foreach (lc, list)
+	{
+		if (!lnext(list, lc))
+			appendStringInfoString(&info, "and ");
+		append(&info, lc);
+		if (lnext(list, lc))
+		{
+			if (list_length(list) > 2)
+				appendStringInfoChar(&info, ',');
+			appendStringInfoChar(&info, ' ');
+		}
+	}
+	return info.data;
+}
+
+typedef struct FindAggrefsContext
+{
+	List *aggrefs; /* all non-nested Aggrefs found in a node */
+} FindAggrefsContext;
+
+static bool
+find_aggrefs_walker(Node *node, FindAggrefsContext *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		context->aggrefs = lappend(context->aggrefs, node);
+		/* don't recurse inside Aggrefs */
+		return false;
+	}
+
+	return expression_tree_walker(node, find_aggrefs_walker, context);
+}
+
+List *
+ts_find_aggrefs(Node *node)
+{
+	FindAggrefsContext agg_ctx = { .aggrefs = NULL };
+	find_aggrefs_walker(node, &agg_ctx);
+	return agg_ctx.aggrefs;
+}
+
+bool
+ts_is_time_bucket_function(Expr *node)
+{
+	if (IsA(node, FuncExpr) &&
+		strncmp(get_func_name(castNode(FuncExpr, node)->funcid), "time_bucket", NAMEDATALEN) == 0)
+		return true;
+
+	return false;
 }

@@ -2,7 +2,7 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
-\set EXPLAIN_ANALYZE 'EXPLAIN (analyze,costs off,timing off,summary off)'
+\set EXPLAIN_ANALYZE 'EXPLAIN (analyze,buffers off, costs off,timing off,summary off)'
 
 CREATE TABLE continuous_agg_test(time int, data int);
 SELECT create_hypertable('continuous_agg_test', 'time', chunk_time_interval=> 10);
@@ -10,25 +10,17 @@ CREATE OR REPLACE FUNCTION integer_now_test1() returns int LANGUAGE SQL STABLE a
 SELECT set_integer_now_func('continuous_agg_test', 'integer_now_test1');
 
 -- watermark tabels start out empty
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- inserting into a table that does not have continuous_agg_insert_trigger doesn't change the watermark
 INSERT INTO continuous_agg_test VALUES (10, 1), (11, 2), (21, 3), (22, 4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
-\c :TEST_DBNAME :ROLE_SUPERUSER
-CREATE TABLE continuous_agg_test_mat(time int);
-SELECT create_hypertable('continuous_agg_test_mat', 'time', chunk_time_interval=> 10);
-INSERT INTO _timescaledb_catalog.continuous_agg VALUES (2, 1, NULL, '', '', '', '', '', '');
-\c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
-
--- create the trigger
-CREATE TRIGGER continuous_agg_insert_trigger
-    AFTER INSERT ON continuous_agg_test
-    FOR EACH ROW EXECUTE FUNCTION _timescaledb_functions.continuous_agg_invalidation_trigger(1);
+CREATE MATERIALIZED VIEW cagg1 WITH (tsdb.continuous, tsdb.materialized_only=false)
+  AS SELECT time_bucket('5', time) FROM continuous_agg_test GROUP BY 1 WITH NO DATA;
 
 -- inserting into the table still doesn't change the watermark since there's no
 -- continuous_aggs_invalidation_threshold. We treat that case as a invalidation_watermark of
@@ -36,66 +28,66 @@ CREATE TRIGGER continuous_agg_insert_trigger
 -- entire table anyway.
 INSERT INTO continuous_agg_test VALUES (10, 1), (11, 2), (21, 3), (22, 4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- set the continuous_aggs_invalidation_threshold to 15, any insertions below that value need an invalidation
 \c :TEST_DBNAME :ROLE_SUPERUSER
-INSERT INTO _timescaledb_catalog.continuous_aggs_invalidation_threshold VALUES (1, 15);
+UPDATE _timescaledb_catalog.continuous_aggs_invalidation_threshold SET watermark = 15 WHERE hypertable_id = 1;
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 
 INSERT INTO continuous_agg_test VALUES (10, 1), (11, 2), (21, 3), (22, 4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- INSERTs only above the continuous_aggs_invalidation_threshold won't change the continuous_aggs_hypertable_invalidation_log
 INSERT INTO continuous_agg_test VALUES (21, 3), (22, 4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- INSERTs only below the continuous_aggs_invalidation_threshold will change the continuous_aggs_hypertable_invalidation_log
 INSERT INTO continuous_agg_test VALUES (10, 1), (11, 2);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- test INSERTing other values
 INSERT INTO continuous_agg_test VALUES (1, 7), (12, 6), (24, 5), (51, 4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- INSERT after dropping a COLUMN
 ALTER TABLE continuous_agg_test DROP COLUMN data;
 
 INSERT INTO continuous_agg_test VALUES (-1), (-2), (-3), (-4);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 INSERT INTO continuous_agg_test VALUES (100);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- INSERT after adding a COLUMN
 ALTER TABLE continuous_agg_test ADD COLUMN d BOOLEAN;
 
 INSERT INTO continuous_agg_test VALUES (-6, true), (-7, false), (-3, true), (-4, false);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 INSERT INTO continuous_agg_test VALUES (120, false), (200, true);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 DELETE FROM _timescaledb_catalog.continuous_agg where mat_hypertable_id =  2;
-DELETE FROM _timescaledb_config.bgw_job WHERE id = 2;
+DELETE FROM _timescaledb_catalog.bgw_job WHERE id = 2;
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 
 DROP TABLE continuous_agg_test CASCADE;
@@ -118,8 +110,8 @@ CREATE MATERIALIZED VIEW cit_view
 
 INSERT INTO ca_inval_test SELECT generate_series(0, 5);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 UPDATE _timescaledb_catalog.continuous_aggs_invalidation_threshold
@@ -129,13 +121,13 @@ WHERE hypertable_id = 3;
 
 INSERT INTO ca_inval_test SELECT generate_series(5, 15);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 INSERT INTO ca_inval_test SELECT generate_series(16, 20);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 TRUNCATE _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
@@ -151,8 +143,8 @@ UPDATE ca_inval_test SET time = 12 WHERE time = 16;
 UPDATE ca_inval_test SET time = 19 WHERE time = 18;
 UPDATE ca_inval_test SET time = 17 WHERE time = 19;
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 DROP TABLE ca_inval_test CASCADE;
 \c :TEST_DBNAME :ROLE_SUPERUSER
@@ -174,8 +166,8 @@ CREATE MATERIALIZED VIEW continuous_view
         FROM ts_continuous_test
         GROUP BY 1 WITH NO DATA;
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 UPDATE _timescaledb_catalog.continuous_aggs_invalidation_threshold
@@ -185,16 +177,16 @@ WHERE hypertable_id = 5;
 
 INSERT INTO ts_continuous_test VALUES (1, 1);
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 -- aborts don't get written
 BEGIN;
     INSERT INTO ts_continuous_test VALUES (-20, -20);
 ABORT;
 
-SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold;
-SELECT * from _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold ORDER BY 1,2;
+SELECT * FROM _timescaledb_catalog.continuous_aggs_hypertable_invalidation_log ORDER BY 1,2,3;
 
 DROP TABLE ts_continuous_test CASCADE;
 
@@ -585,3 +577,302 @@ other AS (
     SELECT * FROM generate_series(1,10)
 )
 SELECT * FROM cagg, other WHERE time_bucket > 10;
+
+-- test error handling
+\set ON_ERROR_STOP 0
+SELECT _timescaledb_functions.cagg_watermark(-1);
+SELECT COALESCE(_timescaledb_functions.cagg_watermark(-1),12);
+SELECT _timescaledb_functions.cagg_watermark_materialized(-1);
+SELECT COALESCE(_timescaledb_functions.cagg_watermark_materialized(-1),12);
+\set ON_ERROR_STOP 1
+
+
+-- Issue #3805 and related: Offset not handled correctly in calculating watermark
+-- and refresh windows
+
+CREATE TABLE metric_data(
+      to_ts       TIMESTAMPTZ NOT NULL,
+      id          INTEGER     NOT NULL,
+      duration_ms BIGINT      NOT NULL
+  );
+
+SELECT create_hypertable('metric_data', 'to_ts');
+
+--timezone (variable) cagg with offset
+CREATE MATERIALIZED VIEW metric_cagg_24h
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 day', to_ts, timezone => 'Europe/Stockholm', "offset" => INTERVAL '18 hours') AS to_ts_24h,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_24h, id
+WITH NO DATA;
+
+--no timezone, fix-bucket cagg, with offset
+CREATE MATERIALIZED VIEW metric_cagg_24h_no_tz
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 day', to_ts, "offset" => INTERVAL '18 hours') AS to_ts_24h,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_24h, id
+WITH NO DATA;
+
+
+
+SET timezone = 'UTC';
+
+
+INSERT INTO metric_data VALUES
+    ('2026-01-23 18:00+00', 1, 1000),
+    ('2026-01-24 10:00+00', 1, 2000);
+
+--invalidation and watermark before refresh
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(lowest_modified_value) AS lowest_ts,
+        _timescaledb_functions.to_timestamp(greatest_modified_value) AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+SELECT
+    CASE WHEN lowest_modified_value <= _timescaledb_functions.get_internal_time_min('timestamptz'::regtype)
+        THEN '-infinity'::timestamptz
+        ELSE _timescaledb_functions.to_timestamp(lowest_modified_value)
+    END AS lowest_ts,
+    CASE WHEN greatest_modified_value >= _timescaledb_functions.get_internal_time_max('timestamptz'::regtype)
+        THEN 'infinity'::timestamptz
+        ELSE _timescaledb_functions.to_timestamp(greatest_modified_value)
+    END AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold
+WHERE hypertable_id = (
+    SELECT raw_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+CALL refresh_continuous_aggregate('metric_cagg_24h', '2026-01-20 15:00:00+00', '2026-01-26 15:00:00+00');
+CALL refresh_continuous_aggregate('metric_cagg_24h_no_tz', '2026-01-20 15:00:00+00', '2026-01-26 15:00:00+00');
+
+SELECT * FROM metric_data;
+
+SELECT * FROM metric_cagg_24h;
+
+SELECT * from metric_cagg_24h_no_tz;
+
+ALTER MATERIALIZED VIEW metric_cagg_24h SET (timescaledb.materialized_only = false);
+ALTER MATERIALIZED VIEW metric_cagg_24h_no_tz SET (timescaledb.materialized_only = false);
+
+--result should not contain duplicates on the grouping column (bucket and id)
+SELECT * FROM metric_cagg_24h;
+
+--fix-bucket cagg has correct watermark before and after the fix, should be no duplicates
+SELECT * FROM metric_cagg_24h_no_tz;
+
+
+--invalidation log, threshold, and watermark should align
+--at the bucket boundary (i.e, 17th hour UTC (which is 18th hour in Stockholm) of each day)
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(lowest_modified_value) AS lowest_ts,
+        _timescaledb_functions.to_timestamp(greatest_modified_value) AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+SELECT
+    CASE WHEN lowest_modified_value <= _timescaledb_functions.get_internal_time_min('timestamptz'::regtype)
+        THEN '-infinity'::timestamptz
+        ELSE _timescaledb_functions.to_timestamp(lowest_modified_value)
+    END AS lowest_ts,
+    CASE WHEN greatest_modified_value >= _timescaledb_functions.get_internal_time_max('timestamptz'::regtype)
+        THEN 'infinity'::timestamptz
+        ELSE _timescaledb_functions.to_timestamp(greatest_modified_value)
+    END AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold
+WHERE hypertable_id = (
+    SELECT raw_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h'
+);
+
+-- Test origin parameter (same bucket boundaries as offset tests)
+-- origin at 17:00 UTC = 18:00 Stockholm, so buckets align at the same boundary
+
+--timezone (variable) cagg with origin
+CREATE MATERIALIZED VIEW metric_cagg_24h_origin_tz
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 day', to_ts, timezone => 'Europe/Stockholm', origin => '2026-01-01 17:00:00+00') AS to_ts_24h,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_24h, id
+WITH NO DATA;
+
+--no timezone, fix-bucket cagg, with origin
+CREATE MATERIALIZED VIEW metric_cagg_24h_origin_no_tz
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 day', to_ts, origin => '2026-01-01 18:00:00+00') AS to_ts_24h,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_24h, id
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('metric_cagg_24h_origin_tz', '2026-01-20 15:00:00+00', '2026-01-26 15:00:00+00');
+CALL refresh_continuous_aggregate('metric_cagg_24h_origin_no_tz', '2026-01-20 15:00:00+00', '2026-01-26 15:00:00+00');
+
+SELECT * FROM metric_cagg_24h_origin_tz;
+
+SELECT * FROM metric_cagg_24h_origin_no_tz;
+
+ALTER MATERIALIZED VIEW metric_cagg_24h_origin_tz SET (timescaledb.materialized_only = false);
+ALTER MATERIALIZED VIEW metric_cagg_24h_origin_no_tz SET (timescaledb.materialized_only = false);
+
+--result should not contain duplicates on the grouping column (bucket and id)
+SELECT * FROM metric_cagg_24h_origin_tz;
+
+SELECT * FROM metric_cagg_24h_origin_no_tz;
+
+--watermark should align at the bucket boundary
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_origin_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_origin_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(lowest_modified_value) AS lowest_ts,
+        _timescaledb_functions.to_timestamp(greatest_modified_value) AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_origin_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(lowest_modified_value) AS lowest_ts,
+        _timescaledb_functions.to_timestamp(greatest_modified_value) AS greatest_ts
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_origin_no_tz'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold
+WHERE hypertable_id = (
+    SELECT raw_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_24h_origin_tz'
+);
+
+-- Test variable-width bucket (monthly) without timezone, with offset
+-- Monthly bucket with 18h offset: boundaries at 18:00 UTC on the 1st of each month
+-- Data at 2026-02-01 10:00 falls in Jan bucket [2026-01-01 18:00, 2026-02-01 18:00)
+-- This would cause duplicates if watermark doesn't account for offset
+
+INSERT INTO metric_data VALUES ('2026-02-01 10:00+00', 1, 500);
+
+CREATE MATERIALIZED VIEW metric_cagg_monthly_offset
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 month', to_ts, "offset" => INTERVAL '18 hours') AS to_ts_month,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_month, id
+WITH NO DATA;
+
+CREATE MATERIALIZED VIEW metric_cagg_monthly_origin
+WITH (timescaledb.continuous) AS
+SELECT
+time_bucket(INTERVAL '1 month', to_ts, origin => '2026-01-01 18:00:00+00') AS to_ts_month,
+id,
+SUM(duration_ms) AS duration_ms
+FROM metric_data
+GROUP BY to_ts_month, id
+WITH NO DATA;
+
+CALL refresh_continuous_aggregate('metric_cagg_monthly_offset', '2025-12-01', '2026-02-05');
+CALL refresh_continuous_aggregate('metric_cagg_monthly_origin', '2025-12-01', '2026-02-05');
+
+SELECT * FROM metric_cagg_monthly_offset;
+
+SELECT * FROM metric_cagg_monthly_origin;
+
+ALTER MATERIALIZED VIEW metric_cagg_monthly_offset SET (timescaledb.materialized_only = false);
+ALTER MATERIALIZED VIEW metric_cagg_monthly_origin SET (timescaledb.materialized_only = false);
+
+--result should not contain duplicates on the grouping column (bucket and id)
+SELECT * FROM metric_cagg_monthly_offset;
+
+SELECT * FROM metric_cagg_monthly_origin;
+
+--watermark should align at 2026-02-01 18:00:00+00 (the next month bucket boundary)
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_monthly_offset'
+);
+
+SELECT _timescaledb_functions.to_timestamp(watermark) AS watermark_ts
+FROM _timescaledb_catalog.continuous_aggs_watermark
+WHERE mat_hypertable_id = (
+    SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+    WHERE user_view_name = 'metric_cagg_monthly_origin'
+);
+
+drop table metric_data cascade;

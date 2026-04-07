@@ -282,7 +282,7 @@ FROM cagg, devices
 WHERE devices.device_id = cagg.thermo_id
 GROUP BY 1;
 
-SELECT * FROM cagg_on_cagg;
+SELECT * FROM cagg_on_cagg ORDER BY bucket;
 
 DROP MATERIALIZED VIEW cagg_on_cagg CASCADE;
 
@@ -295,7 +295,7 @@ FROM cagg JOIN devices
 ON devices.device_id = cagg.thermo_id
 GROUP BY 1;
 
-SELECT * FROM cagg_on_cagg_join;
+SELECT * FROM cagg_on_cagg_join ORDER BY bucket;
 
 DROP MATERIALIZED VIEW cagg_on_cagg_join CASCADE;
 
@@ -647,7 +647,7 @@ JOIN devices ON conditions.device_id = devices.device_id
 GROUP BY name, location, bucket
 WITH NO DATA;
 
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+\c :TEST_DBNAME :ROLE_SUPERUSER
 VACUUM ANALYZE;
 \c :TEST_DBNAME :ROLE_DEFAULT_PERM_USER
 

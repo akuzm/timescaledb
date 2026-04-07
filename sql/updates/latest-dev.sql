@@ -1,57 +1,77 @@
-CREATE PROCEDURE _timescaledb_functions.process_hypertable_invalidations(
-    hypertable REGCLASS
-) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';
 
-CREATE PROCEDURE @extschema@.add_process_hypertable_invalidations_policy(
-    hypertable REGCLASS,
-    schedule_interval INTERVAL,
-    if_not_exists BOOL = false,
-    initial_start TIMESTAMPTZ = NULL,
-    timezone TEXT = NULL
-) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';
+DROP PROCEDURE IF EXISTS _timescaledb_functions.repair_relation_acls();
+DROP FUNCTION IF EXISTS _timescaledb_functions.makeaclitem(regrole, regrole, text, bool);
 
-CREATE PROCEDURE @extschema@.remove_process_hypertable_invalidations_policy(
-       hypertable REGCLASS,
-       if_exists BOOL = false
-) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';
-
-DROP PROCEDURE IF EXISTS _timescaledb_functions.policy_compression(job_id INTEGER, config JSONB);
-
-DROP PROCEDURE IF EXISTS _timescaledb_internal.policy_compression_execute(
-INTEGER, INTEGER, ANYELEMENT, INTEGER, BOOLEAN, BOOLEAN, BOOLEAN
-);
-
-DROP PROCEDURE IF EXISTS _timescaledb_functions.policy_compression_execute(
-  INTEGER, INTEGER, ANYELEMENT, INTEGER, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN
-);
-
-CREATE PROCEDURE _timescaledb_functions.policy_compression_execute(
-  job_id              INTEGER,
-  htid                INTEGER,
-  lag                 ANYELEMENT,
-  maxchunks           INTEGER,
-  verbose_log         BOOLEAN,
-  recompress_enabled  BOOLEAN,
-  reindex_enabled     BOOLEAN,
-  use_creation_time   BOOLEAN,
-  useam               BOOLEAN = NULL)
-AS $$
+-- Create watermark record when required. This uses pure SQL to avoid calling
+-- C functions that need catalog access during ALTER EXTENSION UPDATE.
+-- this is only needed for users upgrading from before 2.11.0, as the watermark
+-- was added in that version.
+DO
+$$
+DECLARE
+  ts_version TEXT;
+  cagg_rec RECORD;
+  max_val BIGINT;
+  watermark_val BIGINT;
+  bucket_width_val BIGINT;
 BEGIN
-  -- empty body
+    SELECT extversion INTO ts_version FROM pg_extension WHERE extname = 'timescaledb';
+    IF ts_version < '2.11.0' THEN
+      RETURN;
+    END IF;
+
+    FOR cagg_rec IN
+      SELECT a.mat_hypertable_id,
+             h.schema_name, h.table_name,
+             d.column_name, d.column_type,
+             bf.bucket_width, bf.bucket_fixed_width
+      FROM _timescaledb_catalog.continuous_agg a
+      LEFT JOIN _timescaledb_catalog.continuous_aggs_watermark w ON w.mat_hypertable_id = a.mat_hypertable_id
+      JOIN _timescaledb_catalog.hypertable h ON h.id = a.mat_hypertable_id
+      JOIN _timescaledb_catalog.dimension d ON d.hypertable_id = a.mat_hypertable_id AND d.num_slices IS NULL
+      LEFT JOIN _timescaledb_catalog.continuous_aggs_bucket_function bf ON bf.mat_hypertable_id = a.mat_hypertable_id
+      WHERE w.mat_hypertable_id IS NULL
+      ORDER BY a.mat_hypertable_id
+    LOOP
+      -- Get max value from materialization hypertable converted to internal representation
+      IF cagg_rec.column_type IN ('timestamptz'::regtype, 'timestamp'::regtype, 'date'::regtype) THEN
+        EXECUTE format(
+          'SELECT (pg_catalog.date_part(''epoch'', pg_catalog.max(%I)) * 1000000)::bigint FROM %I.%I',
+          cagg_rec.column_name, cagg_rec.schema_name, cagg_rec.table_name
+        ) INTO max_val;
+      ELSE
+        EXECUTE format(
+          'SELECT pg_catalog.max(%I)::bigint FROM %I.%I',
+          cagg_rec.column_name, cagg_rec.schema_name, cagg_rec.table_name
+        ) INTO max_val;
+      END IF;
+
+      IF max_val IS NULL OR cagg_rec.bucket_width IS NULL OR NOT cagg_rec.bucket_fixed_width THEN
+        -- No data, no bucket function info, or variable-width bucket: use minimum value.
+        -- The next cagg refresh will compute the correct watermark.
+        watermark_val := '-9223372036854775808'::bigint;
+      ELSE
+        -- Fixed-width bucket: watermark is max value + bucket width
+        IF cagg_rec.column_type IN ('timestamptz'::regtype, 'timestamp'::regtype, 'date'::regtype) THEN
+          bucket_width_val := (pg_catalog.date_part('epoch', cagg_rec.bucket_width::interval) * 1000000)::bigint;
+        ELSE
+          bucket_width_val := cagg_rec.bucket_width::bigint;
+        END IF;
+        watermark_val := max_val + bucket_width_val;
+      END IF;
+
+      INSERT INTO _timescaledb_catalog.continuous_aggs_watermark (mat_hypertable_id, watermark)
+      VALUES (cagg_rec.mat_hypertable_id, watermark_val);
+    END LOOP;
 END;
-$$ LANGUAGE PLPGSQL;
+$$;
 
-DROP PROCEDURE @extschema@.refresh_continuous_aggregate(
-    continuous_aggregate REGCLASS,
-    window_start "any",
-    window_end "any",
-    force BOOLEAN
-);
-
-CREATE PROCEDURE @extschema@.refresh_continuous_aggregate(
-    continuous_aggregate     REGCLASS,
-    window_start             "any",
-    window_end               "any",
-    force                    BOOLEAN = FALSE,
-    options                  JSONB = NULL
-) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_update_placeholder';
+-- Cleanup orphaned compression settings
+WITH orphaned_settings AS (
+     SELECT cs.relid, cl.relname
+     FROM _timescaledb_catalog.compression_settings cs
+     LEFT JOIN pg_class cl ON (cs.relid = cl.oid)
+     WHERE cl.relname IS NULL
+)
+DELETE FROM _timescaledb_catalog.compression_settings AS cs
+USING orphaned_settings AS os WHERE cs.relid = os.relid;

@@ -33,13 +33,57 @@ if(NOT GCOV)
 elseif(NOT LCOV)
   message(STATUS "Install lcov to generate code coverage reports")
 else()
-  message(STATUS "Using lcov ${LCOV}:")
-  execute_process(COMMAND ${LCOV} --version)
+  execute_process(
+    COMMAND ${LCOV} --version
+    OUTPUT_VARIABLE LCOV_VERSION_OUTPUT
+    RESULT_VARIABLE LCOV_VERSION_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(LCOV_VERSION_RESULT EQUAL 0)
+    # You might need to parse LCOV_VERSION_OUTPUT to extract just the version
+    # number For example, if the output is "lcov: LCOV version 1.15", you'd
+    # extract "1.15"
+    string(REGEX MATCH "LCOV version ([0-9]+\\.[0-9]+)" LCOV_VERSION_MATCH
+                 "${LCOV_VERSION_OUTPUT}")
+    if(LCOV_VERSION_MATCH)
+      set(LCOV_VERSION ${CMAKE_MATCH_1})
+      message(STATUS "Using lcov ${LCOV}: ${LCOV_VERSION}")
+    else()
+      message(
+        FATAL_ERROR
+          "Could not parse LCOV version from output: ${LCOV_VERSION_OUTPUT}")
+    endif()
+  else()
+    message(
+      FATAL_ERROR
+        "Failed to get LCOV version. Error code: ${LCOV_VERSION_RESULT}")
+  endif()
+
   message(STATUS "Using gcov ${GCOV}:")
   execute_process(COMMAND ${GCOV} --version)
 
   # Final tracefile for code coverage
   set(OUTPUT_FILE "timescaledb-coverage.info")
+
+  # Common options for lcov capture commands. We disable branch coverage for
+  # Assert and Ensure, because these are never supposed to be hit and always
+  # have partial coverage. The ereport macro also has some internal conditions
+  # that lead to partial coverage.
+  set(LCOV_CAPTURE_OPTS
+      --rc
+      lcov_branch_coverage=1
+      --rc
+      "lcov_excl_br_line=Assert\\(|Ensure\\(|ereport\\("
+      --no-external
+      --base-directory
+      ${CMAKE_SOURCE_DIR}
+      --directory
+      ${CMAKE_BINARY_DIR}
+      --gcov-tool
+      ${CMAKE_CURRENT_BINARY_DIR}/gcov)
+
+  if(${LCOV_VERSION} VERSION_GREATER_EQUAL "2.0")
+    list(APPEND LCOV_CAPTURE_OPTS --ignore-errors=mismatch,mismatch)
+  endif()
 
   # Directory where to generate the HTML report
   set(REPORT_DIR "lcov-report")
@@ -55,14 +99,11 @@ else()
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}.base
     COMMENT "Generating code coverage base file"
-    COMMAND
-      ${LCOV} --rc lcov_branch_coverage=1 --capture --initial # Initial run
-      --no-external # Do not include external source files
-      --base-directory ${CMAKE_SOURCE_DIR} --directory ${CMAKE_BINARY_DIR}
-      --output-file ${OUTPUT_FILE}.base --gcov-tool
-      ${CMAKE_CURRENT_BINARY_DIR}/gcov
+    COMMAND ${LCOV} --capture --initial ${LCOV_CAPTURE_OPTS} --output-file
+            ${OUTPUT_FILE}.base
     DEPENDS timescaledb-tsl timescaledb timescaledb-loader
-            ${CMAKE_CURRENT_BINARY_DIR}/gcov)
+            ${CMAKE_CURRENT_BINARY_DIR}/gcov
+    VERBATIM)
 
   add_custom_target(coverage_base DEPENDS ${OUTPUT_FILE}.base)
 
@@ -73,12 +114,10 @@ else()
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}.test
     COMMENT "Generating code coverage test file"
-    COMMAND
-      ${LCOV} --rc lcov_branch_coverage=1 --capture --no-external
-      --base-directory ${CMAKE_SOURCE_DIR} --directory ${CMAKE_BINARY_DIR}
-      --output-file ${OUTPUT_FILE}.test --gcov-tool
-      ${CMAKE_CURRENT_BINARY_DIR}/gcov
-    DEPENDS ${OUTPUT_FILE}.base coverage_base)
+    COMMAND ${LCOV} --capture ${LCOV_CAPTURE_OPTS} --output-file
+            ${OUTPUT_FILE}.test
+    DEPENDS ${OUTPUT_FILE}.base coverage_base
+    VERBATIM)
 
   # Make sure coverage_test runs after tests (installcheck) finish
   add_custom_target(coverage_test DEPENDS ${OUTPUT_FILE}.test)
@@ -89,11 +128,10 @@ else()
   add_custom_command(
     OUTPUT ${OUTPUT_FILE}
     COMMENT "Generating final code coverage file"
-    COMMAND
-      ${LCOV} --rc lcov_branch_coverage=1 --add-tracefile ${OUTPUT_FILE}.base
-      --add-tracefile ${OUTPUT_FILE}.test --output-file ${OUTPUT_FILE}
-      --gcov-tool ${CMAKE_CURRENT_BINARY_DIR}/gcov
-    DEPENDS ${OUTPUT_FILE}.test coverage_test)
+    COMMAND ${LCOV} ${LCOV_CAPTURE_OPTS} --add-tracefile ${OUTPUT_FILE}.base
+            --add-tracefile ${OUTPUT_FILE}.test --output-file ${OUTPUT_FILE}
+    DEPENDS ${OUTPUT_FILE}.test coverage_test
+    VERBATIM)
 
   add_custom_target(coverage_final DEPENDS ${OUTPUT_FILE})
   add_dependencies(coverage_final coverage_test)

@@ -16,6 +16,7 @@
 #include <foreign/foreign.h>
 #include <nodes/extensible.h>
 #include <nodes/pathnodes.h>
+#include <optimizer/paths.h>
 #include <utils/builtins.h>
 #include <utils/datetime.h>
 #include <utils/jsonb.h>
@@ -40,58 +41,11 @@
 #define UnassignedDatum (Datum) 0
 
 static inline int64
-interval_to_usec(Interval *interval)
+interval_to_usec(const Interval *interval)
 {
 	return (interval->month * DAYS_PER_MONTH * USECS_PER_DAY) + (interval->day * USECS_PER_DAY) +
 		   interval->time;
 }
-
-#ifdef TS_DEBUG
-
-static inline const char *
-yes_no(bool value)
-{
-	return value ? "yes" : "no";
-}
-
-/* Convert datum to string using the output function. */
-static inline const char *
-datum_as_string(Oid typid, Datum value, bool is_null)
-{
-	Oid typoutput;
-	bool typIsVarlena;
-
-	if (is_null)
-		return "<NULL>";
-
-	getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
-	return OidOutputFunctionCall(typoutput, value);
-}
-
-static inline const char *
-slot_as_string(TupleTableSlot *slot)
-{
-	StringInfoData info;
-	initStringInfo(&info);
-	appendStringInfoString(&info, "{");
-	for (int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(slot->tts_tupleDescriptor, i);
-
-		if (att->attisdropped)
-			continue;
-		appendStringInfo(&info,
-						 "%s: %s",
-						 NameStr(att->attname),
-						 datum_as_string(att->atttypid, slot->tts_values[i], slot->tts_isnull[i]));
-		if (i + 1 < slot->tts_tupleDescriptor->natts)
-			appendStringInfoString(&info, ", ");
-	}
-	appendStringInfoString(&info, "}");
-	return info.data;
-}
-
-#endif /* TS_DEBUG */
 
 /*
  * Get the function name in a PG_FUNCTION.
@@ -117,9 +71,11 @@ slot_as_string(TupleTableSlot *slot)
 #define MAX(x, y) ((x) > (y) ? x : y)
 #define MIN(x, y) ((x) < (y) ? x : y)
 
-/* Use a special pseudo-random field 4 value to avoid conflicting with user-advisory-locks */
-#define TS_SET_LOCKTAG_ADVISORY(tag, id1, id2, id3)                                                \
-	SET_LOCKTAG_ADVISORY((tag), (id1), (id2), (id3), 29749)
+static inline bool
+contains_volatile_functions_checker(Oid func_id, void *context)
+{
+	return (func_volatile(func_id) == PROVOLATILE_VOLATILE);
+}
 
 /* find the length of a statically sized array */
 #define TS_ARRAY_LEN(array) (sizeof(array) / sizeof(*array))
@@ -146,6 +102,7 @@ extern TSDLLEXPORT int64 ts_interval_value_to_internal(Datum time_val, Oid type_
 extern TSDLLEXPORT Datum ts_internal_to_time_value(int64 value, Oid type);
 extern TSDLLEXPORT int64 ts_internal_to_time_int64(int64 value, Oid type);
 extern TSDLLEXPORT Datum ts_internal_to_interval_value(int64 value, Oid type);
+extern TSDLLEXPORT char *ts_datum_to_string(Datum value, Oid type);
 extern TSDLLEXPORT char *ts_internal_to_time_string(int64 value, Oid type);
 
 /*
@@ -183,6 +140,7 @@ extern TSDLLEXPORT AppendRelInfo *ts_get_appendrelinfo(PlannerInfo *root, Index 
 													   bool missing_ok);
 
 extern TSDLLEXPORT Expr *ts_find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
+extern TSDLLEXPORT EquivalenceMember *ts_find_em_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 
 extern TSDLLEXPORT bool ts_has_row_security(Oid relid);
 
@@ -405,11 +363,14 @@ ts_datum_set_objectid(const AttrNumber attno, NullableDatum *datums, const Oid v
 		datums[AttrNumberGetAttrOffset(attno)].isnull = true;
 }
 
+typedef void (*append_cell_func)(StringInfo, ListCell *);
+
 extern TSDLLEXPORT void ts_get_rel_info_by_name(const char *relnamespace, const char *relname,
-												Oid *relid, Oid *amoid, char *relkind);
-extern TSDLLEXPORT void ts_get_rel_info(Oid relid, Oid *amoid, char *relkind);
+												Oid *relid, char *relkind);
 extern TSDLLEXPORT Oid ts_get_rel_am(Oid relid);
 extern TSDLLEXPORT void ts_relation_set_reloption(Relation rel, List *options, LOCKMODE lockmode);
-extern TSDLLEXPORT bool ts_is_hypercore_am(Oid amoid);
 extern TSDLLEXPORT Jsonb *ts_errdata_to_jsonb(ErrorData *edata, Name proc_schema, Name proc_name);
 extern TSDLLEXPORT char *ts_get_attr_expr(Relation rel, AttrNumber attno);
+extern TSDLLEXPORT char *ts_list_to_string(List *list, append_cell_func append);
+extern TSDLLEXPORT List *ts_find_aggrefs(Node *node);
+extern TSDLLEXPORT bool ts_is_time_bucket_function(Expr *node);

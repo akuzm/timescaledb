@@ -35,16 +35,14 @@ CREATE OR REPLACE FUNCTION _timescaledb_functions.create_compressed_chunk(
 CREATE OR REPLACE FUNCTION @extschema@.compress_chunk(
     uncompressed_chunk REGCLASS,
     if_not_compressed BOOLEAN = true,
-    recompress BOOLEAN = false,
-    hypercore_use_access_method BOOL = NULL
+    recompress BOOLEAN = false
 ) RETURNS REGCLASS AS '@MODULE_PATHNAME@', 'ts_compress_chunk' LANGUAGE C VOLATILE;
 
 -- Alias for compress_chunk above.
 CREATE OR REPLACE PROCEDURE @extschema@.convert_to_columnstore(
     chunk REGCLASS,
     if_not_columnstore BOOLEAN = true,
-    recompress BOOLEAN = false,
-    hypercore_use_access_method BOOL = NULL
+    recompress BOOLEAN = false
 ) AS '@MODULE_PATHNAME@', 'ts_compress_chunk' LANGUAGE C;
 
 CREATE OR REPLACE FUNCTION @extschema@.decompress_chunk(
@@ -57,13 +55,24 @@ CREATE OR REPLACE PROCEDURE @extschema@.convert_to_rowstore(
     if_columnstore BOOLEAN = true
 ) AS '@MODULE_PATHNAME@', 'ts_decompress_chunk' LANGUAGE C;
 
+CREATE OR REPLACE PROCEDURE _timescaledb_functions.rebuild_columnstore(
+    chunk REGCLASS
+) AS '@MODULE_PATHNAME@', 'ts_rebuild_columnstore' LANGUAGE C;
+
+CREATE OR REPLACE PROCEDURE _timescaledb_functions.chunk_rewrite_cleanup()
+LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_chunk_rewrite_cleanup';
+
 CREATE OR REPLACE PROCEDURE @extschema@.merge_chunks(
-   chunk1 REGCLASS, chunk2 REGCLASS
+   chunk1 REGCLASS, chunk2 REGCLASS, concurrently BOOLEAN = false
 ) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_merge_two_chunks';
 
 CREATE OR REPLACE PROCEDURE @extschema@.merge_chunks(
     chunks REGCLASS[]
 ) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_merge_chunks';
+
+CREATE OR REPLACE PROCEDURE @extschema@.merge_chunks_concurrently(
+    chunks REGCLASS[]
+) LANGUAGE C AS '@MODULE_PATHNAME@', 'ts_merge_chunks_concurrently';
 
 CREATE OR REPLACE PROCEDURE @extschema@.split_chunk(
     chunk REGCLASS,
@@ -99,46 +108,6 @@ BEGIN
   PERFORM @extschema@.compress_chunk(chunk, if_not_compressed);
 END$$ SET search_path TO pg_catalog,pg_temp;
 
--- A version of makeaclitem that accepts a comma-separated list of
--- privileges rather than just a single privilege. This is copied from
--- PG16, but since we need to support earlier versions, we provide it
--- with the extension.
---
--- This is intended for internal usage and interface might change.
-CREATE OR REPLACE FUNCTION _timescaledb_functions.makeaclitem(regrole, regrole, text, bool)
-RETURNS AclItem AS '@MODULE_PATHNAME@', 'ts_makeaclitem'
-LANGUAGE C STABLE PARALLEL SAFE STRICT;
-
--- Repair relation ACL by removing roles that do not exist in pg_authid.
-CREATE OR REPLACE PROCEDURE _timescaledb_functions.repair_relation_acls()
-LANGUAGE SQL AS $$
-  WITH
-    badrels AS (
-	SELECT oid::regclass
-	  FROM (SELECT oid, (aclexplode(relacl)).* FROM pg_class) AS rels
-	 WHERE rels.grantee != 0
-	   AND rels.grantee NOT IN (SELECT oid FROM pg_authid)
-    ),
-    pickacls AS (
-      SELECT oid::regclass,
-	     _timescaledb_functions.makeaclitem(
-	         b.grantee,
-		 b.grantor,
-		 string_agg(b.privilege_type, ','),
-		 b.is_grantable
-	     ) AS acl
-	FROM (SELECT oid, (aclexplode(relacl)).* AS a FROM pg_class) AS b
-       WHERE b.grantee IN (SELECT oid FROM pg_authid)
-       GROUP BY oid, b.grantee, b.grantor, b.is_grantable
-    ),
-    cleanacls AS (
-      SELECT oid, array_agg(acl) AS acl FROM pickacls GROUP BY oid
-    )
-  UPDATE pg_class c
-     SET relacl = (SELECT acl FROM cleanacls n WHERE c.oid = n.oid)
-   WHERE oid IN (SELECT oid FROM badrels)
-$$ SET search_path TO pg_catalog, pg_temp;
-
 -- Remove chunk metadata when marked as dropped
 CREATE OR REPLACE FUNCTION _timescaledb_functions.remove_dropped_chunk_metadata(_hypertable_id INTEGER)
 RETURNS INTEGER LANGUAGE plpgsql AS $$
@@ -149,18 +118,10 @@ BEGIN
   FOR _chunk_id IN
     SELECT id FROM _timescaledb_catalog.chunk
     WHERE hypertable_id = _hypertable_id
-    AND dropped IS TRUE
     AND NOT EXISTS (
         SELECT FROM information_schema.tables
         WHERE tables.table_schema = chunk.schema_name
         AND tables.table_name = chunk.table_name
-    )
-    AND NOT EXISTS (
-        SELECT FROM _timescaledb_catalog.hypertable
-        JOIN _timescaledb_catalog.continuous_agg ON continuous_agg.raw_hypertable_id = hypertable.id
-        WHERE hypertable.id = chunk.hypertable_id
-        -- for the old caggs format we need to keep chunk metadata for dropped chunks
-        AND continuous_agg.finalized IS FALSE
     )
   LOOP
     _removed := _removed + 1;
@@ -187,9 +148,6 @@ BEGIN
 
     DELETE FROM _timescaledb_internal.bgw_policy_chunk_stats
     WHERE bgw_policy_chunk_stats.chunk_id = _chunk_id;
-
-    DELETE FROM _timescaledb_catalog.chunk_index
-    WHERE chunk_index.chunk_id = _chunk_id;
 
     DELETE FROM _timescaledb_catalog.compression_chunk_size
     WHERE compression_chunk_size.chunk_id = _chunk_id

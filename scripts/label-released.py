@@ -3,6 +3,7 @@
 Look at commits between the given release and the previous one, and label all
 PRs that made these commits with the "released-..." label.
 """
+
 import os
 import sys
 import argparse
@@ -250,7 +251,7 @@ print()
 
 # Label the PRs in bulk using GraphQL.
 ids = list({pr["id"] for pr in branch_commit_title_to_pr.values()})
-for chunk in more_itertools.chunked(ids, 20):
+for chunk in more_itertools.chunked(ids, 10):
     parts = [
         f'p{j}: addLabelsToLabelable(input: {{labelableId:"{nid}",labelIds:["{label_id}"]}}) {{ clientMutationId }}'
         for j, nid in enumerate(chunk)

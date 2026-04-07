@@ -10,7 +10,7 @@
 -- * attach_foreign_table_chunk
 -- * hypertable_osm_range_update
 
-\set EXPLAIN 'EXPLAIN (COSTS OFF)'
+\set EXPLAIN 'EXPLAIN (BUFFERS OFF, COSTS OFF)'
 
 CREATE OR REPLACE VIEW chunk_view AS
   SELECT
@@ -19,6 +19,8 @@ CREATE OR REPLACE VIEW chunk_view AS
     srcch.table_name AS chunk_name,
     _timescaledb_functions.to_timestamp(dimsl.range_start)
      AS range_start,
+    dimsl.range_start AS range_start_int,
+    dimsl.range_end AS range_end_int,
     _timescaledb_functions.to_timestamp(dimsl.range_end)
      AS range_end
   FROM _timescaledb_catalog.chunk srcch
@@ -30,8 +32,6 @@ CREATE OR REPLACE VIEW chunk_view AS
 GRANT SELECT on chunk_view TO PUBLIC;
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
--- fake presence of timescaledb_osm
-INSERT INTO pg_extension(oid,extname,extowner,extnamespace,extrelocatable,extversion) SELECT 1,'timescaledb_osm',10,11,false,'1.0';
 
 CREATE SCHEMA test1;
 GRANT CREATE ON SCHEMA test1 TO :ROLE_DEFAULT_PERM_USER;
@@ -463,7 +463,7 @@ BEGIN
 		include_tiered_data => include_tiered_data
 	);
 
-	cfg := config FROM _timescaledb_config.bgw_job WHERE id = job_id;
+	cfg := config FROM _timescaledb_catalog.bgw_job WHERE id = job_id;
 	RAISE NOTICE 'config: %', jsonb_pretty(cfg);
 
 	RETURN job_id;
@@ -499,7 +499,7 @@ DO $$
 DECLARE
     r RECORD;
 BEGIN
-	EXPLAIN (COSTS OFF) UPDATE ht_try SET value = 2
+	EXPLAIN (BUFFERS OFF, COSTS OFF) UPDATE ht_try SET value = 2
 	WHERE acq_id = 10 AND timec > now() - '15 years'::interval INTO r;
 END
 $$ LANGUAGE plpgsql;
@@ -553,10 +553,10 @@ SELECT FROM _timescaledb_catalog.chunk_constraint WHERE chunk_id = :osm_chunk_id
 SELECT FROM _timescaledb_catalog.dimension_slice WHERE id = :osm_dimension_slice;
 
 -- foreign chunk no longer appears in the inheritance hierarchy
-\d+ ht_try
+SELECT * FROM test.show_subtables('ht_try');
 
 -- verify that still can read from the table after catalog manipulations
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM ht_try;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT * FROM ht_try;
 ROLLBACK;
 
 -- TEST error out when trying to drop an OSM chunk from a hypertable that
@@ -611,6 +611,8 @@ INSERT INTO hyper_constr VALUES( 10, 200, 22, 1, 111, 44);
 \c postgres_fdw_db :ROLE_4
 CREATE TABLE fdw_hyper_constr(id integer, time bigint, temp float, mid integer, dev integer, devref integer);
 INSERT INTO fdw_hyper_constr VALUES( 10, 100, 33, 2, 222, 55);
+INSERT INTO fdw_hyper_constr VALUES( 10, 300, 44, 2, 333, 30);
+INSERT INTO fdw_hyper_constr VALUES( 10, 400, 55, 2, 444, 40);
 
 \c :TEST_DBNAME :ROLE_4
 -- this is a stand-in for the OSM table
@@ -620,8 +622,10 @@ CREATE FOREIGN TABLE child_hyper_constr
 
 --check constraints are automatically added for the foreign table
 SELECT _timescaledb_functions.attach_osm_table_chunk('hyper_constr', 'child_hyper_constr');
--- was attached with data, so must update the range
-SELECT _timescaledb_functions.hypertable_osm_range_update('hyper_constr', 100, 110);
+SELECT chunk_name, range_start_int, range_end_int
+FROM chunk_view
+WHERE hypertable_name = 'hyper_constr'
+ORDER BY chunk_name;
 
 SELECT table_name, status, osm_chunk
 FROM _timescaledb_catalog.chunk
@@ -630,10 +634,12 @@ WHERE hypertable_id IN (SELECT id from _timescaledb_catalog.hypertable
 ORDER BY table_name;
 
 SELECT * FROM hyper_constr order by time;
+-- TEST verify data from fdw is selected correctly
+SELECT * FROM hyper_constr WHERE time > 200 order by time;
+SELECT * FROM hyper_constr WHERE time > 200 and time < 400 order by time;
 
---verify the check constraint exists on the OSM chunk
-SELECT conname FROM pg_constraint
-where conrelid = 'child_hyper_constr'::regclass ORDER BY 1;
+--TEST verify the check constraint exists on the OSM chunk
+SELECT * FROM test.show_constraints('child_hyper_constr');
 
 -- TEST foreign key trigger: deleting data from foreign table measure
 -- does not error out due to data in osm chunk
@@ -680,7 +686,7 @@ SELECT show_chunks('hyper_constr');
 ROLLBACK;
 CALL run_job(:deljob_id);
 CALL run_job(:deljob_id);
-SELECT chunk_name, range_start, range_end
+SELECT chunk_name
 FROM chunk_view
 WHERE hypertable_name = 'hyper_constr'
 ORDER BY chunk_name;
@@ -842,5 +848,165 @@ DROP EVENT TRIGGER ddl_start_trigger;
 DROP EVENT TRIGGER ddl_end_trigger;
 DROP TABLE ht_try;
 
+--TEST ALTER TABLE propagation with foreign chunks
+\c :TEST_DBNAME :ROLE_4
+CREATE TABLE ht_alter(ts timestamptz) WITH (tsdb.hypertable,tsdb.compress=false);
+
+INSERT INTO ht_alter SELECT '2025-01-01';
+\c postgres_fdw_db :ROLE_4
+CREATE TABLE fdw_ht_alter(ts timestamptz NOT NULL, device text, value float);
+INSERT INTO fdw_ht_alter SELECT '2021-05-05';
+
+\c :TEST_DBNAME :ROLE_4
+-- this is a stand-in for the OSM table
+CREATE FOREIGN TABLE child_ht_alter(ts timestamptz NOT NULL)
+ SERVER s3_server OPTIONS ( schema_name 'public', table_name 'fdw_ht_alter');
+SELECT _timescaledb_functions.attach_osm_table_chunk('ht_alter', 'child_ht_alter');
+
+ALTER TABLE ht_alter SET (autovacuum_enabled = false);
+ALTER TABLE ht_alter RESET (autovacuum_enabled);
+
+-- test DML blocker on frozen chunks
+CREATE TABLE dml_blocks (time timestamptz, device text, value float) WITH (tsdb.hypertable, tsdb.segmentby='device');
+
+-- DML on hypertable before freezing should work
+INSERT INTO dml_blocks VALUES ('2025-01-01','dev1',1.0);
+BEGIN;
+UPDATE dml_blocks SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM dml_blocks WHERE device = 'dev2';
+COPY dml_blocks FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+ROLLBACK;
+SELECT show_chunks('dml_blocks') AS "CHUNK" \gset
+
+-- DML on chunk before freezing should work
+BEGIN;
+INSERT INTO :CHUNK VALUES ('2025-01-01','dev1',1.0);
+UPDATE :CHUNK SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM :CHUNK WHERE device = 'dev2';
+COPY :CHUNK FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+ROLLBACK;
+
+SELECT _timescaledb_functions.freeze_chunk(:'CHUNK');
+
+-- DML on hypertable after freezing should be blocked
+\set ON_ERROR_STOP 0
+INSERT INTO dml_blocks VALUES ('2025-01-01','dev1',1.0);
+UPDATE dml_blocks SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM dml_blocks WHERE device = 'dev2';
+COPY dml_blocks FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+\set ON_ERROR_STOP 1
+
+-- DML on chunk after freezing should be blocked
+\set ON_ERROR_STOP 0
+INSERT INTO :CHUNK VALUES ('2025-01-01','dev1',1.0);
+UPDATE :CHUNK SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM :CHUNK WHERE device = 'dev2';
+COPY :CHUNK FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+\set ON_ERROR_STOP 1
+
+-- repeat tests with compressed chunk
+SELECT _timescaledb_functions.unfreeze_chunk(:'CHUNK');
+SELECT compress_chunk(:'CHUNK');
+SELECT _timescaledb_functions.freeze_chunk(:'CHUNK');
+SELECT format('%I.%I', schema_name, table_name) AS "COMPRESSED_CHUNK" FROM _timescaledb_catalog.chunk ORDER BY id DESC LIMIT 1 \gset
+
+-- DML on hypertable after freezing should be blocked
+\set ON_ERROR_STOP 0
+INSERT INTO dml_blocks VALUES ('2025-01-01','dev1',1.0);
+UPDATE dml_blocks SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM dml_blocks WHERE device = 'dev2';
+COPY dml_blocks FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+\set ON_ERROR_STOP 1
+
+-- DML on chunk after freezing should be blocked
+\set ON_ERROR_STOP 0
+INSERT INTO :CHUNK VALUES ('2025-01-01','dev1',1.0);
+UPDATE :CHUNK SET value = 2.0 WHERE device = 'dev1';
+DELETE FROM :CHUNK WHERE device = 'dev2';
+COPY :CHUNK FROM STDIN;
+2025-01-01	dev1	1.0
+\.
+\set ON_ERROR_STOP 1
+
+-- DML on chunk after freezing should be blocked
+\set ON_ERROR_STOP 0
+INSERT INTO :COMPRESSED_CHUNK SELECT;
+UPDATE :COMPRESSED_CHUNK SET device = 'dev3' WHERE device = 'dev1';
+DELETE FROM :COMPRESSED_CHUNK WHERE device = 'dev1';
+COPY :COMPRESSED_CHUNK FROM STDIN;
+\set ON_ERROR_STOP 1
+
+-- TEST: OSM chunks should NOT be added to publications
+-- Create a new hypertable for publication testing
+\c :TEST_DBNAME :ROLE_4
+CREATE TABLE ht_pub_test(timec timestamptz NOT NULL, device_id int, value float);
+SELECT create_hypertable('ht_pub_test', 'timec', chunk_time_interval => interval '1 day');
+
+-- Insert data to create first normal chunk
+INSERT INTO ht_pub_test VALUES ('2023-01-01 01:00', 1, 10.5);
+
+-- Create publication
+\c :TEST_DBNAME :ROLE_SUPERUSER
+SET timescaledb.enable_chunk_auto_publication = true;
+CREATE PUBLICATION test_pub_osm FOR TABLE ht_pub_test;
+
+-- Verify: 1 normal chunk in publication
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'test_pub_osm'
+ORDER BY schemaname, tablename;
+
+-- Create a new foreign table for OSM testing
+\c :TEST_DBNAME :ROLE_4
+CREATE FOREIGN TABLE osm_chunk_pub_test
+(timec timestamptz NOT NULL, device_id int, value float)
+SERVER s3_server OPTIONS (schema_name 'public', table_name 'fdw_table');
+
+-- Attach OSM chunk
+SELECT _timescaledb_functions.attach_osm_table_chunk('ht_pub_test', 'osm_chunk_pub_test');
+SELECT _timescaledb_functions.hypertable_osm_range_update('ht_pub_test', '2020-01-01'::timestamptz, '2020-01-02');
+
+-- Check chunks also have OSM chunk
+SELECT schema_name, table_name, status, osm_chunk
+FROM _timescaledb_catalog.chunk
+WHERE hypertable_id IN (SELECT id from _timescaledb_catalog.hypertable
+                        WHERE table_name = 'ht_pub_test')
+ORDER BY table_name;
+
+-- Verify: still only 1 normal chunk in publication (OSM chunk NOT added)
+\c :TEST_DBNAME :ROLE_SUPERUSER
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'test_pub_osm'
+ORDER BY schemaname, tablename;
+
+-- Insert data to create second normal chunk
+\c :TEST_DBNAME :ROLE_4
+SET timescaledb.enable_chunk_auto_publication = true;
+INSERT INTO ht_pub_test VALUES ('2023-01-02 01:00', 2, 20.5);
+
+-- Verify: 2 normal chunks in publication (second chunk added, OSM still not)
+\c :TEST_DBNAME :ROLE_SUPERUSER
+SELECT schemaname, tablename
+FROM pg_publication_tables
+WHERE pubname = 'test_pub_osm'
+ORDER BY schemaname, tablename;
+
+-- Cleanup
+DROP PUBLICATION test_pub_osm CASCADE;
+\c :TEST_DBNAME :ROLE_4
+DROP TABLE ht_pub_test CASCADE;
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
 -- clean up databases created
 DROP DATABASE postgres_fdw_db WITH (FORCE);

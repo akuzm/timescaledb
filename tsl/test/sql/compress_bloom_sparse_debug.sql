@@ -42,7 +42,7 @@ select schema_name || '.' || table_name chunk, 'c' column from _timescaledb_cata
 \gset
 
 with col as (
-    select _ts_meta_count rows, _ts_meta_v2_bloom1_:column f, :column cc
+    select _ts_meta_count rows, _ts_meta_v2_bloomh_:column f, :column cc
     from :chunk),
 blooms as (
     select *, (ts_bloom1_debug_info(f)).*, pg_column_compression(f) filter_column_compression,
@@ -66,7 +66,7 @@ group by 1 order by min(bits_total);
 -- read w/o the index to the sum of bytes read by the bloom filter check
 -- and the actual column check.
 with col as (
-    select _ts_meta_count b, _ts_meta_v2_bloom1_:column f, :column cc
+    select _ts_meta_count b, _ts_meta_v2_bloomh_:column f, :column cc
     from :chunk)
 select
     round(
@@ -78,7 +78,7 @@ from col;
 
 -- Compressed bytes-per-value vs bloom filter bytes-per-value.
 with col as (
-    select _ts_meta_count rows, _ts_meta_v2_bloom1_:column f, :column cc
+    select _ts_meta_count rows, _ts_meta_v2_bloomh_:column f, :column cc
     from :chunk)
 select
     round(sum(pg_column_size(cc))::numeric / sum(rows), 2) compressed_bytes_per_row,
@@ -106,3 +106,63 @@ select ts_bloom1_debug_hash(1::float8);
 select ts_bloom1_debug_hash('2025-05-05'::date);
 select ts_bloom1_debug_hash('2025-05-05'::timestamp);
 select ts_bloom1_debug_hash('2025-05-05'::timestamptz);
+
+
+-- The "contains" functions should error out when called with wrong arguments.
+\set ON_ERROR_STOP 0
+
+select _timescaledb_functions.bloom1_contains('\xffffffffffffffff'::_timescaledb_internal.bloom1, 1::bit) ;
+
+select _timescaledb_functions.bloom1_contains_any('\xffffffffffffffff'::_timescaledb_internal.bloom1, array[1::bit]) ;
+
+\set ON_ERROR_STOP 1
+
+
+-- Test that the "contains" function cope with different source chunks.
+create table detoaster(ts int, tag text) with (tsdb.hypertable,
+    tsdb.partition_column = 'ts', tsdb.compress, tsdb.compress_orderby = 'ts')
+;
+
+insert into detoaster select ts, ts::text from generate_series(1, 1000) ts;
+insert into detoaster select ts, ts::text from generate_series(1000001, 1001000) ts;
+
+create index on detoaster(tag);
+
+select count(compress_chunk(x)) from show_chunks('detoaster') x;
+
+with chunks as (
+  select
+    row_number() over (order by table_name) index,
+    schema_name || '.' || table_name chunk
+  from _timescaledb_catalog.chunk
+    where id in (select compressed_chunk_id from _timescaledb_catalog.chunk
+      where hypertable_id = (select id from _timescaledb_catalog.hypertable
+        where table_name = 'detoaster'))
+)
+select max(chunk) filter (where index = 1) chunk1,
+    max(chunk) filter (where index = 2) chunk2
+from chunks
+\gset
+
+select attname column from pg_attribute where attrelid = :'chunk1'::regclass
+  and attname like '_ts_meta_v2_bl%_tag'
+\gset
+
+create view v(f) as (select :column from :chunk1
+    union all select :column from :chunk2);
+
+select
+    _timescaledb_functions.bloom1_contains(f, '1'::text),
+    _timescaledb_functions.bloom1_contains(f, '1000001'::text)
+from v
+;
+
+select (ts_bloom1_debug_info(f)).* from v;
+
+-- test NULL handling
+SELECT _timescaledb_functions.bloom1_contains(NULL, 23);
+SELECT _timescaledb_functions.bloom1_contains(NULL, NULL::int);
+SELECT _timescaledb_functions.bloom1_contains('\xd098c885f08468eb8916751d947f248ed2843a88c02b1dea6228591c588b8068'::_timescaledb_internal.bloom1, NULL::int);
+-- both args NULL but second arg obfuscated through record_in
+SELECT _timescaledb_functions.bloom1_contains(NULL, pg_catalog.record_in(null::cstring, 23::oid, 12::int4));
+

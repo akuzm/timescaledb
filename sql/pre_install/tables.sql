@@ -147,7 +147,6 @@ CREATE TABLE _timescaledb_catalog.chunk (
   schema_name name NOT NULL,
   table_name name NOT NULL,
   compressed_chunk_id integer ,
-  dropped boolean NOT NULL DEFAULT FALSE,
   status integer NOT NULL DEFAULT 0,
   osm_chunk boolean NOT NULL DEFAULT FALSE,
   creation_time timestamptz NOT NULL,
@@ -192,21 +191,6 @@ CREATE SEQUENCE _timescaledb_catalog.chunk_constraint_name;
 
 SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.chunk_constraint_name', '');
 
-CREATE TABLE _timescaledb_catalog.chunk_index (
-  chunk_id integer NOT NULL,
-  index_name name NOT NULL,
-  hypertable_id integer NOT NULL,
-  hypertable_index_name name NOT NULL,
-  -- table constraints
-  CONSTRAINT chunk_index_chunk_id_index_name_key UNIQUE (chunk_id, index_name),
-  CONSTRAINT chunk_index_chunk_id_fkey FOREIGN KEY (chunk_id) REFERENCES _timescaledb_catalog.chunk (id) ON DELETE CASCADE,
-  CONSTRAINT chunk_index_hypertable_id_fkey FOREIGN KEY (hypertable_id) REFERENCES _timescaledb_catalog.hypertable (id) ON DELETE CASCADE
-);
-
-CREATE INDEX chunk_index_hypertable_id_hypertable_index_name_idx ON _timescaledb_catalog.chunk_index (hypertable_id, hypertable_index_name);
-
-SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.chunk_index', '');
-
 -- Track statistics for columns of chunks from a hypertable.
 -- Currently, we track the min/max range for a given column across chunks.
 -- More statistics (like bloom filters) can be added in the future.
@@ -250,17 +234,17 @@ SELECT pg_catalog.pg_extension_config_dump(pg_get_serial_sequence('_timescaledb_
 -- Default jobs are given the id space [1,1000). User-installed jobs and any jobs created inside tests
 -- are given the id space [1000, INT_MAX). That way, we do not pg_dump jobs that are always default-installed
 -- inside other .sql scripts. This avoids insertion conflicts during pg_restore.
-CREATE SEQUENCE _timescaledb_config.bgw_job_id_seq
+CREATE SEQUENCE _timescaledb_catalog.bgw_job_id_seq
 MINVALUE 1000;
 
-SELECT pg_catalog.pg_extension_config_dump('_timescaledb_config.bgw_job_id_seq', '');
+SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.bgw_job_id_seq', '');
 
   -- We put columns that can be null or have variable length
   -- last. This allow us to read the important fields above in the
   -- scheduler without materializing these fields below, which the
   -- scheduler does not neeed.
-CREATE TABLE _timescaledb_config.bgw_job (
-  id integer NOT NULL DEFAULT nextval('_timescaledb_config.bgw_job_id_seq'),
+CREATE TABLE _timescaledb_catalog.bgw_job (
+  id integer NOT NULL DEFAULT nextval('_timescaledb_catalog.bgw_job_id_seq'),
   application_name name NOT NULL,
   schedule_interval interval NOT NULL,
   max_runtime interval NOT NULL,
@@ -282,11 +266,11 @@ CREATE TABLE _timescaledb_config.bgw_job (
   CONSTRAINT bgw_job_hypertable_id_fkey FOREIGN KEY (hypertable_id) REFERENCES _timescaledb_catalog.hypertable (id) ON DELETE CASCADE
 );
 
-ALTER SEQUENCE _timescaledb_config.bgw_job_id_seq OWNED BY _timescaledb_config.bgw_job.id;
+ALTER SEQUENCE _timescaledb_catalog.bgw_job_id_seq OWNED BY _timescaledb_catalog.bgw_job.id;
 
-CREATE INDEX bgw_job_proc_hypertable_id_idx ON _timescaledb_config.bgw_job (proc_schema, proc_name, hypertable_id);
+CREATE INDEX bgw_job_proc_hypertable_id_idx ON _timescaledb_catalog.bgw_job (proc_schema, proc_name, hypertable_id);
 
-SELECT pg_catalog.pg_extension_config_dump('_timescaledb_config.bgw_job', 'WHERE id >= 1000');
+SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.bgw_job', 'WHERE id >= 1000');
 
 CREATE TABLE _timescaledb_internal.bgw_job_stat (
   job_id integer NOT NULL,
@@ -306,7 +290,7 @@ CREATE TABLE _timescaledb_internal.bgw_job_stat (
   flags int NOT NULL DEFAULT 0,
   -- table constraints
   CONSTRAINT bgw_job_stat_pkey PRIMARY KEY (job_id),
-  CONSTRAINT bgw_job_stat_job_id_fkey FOREIGN KEY (job_id) REFERENCES _timescaledb_config.bgw_job (id) ON DELETE CASCADE
+  CONSTRAINT bgw_job_stat_job_id_fkey FOREIGN KEY (job_id) REFERENCES _timescaledb_catalog.bgw_job (id) ON DELETE CASCADE
 );
 
 CREATE SEQUENCE _timescaledb_internal.bgw_job_stat_history_id_seq MINVALUE 1;
@@ -325,7 +309,10 @@ CREATE TABLE _timescaledb_internal.bgw_job_stat_history (
 
 ALTER SEQUENCE _timescaledb_internal.bgw_job_stat_history_id_seq OWNED BY _timescaledb_internal.bgw_job_stat_history.id;
 
-CREATE INDEX bgw_job_stat_history_job_id_idx ON _timescaledb_internal.bgw_job_stat_history (job_id);
+CREATE INDEX bgw_job_stat_history_execution_start_idx
+    ON _timescaledb_internal.bgw_job_stat_history (execution_start);
+CREATE INDEX bgw_job_stat_history_job_id_execution_start_idx
+    ON _timescaledb_internal.bgw_job_stat_history(job_id, execution_start DESC);
 
 --The job_stat table is not dumped by pg_dump on purpose because
 --the statistics probably aren't very meaningful across instances.
@@ -339,7 +326,7 @@ CREATE TABLE _timescaledb_internal.bgw_policy_chunk_stats (
   -- table constraints
   CONSTRAINT bgw_policy_chunk_stats_job_id_chunk_id_key UNIQUE (job_id, chunk_id),
   CONSTRAINT bgw_policy_chunk_stats_chunk_id_fkey FOREIGN KEY (chunk_id) REFERENCES _timescaledb_catalog.chunk (id) ON DELETE CASCADE,
-  CONSTRAINT bgw_policy_chunk_stats_job_id_fkey FOREIGN KEY (job_id) REFERENCES _timescaledb_config.bgw_job (id) ON DELETE CASCADE
+  CONSTRAINT bgw_policy_chunk_stats_job_id_fkey FOREIGN KEY (job_id) REFERENCES _timescaledb_catalog.bgw_job (id) ON DELETE CASCADE
 );
 
 CREATE TABLE _timescaledb_catalog.metadata (
@@ -372,7 +359,6 @@ CREATE TABLE _timescaledb_catalog.continuous_agg (
   direct_view_schema name NOT NULL,
   direct_view_name name NOT NULL,
   materialized_only bool NOT NULL DEFAULT FALSE,
-  finalized bool NOT NULL DEFAULT TRUE,
   -- table constraints
   CONSTRAINT continuous_agg_pkey PRIMARY KEY (mat_hypertable_id),
   CONSTRAINT continuous_agg_partial_view_schema_partial_view_name_key UNIQUE (partial_view_schema, partial_view_name),
@@ -457,6 +443,18 @@ SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.continuous_aggs
 
 CREATE INDEX continuous_aggs_materialization_invalidation_log_idx ON _timescaledb_catalog.continuous_aggs_materialization_invalidation_log (materialization_id, lowest_modified_value ASC);
 
+-- cagg materialization ranges
+CREATE TABLE _timescaledb_catalog.continuous_aggs_materialization_ranges (
+  materialization_id integer,
+  lowest_modified_value bigint NOT NULL,
+  greatest_modified_value bigint NOT NULL,
+  -- table constraints
+  CONSTRAINT continuous_aggs_materialization_ranges_materialization_id_fkey FOREIGN KEY (materialization_id) REFERENCES _timescaledb_catalog.continuous_agg (mat_hypertable_id) ON DELETE CASCADE
+);
+
+SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.continuous_aggs_materialization_ranges', '');
+
+CREATE INDEX continuous_aggs_materialization_ranges_idx ON _timescaledb_catalog.continuous_aggs_materialization_ranges (materialization_id, lowest_modified_value ASC);
 
 /* the source of this data is the enum from the source code that lists
  *  the algorithms. This table is NOT dumped.
@@ -477,6 +475,7 @@ CREATE TABLE _timescaledb_catalog.compression_settings (
   orderby text[],
   orderby_desc bool[],
   orderby_nullsfirst bool[],
+  index jsonb,
   CONSTRAINT compression_settings_pkey PRIMARY KEY (relid),
   CONSTRAINT compression_settings_check_segmentby CHECK (array_ndims(segmentby) = 1),
   CONSTRAINT compression_settings_check_orderby_null CHECK ((orderby IS NULL AND orderby_desc IS NULL AND orderby_nullsfirst IS NULL) OR (orderby IS NOT NULL AND orderby_desc IS NOT NULL AND orderby_nullsfirst IS NOT NULL)),
@@ -511,35 +510,11 @@ CREATE INDEX compression_chunk_size_idx ON _timescaledb_catalog.compression_chun
 
 SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.compression_chunk_size', '');
 
-CREATE TABLE _timescaledb_catalog.continuous_agg_migrate_plan (
-  mat_hypertable_id integer NOT NULL,
-  start_ts TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
-  end_ts TIMESTAMPTZ,
-  user_view_definition TEXT,
-  -- table constraints
-  CONSTRAINT continuous_agg_migrate_plan_pkey PRIMARY KEY (mat_hypertable_id)
+CREATE TABLE _timescaledb_catalog.chunk_rewrite (
+  chunk_relid REGCLASS NOT NULL,
+  new_relid REGCLASS NOT NULL,
+  CONSTRAINT chunk_rewrite_key UNIQUE (chunk_relid)
 );
-
-SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.continuous_agg_migrate_plan', '');
-
-CREATE TABLE _timescaledb_catalog.continuous_agg_migrate_plan_step (
-  mat_hypertable_id integer NOT NULL,
-  step_id serial NOT NULL,
-  status TEXT NOT NULL DEFAULT 'NOT STARTED', -- NOT STARTED, STARTED, FINISHED, CANCELED
-  start_ts TIMESTAMPTZ,
-  end_ts TIMESTAMPTZ,
-  type TEXT NOT NULL,
-  config JSONB,
-  -- table constraints
-  CONSTRAINT continuous_agg_migrate_plan_step_pkey PRIMARY KEY (mat_hypertable_id, step_id),
-  CONSTRAINT continuous_agg_migrate_plan_step_mat_hypertable_id_fkey FOREIGN KEY (mat_hypertable_id) REFERENCES _timescaledb_catalog.continuous_agg_migrate_plan (mat_hypertable_id) ON DELETE CASCADE,
-  CONSTRAINT continuous_agg_migrate_plan_step_check CHECK (start_ts <= end_ts),
-  CONSTRAINT continuous_agg_migrate_plan_step_check2 CHECK (type IN ('CREATE NEW CAGG', 'DISABLE POLICIES', 'COPY POLICIES', 'ENABLE POLICIES', 'SAVE WATERMARK', 'REFRESH NEW CAGG', 'COPY DATA', 'OVERRIDE CAGG', 'DROP OLD CAGG'))
-);
-
-SELECT pg_catalog.pg_extension_config_dump('_timescaledb_catalog.continuous_agg_migrate_plan_step', '');
-
-SELECT pg_catalog.pg_extension_config_dump(pg_get_serial_sequence('_timescaledb_catalog.continuous_agg_migrate_plan_step', 'step_id'), '');
 
 -- Set table permissions
 -- We need to grant SELECT to PUBLIC for all tables even those not
@@ -548,13 +523,9 @@ SELECT pg_catalog.pg_extension_config_dump(pg_get_serial_sequence('_timescaledb_
 -- which objects actually need to be dumped.
 GRANT SELECT ON ALL TABLES IN SCHEMA _timescaledb_catalog TO PUBLIC;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA _timescaledb_config TO PUBLIC;
-
 GRANT SELECT ON ALL TABLES IN SCHEMA _timescaledb_internal TO PUBLIC;
 
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_catalog TO PUBLIC;
-
-GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_config TO PUBLIC;
 
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_internal TO PUBLIC;
 

@@ -1,26 +1,43 @@
-name: Test Update and Downgrade
+name: Update and Downgrade
 "on":
   push:
     branches:
       - main
       - ?.*.x
+      - prerelease_test
   pull_request:
   workflow_dispatch:
 
 jobs:
+  check_paths:
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: >-
+        ${{ github.event_name == 'push'
+          || (steps.filter.outputs.sql == 'true' && !contains(github.event.pull_request.labels.*.name, 'skip-ci'))
+         }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        id: filter
+        with:
+          filters: .github/filters.yaml
+
   update_test:
+    needs: check_paths
+    if: needs.check_paths.outputs.run_ci == 'true'
     name: Update test PG${{ matrix.pg }}
     runs-on: 'ubuntu-latest'
     strategy:
       matrix:
-        pg: [15, 16, 17]
+        pg: [15, 16, 17, 18]
       fail-fast: false
     env:
       PG_VERSION: ${{ matrix.pg }}
       POSTGRES_HOST_AUTH_METHOD: trust
     steps:
     - name: Checkout TimescaleDB
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Install Dependencies
       run: |
@@ -50,8 +67,13 @@ jobs:
       run: |
         find update_test -name "*.diff" | xargs -IFILE sh -c "echo '\nFILE\n';cat FILE"
 
+    - name: Postgres Errors
+      if: failure()
+      run: |
+        find update_test -name postgres.log -exec grep ERROR {} \;
+
     - name: Check for coredumps
-      if: always()
+      if: failure()
       id: collectlogs
       run: |
         # wait for in progress coredumps
@@ -82,14 +104,28 @@ jobs:
 
     - name: Upload Coredumps
       if: always() && steps.collectlogs.outputs.coredumps == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
-        name: Coredumps sqlsmith ${{ matrix.os }} PG${{ matrix.pg }}
+        name: Coredumps update-test ${{ matrix.os }} PG${{ matrix.pg }}
         path: coredumps
 
     - name: Upload Artifacts
-      if: failure()
-      uses: actions/upload-artifact@v4
+      if: always()
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
         name: Update test PG${{ matrix.pg }}
         path: update_test
+
+  report_status:
+    name: Update and Downgrade summary
+    needs: [check_paths, update_test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # If the detector failed, or the matrix failed, exit with error
+          if [[ "${{ needs.update_test.result }}" == "failure" ]]; then
+            exit 1
+          fi
+          echo "All checks passed or were safely skipped."
+

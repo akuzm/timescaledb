@@ -4,6 +4,8 @@
 
 \c :TEST_DBNAME :ROLE_SUPERUSER
 
+set timescaledb.enable_columnarindexscan = off;
+
 -- Uncomment these two settings to run this test with hypercore TAM
 --set timescaledb.default_hypercore_use_access_method=true;
 --set enable_indexscan=off;
@@ -26,39 +28,56 @@ vacuum analyze dvagg;
 
 -- Just the most basic vectorized aggregation query on a table with default
 -- compressed column.
-explain (costs off) select sum(c) from dvagg;
+explain (buffers off, costs off) select sum(c) from dvagg;
 select sum(c) from dvagg;
 
 
 set timescaledb.debug_require_vector_agg = 'require';
----- Uncomment to generate reference
---set timescaledb.debug_require_vector_agg = 'forbid';
---set timescaledb.enable_vectorized_aggregation to off;
+-- Uncomment to generate reference
+--set timescaledb.debug_require_vector_agg = 'forbid'; set timescaledb.enable_vectorized_aggregation to off;
 
--- Vectorized aggregation should work with vectorized filters.
-select sum(c) from dvagg where b >= 0;
-select sum(c) from dvagg where b = 0;
-select sum(c) from dvagg where b in (0, 1);
-select sum(c) from dvagg where b in (0, 1, 3);
-select sum(c) from dvagg where b > 10;
+-- Test vectorized aggregation, filters and expressions with a default column.
+select
+    format('select %s%s from dvagg%s%s%s;',
+            grouping || ', ',
+            function,
+            ' where ' || condition,
+            ' group by ' || grouping,
+            format(' order by %s, ', function) || grouping || ' limit 10')
+from
+    unnest(array[
+        'count(*)',
+        'sum(c)',
+        'sum(b + c)']) function,
+    unnest(array[
+        null,
+        'b >= 0',
+        'b = 0',
+        'b in (0, 1)',
+        'b in (0, 1, 3)',
+        'b > 10',
+        'c != 7',
+        'c > 1000',
+        'c < 1000']) with ordinality as condition(condition, n),
+    unnest(array[
+        null,
+        'b',
+        'c',
+        'b + c']) with ordinality as grouping(grouping, n)
+\gexec
 
-select count(*) from dvagg where b >= 0;
-select count(*) from dvagg where b = 0;
-select count(*) from dvagg where b in (0, 1);
-select count(*) from dvagg where b in (0, 1, 3);
-select count(*) from dvagg where b > 10;
 
-explain (costs off) select sum(c) from dvagg where b in (0, 1, 3);
+explain (buffers off, costs off) select sum(c) from dvagg where b in (0, 1, 3);
 
 select sum(a), sum(b), sum(c) from dvagg where b in (0, 1, 3);
 
-explain (costs off) select sum(a), sum(b), sum(c) from dvagg where b in (0, 1, 3);
+explain (buffers off, costs off) select sum(a), sum(b), sum(c) from dvagg where b in (0, 1, 3);
 
 reset timescaledb.enable_vectorized_aggregation;
 
 
 -- The runtime chunk exclusion should work.
-explain (costs off) select sum(c) from dvagg where a < stable_abs(1000);
+explain (buffers off, costs off) select sum(c) from dvagg where a < stable_abs(1000);
 
 -- The case with HAVING can still be vectorized because it is applied after
 -- final aggregation.
@@ -68,7 +87,7 @@ select sum(c) from dvagg having sum(c) > 0;
 -- Some negative cases.
 set timescaledb.debug_require_vector_agg to 'forbid';
 
-explain (costs off) select sum(c) from dvagg group by grouping sets ((), (a));
+explain (buffers off, costs off) select sum(c) from dvagg group by grouping sets ((), (a));
 
 
 

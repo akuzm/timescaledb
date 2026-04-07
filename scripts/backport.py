@@ -10,7 +10,6 @@ import sys
 from github import Github  # This is PyGithub.
 import requests
 
-
 # Limit our history search and fetch depth to this value, not to get stuck in
 # case of a bug.
 HISTORY_DEPTH = 1000
@@ -47,9 +46,7 @@ def get_referenced_issue(pr_number):
     # We only need the first issue here. We also request only the first 30 labels,
     # because GitHub requires some small restriction there that is counted
     # towards the GraphQL API usage quota.
-    ref_result = run_query(
-        string.Template(
-            """
+    ref_result = run_query(string.Template("""
         query {
             repository(owner: "timescale", name: "timescaledb") {
               pullRequest(number: $pr_number) {
@@ -62,9 +59,7 @@ def get_referenced_issue(pr_number):
               }
             }
           }
-          """
-        ).substitute({"pr_number": pr_number})
-    )
+          """).substitute({"pr_number": pr_number}))
 
     # The above returns:
     # {'data': {'repository': {'pullRequest': {'closingIssuesReferences': {'nodes': [{'number': 6819,
@@ -93,22 +88,19 @@ def set_auto_merge(pr_number):
 
     # We first have to find out the PR id, which is some base64 string, different
     # from its number.
-    query = string.Template(
-        """query {
+    query = string.Template("""query {
           repository(owner: "$owner", name: "$name") {
             pullRequest(number: $pr_number) {
               id
             }
           }
-        }"""
-    ).substitute(
+        }""").substitute(
         pr_number=pr_number, owner=source_repo.owner.login, name=source_repo.name
     )
     result = run_query(query)
     pr_id = result["data"]["repository"]["pullRequest"]["id"]
 
-    query = string.Template(
-        """mutation {
+    query = string.Template("""mutation {
             enablePullRequestAutoMerge(
                 input: {
                     pullRequestId: "$pr_id",
@@ -117,8 +109,7 @@ def set_auto_merge(pr_number):
             ) {
                 clientMutationId
             }
-        }"""
-    ).substitute(pr_id=pr_id)
+        }""").substitute(pr_id=pr_id)
     run_query(query)
 
 
@@ -238,9 +229,7 @@ def should_backport_by_labels(number, title, labels):
         )
         return False
 
-    force_labels = labels.intersection(
-        ["bug", "force-auto-backport", "force-auto-backport-workflow"]
-    )
+    force_labels = labels.intersection(["bug", "force-auto-backport"])
     if force_labels:
         print(
             f"#{number} '{title}' is labeled as '{list(force_labels)[0]}' which requests automated backporting."
@@ -476,29 +465,7 @@ for index, pr_info in enumerate(
         report_backport_not_done(original_pr, "cherry-pick failed", details)
         continue
 
-    # We don't have the permission to modify workflows
     changed_files = {file.filename for file in original_pr.get_files()}
-    changed_workflow_files = {
-        filename
-        for filename in changed_files
-        if filename.startswith(".github/workflows/")
-    }
-
-    if changed_workflow_files:
-        pull_labels = {label.name for label in original_pr.labels}
-        force_workflow_label = pull_labels.intersection(
-            ["force-auto-backport-workflow"]
-        )
-        if not force_workflow_label:
-            details = (
-                f"The PR touches a workflow file '{list(changed_workflow_files)[0]}' "
-                " and cannot be backported automatically"
-            )
-            report_backport_not_done(original_pr, "backport failed", details)
-            continue
-        print(
-            f"PR #{original_pr.number} '{original_pr.title}' touches a workflow file, but will be backported anyway."
-        )
 
     # Push the backport branch.
     git_check(f"push {source_remote} @:refs/heads/{backport_branch}")
@@ -546,7 +513,7 @@ for index, pr_info in enumerate(
     original_description = re.sub(
         r"((fix|clos|resolv)[esd]+)(\s+#[0-9]+)",
         r"`\1`\3",
-        original_pr.body,
+        original_pr.body or "",  # Match "" if pr_body is None
         flags=re.IGNORECASE,
     )
     backport_description += (

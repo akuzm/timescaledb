@@ -15,11 +15,10 @@ typedef enum CreateMaterializedViewFlags
 	CreateMaterializedViewFlagCreateGroupIndexes,
 	CreateMaterializedViewFlagMaterializedOnly,
 	CreateMaterializedViewFlagColumnstore,
-	CreateMaterializedViewFlagFinalized,
 	CreateMaterializedViewFlagChunkTimeInterval,
 	CreateMaterializedViewFlagSegmentBy,
 	CreateMaterializedViewFlagOrderBy,
-	CreateMaterializedViewFlagCompressChunkTimeInterval
+	CreateMaterializedViewFlagCompressChunkTimeInterval,
 } CreateMaterializedViewFlags;
 
 extern TSDLLEXPORT WithClauseResult *

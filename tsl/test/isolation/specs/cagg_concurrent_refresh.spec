@@ -113,8 +113,47 @@ setup
       FROM _timescaledb_catalog.continuous_agg
       WHERE user_view_name = cagg
       INTO mattable;
-      EXECUTE format('LOCK table %s IN ROW EXCLUSIVE MODE', mattable);
+      EXECUTE format('LOCK table %s IN SHARE UPDATE EXCLUSIVE MODE', mattable);
     END; $$ LANGUAGE plpgsql;
+
+    CREATE TABLE cancelpid (
+        pid INTEGER NOT NULL PRIMARY KEY
+    );
+    CREATE OR REPLACE PROCEDURE cancelpids() AS
+    $$
+    DECLARE
+        max_attempts INT := 100; -- 2 seconds total (100 * 20ms), enough for 500ms lock_timeout + buffer
+        attempts INT := 0;
+        remaining_pids INT;
+    BEGIN
+        PERFORM pg_cancel_backend(pid) FROM cancelpid;
+        WHILE EXISTS (SELECT FROM pg_stat_activity WHERE pid IN (SELECT pid FROM cancelpid) AND state = 'active') AND attempts < max_attempts
+        LOOP
+            PERFORM pg_sleep(0.02);
+            attempts := attempts + 1;
+        END LOOP;
+        -- Check if any processes are still active after timeout
+        SELECT COUNT(*) INTO remaining_pids
+        FROM pg_stat_activity
+        WHERE pid IN (SELECT pid FROM cancelpid) AND state = 'active';
+        IF remaining_pids > 0 THEN
+            RAISE EXCEPTION 'Timeout waiting for % process(es) to become inactive after cancellation', remaining_pids;
+        END IF;
+        DELETE FROM cancelpid;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE VIEW pending_materialization_ranges AS
+    SELECT
+        c.user_view_name,
+        m.lowest_modified_value,
+        m.greatest_modified_value
+    FROM
+        _timescaledb_catalog.continuous_aggs_materialization_ranges m
+        LEFT JOIN _timescaledb_catalog.continuous_agg c on c.mat_hypertable_id = m.materialization_id
+    ORDER BY
+        1, 2, 3;
+
 }
 
 # Move the invalidation threshold so that we can generate some
@@ -149,17 +188,38 @@ setup
 teardown {
     DROP TABLE conditions CASCADE;
     DROP TABLE conditions2 CASCADE;
+    DROP TABLE cancelpid;
 }
 
 # Waitpoint for cagg invalidation logs
-session "WP"
-step "WP_enable"
+session "WP_after"
+step "WP_after_enable"
 {
-    SELECT debug_waitpoint_enable('clear_cagg_invalidations_for_refresh_lock');
+    SELECT debug_waitpoint_enable('after_process_cagg_invalidations_for_refresh_lock');
 }
-step "WP_release"
+step "WP_after_release"
 {
-    SELECT debug_waitpoint_release('clear_cagg_invalidations_for_refresh_lock');
+    SELECT debug_waitpoint_release('after_process_cagg_invalidations_for_refresh_lock');
+}
+
+session "WP_before"
+step "WP_before_enable"
+{
+    SELECT debug_waitpoint_enable('before_process_cagg_invalidations_for_refresh_lock');
+}
+step "WP_before_release"
+{
+    SELECT debug_waitpoint_release('before_process_cagg_invalidations_for_refresh_lock');
+}
+
+session "WP_after_materialization"
+step "WP_after_materialization_enable"
+{
+    SELECT debug_waitpoint_enable('after_process_cagg_materializations');
+}
+step "WP_after_materialization_release"
+{
+    SELECT debug_waitpoint_release('after_process_cagg_materializations');
 }
 
 # Session to refresh the cond_10 continuous aggregate
@@ -168,10 +228,27 @@ setup
 {
     SET SESSION lock_timeout = '500ms';
     SET SESSION deadlock_timeout = '500ms';
+    INSERT INTO cancelpid VALUES (pg_backend_pid())
+    ON CONFLICT (pid) DO NOTHING;
 }
 step "R1_refresh"
 {
     CALL refresh_continuous_aggregate('cond_10', 25, 70);
+}
+step "R1_refresh2"
+{
+    CALL refresh_continuous_aggregate('cond_10', 30, 120);
+}
+step "R1_drop"
+{
+    DROP MATERIALIZED VIEW cond_10;
+}
+
+## generate invalidation that has overlaps for R1_refresh and R2_refresh
+session "RI2"
+step "RI2_invalidation"
+{
+    INSERT INTO conditions VALUES  (20, 1000), (30, 1000), (40, 1000), (50, 1000), (60, 1000), (70, 1000), (79, 1000);
 }
 
 session "R12"
@@ -185,6 +262,39 @@ step "R12_refresh"
     CALL refresh_continuous_aggregate('cond2_10', 25, 70);
 }
 
+session "R13"
+step "R13_refresh1"
+{
+    -- the window start 65 is far from the pending range start 30
+    -- so in this case the left behind pending range will NOT be processed
+    CALL refresh_continuous_aggregate('cond_10', 65, 100);
+}
+step "R13_refresh2"
+{
+    -- the window start 40 is one bucket before the pending range start 30
+    -- so in this case the left behind pending range will be processed
+    CALL refresh_continuous_aggregate('cond_10', 40, 100);
+}
+step "R13_refresh3"
+{
+    -- the window end 100 is far from the pending range end 120
+    -- so in this case the left behind pending range will NOT be processed
+    CALL refresh_continuous_aggregate('cond_10', 40, 100);
+}
+step "R13_refresh4"
+{
+    -- the window end 110 is one bucket after the pending range end 120
+    -- so in this case the left behind pending range will be processed
+    CALL refresh_continuous_aggregate('cond_10', 40, 110);
+}
+step "R13_refresh5"
+{
+    -- the window start and end are far in more than one bucket from
+    -- pending range, so in this case the left behind pending range
+    -- will NOT be processed
+    CALL refresh_continuous_aggregate('cond_10', 50, 100);
+}
+
 # Refresh that overlaps with R1
 session "R2"
 setup
@@ -195,6 +305,18 @@ setup
 step "R2_refresh"
 {
     CALL refresh_continuous_aggregate('cond_10', 35, 62);
+}
+step "R2_refresh_exact"
+{
+    CALL refresh_continuous_aggregate('cond_10', 25, 70);
+}
+step "R2_refresh_left"
+{
+    CALL refresh_continuous_aggregate('cond_10', 15, 55);
+}
+step "R2_refresh_superset"
+{
+    CALL refresh_continuous_aggregate('cond_10', 15, 85);
 }
 
 # Refresh on same aggregate (cond_10) that doesn't overlap with R1 and R2
@@ -233,6 +355,17 @@ setup
 step "R5_refresh"
 {
     CALL refresh_continuous_aggregate('cond_10', 70, 107);
+}
+
+# Check for pending materialization ranges
+session "R6"
+step "R6_pending_materialization_ranges"
+{
+    SELECT * FROM pending_materialization_ranges WHERE user_view_name = 'cond_10';
+}
+step "R6_pending_materialization_ranges_orphan"
+{
+    SELECT * FROM pending_materialization_ranges WHERE user_view_name IS NULL;
 }
 
 # Define a number of lock sessions to simulate concurrent refreshes
@@ -319,6 +452,12 @@ step "S1_select"
     ORDER BY 1;
 }
 
+session "K1"
+step "K1_cancelpid"
+{
+    CALL cancelpids();
+}
+
 ####################################################################
 #
 # Tests for concurrent updates to the invalidation threshold (first
@@ -346,7 +485,7 @@ permutation "R3_refresh" "L2_read_lock_threshold_table" "R1_refresh" "L2_read_un
 ##################################################################
 #
 # Tests for concurrent refreshes of continuous aggregates (second
-# transaction of a refresh).
+# and third transactions of a refresh).
 #
 ##################################################################
 
@@ -356,8 +495,8 @@ permutation "L3_lock_cagg_table" "R1_refresh" "L3_unlock_cagg_table" "S1_select"
 # R1 and R2 queued to refresh
 permutation "L3_lock_cagg_table" "R1_refresh" "R2_refresh" "L3_unlock_cagg_table" "S1_select" "L1_unlock_threshold_table" "L2_read_unlock_threshold_table"
 
-# R1 and R3 don't have overlapping refresh windows, but should skip
-# locks and process the materialization.
+# R1 and R3 don't have overlapping refresh windows, but should serialize
+# anyway cause we're locking the cagg hypertable
 permutation "L3_lock_cagg_table" "R1_refresh" "R3_refresh" "L3_unlock_cagg_table" "S1_select" "L1_unlock_threshold_table" "L2_read_unlock_threshold_table"
 
 # Concurrent refreshing across two different aggregates on same
@@ -368,6 +507,37 @@ permutation "L3_lock_cagg_table" "R3_refresh" "R4_refresh" "L3_unlock_cagg_table
 # block each other
 permutation "R1_refresh" "R12_refresh"
 
-# CAgg invalidation logs processing skipping locks due to
-# the concurrent execution
-permutation "WP_enable" "R1_refresh"("WP_enable") "R5_refresh"("WP_enable") "WP_release" "S1_select" "R3_refresh" "S1_select"
+# CAgg invalidation logs processing in a separated transaction and the materialization
+# transaction can be executed concurrently
+permutation "WP_after_enable" "R1_refresh"("WP_after_enable") "R6_pending_materialization_ranges" "R5_refresh"("WP_after_enable") "R6_pending_materialization_ranges" "WP_after_release" "R6_pending_materialization_ranges" "S1_select"
+
+# CAgg materialization phase (third trasaction of the refresh procedure) terminated by another session and then
+# refreshing again and make sure the pending ranges will be processed
+permutation "WP_after_enable" "R6_pending_materialization_ranges" "R1_refresh"("WP_after_enable") "R3_refresh"("WP_after_enable") "K1_cancelpid"("R1_refresh") "R6_pending_materialization_ranges" "WP_after_release" "R13_refresh1"("K1_cancelpid") "R6_pending_materialization_ranges" "R13_refresh2" "R6_pending_materialization_ranges"
+
+permutation "WP_after_enable" "R6_pending_materialization_ranges" "R1_refresh2"("WP_after_enable") "R3_refresh"("WP_after_enable") "K1_cancelpid"("R1_refresh2") "R6_pending_materialization_ranges" "WP_after_release" "R13_refresh3"("K1_cancelpid") "R6_pending_materialization_ranges" "R13_refresh5" "R6_pending_materialization_ranges" "R13_refresh4" "R6_pending_materialization_ranges"
+
+# When dropping a CAgg pending ranges left behind should be removed
+permutation "WP_after_enable" "R6_pending_materialization_ranges" "R1_refresh"("WP_after_enable") "K1_cancelpid"("R1_refresh") "R6_pending_materialization_ranges" "WP_after_release" "R1_drop" "R6_pending_materialization_ranges_orphan"
+
+# R3 should wait for R1 to finish because there are cagg invalidation rows locked
+permutation "WP_before_enable" "R1_refresh"("WP_before_enable") "R3_refresh" "WP_before_release"
+
+# Concurrent refresh of caggs on non-overlapping ranges should not
+# block each other in the third transaction (materialization)
+permutation "WP_after_materialization_enable" "R1_refresh"("WP_after_materialization_enable") "WP_after_materialization_release" "R3_refresh" 
+
+# Concurrent refresh on same cagg that generate overlapping  materialization range will error out. Only 1 can proceed
+# R1 and R2 have overlap refresh and  we add invalidations. So R2 materialization range will overlap with R1
+## R1 will process invalidation first, add cagg ranges, then wait. R2 should fail as it attempts to process an
+## overlapping range
+permutation "WP_before_enable" "R1_refresh"("WP_before_enable") "RI2_invalidation" "WP_after_enable" "WP_before_release" "R2_refresh" "WP_after_release"
+
+# Exact match overlap: R2 materializes [30, 70) which exactly matches R1's [30, 70)
+permutation "WP_before_enable" "R1_refresh"("WP_before_enable") "RI2_invalidation" "WP_after_enable" "WP_before_release" "R2_refresh_exact" "WP_after_release"
+
+# Left overlap: R2 materializes [20, 50) which overlaps R1's [30, 70) from the left
+permutation "WP_before_enable" "R1_refresh"("WP_before_enable") "RI2_invalidation" "WP_after_enable" "WP_before_release" "R2_refresh_left" "WP_after_release"
+
+# Superset overlap: R2 materializes [20, 80) which fully contains R1's [30, 70)
+permutation "WP_before_enable" "R1_refresh"("WP_before_enable") "RI2_invalidation" "WP_after_enable" "WP_before_release" "R2_refresh_superset" "WP_after_release"

@@ -7,6 +7,7 @@
 
 #include <catalog/pg_inherits.h>
 #include <optimizer/optimizer.h>
+#include <parser/parse_coerce.h>
 #include <parser/parsetree.h>
 #include <tcop/tcopprot.h>
 #include <utils/array.h>
@@ -35,6 +36,8 @@ typedef struct DimensionValues
 	bool use_or; /* ORed or ANDed values */
 	Oid type;	 /* Oid type for values */
 } DimensionValues;
+
+static DimensionValues *dimension_values_create(List *values, Oid type, bool use_or);
 
 static DimensionRestrictInfoOpen *
 dimension_restrict_info_open_create(const Dimension *d)
@@ -119,26 +122,62 @@ dimension_restrict_info_is_trivial(const DimensionRestrictInfo *dri)
 	}
 }
 
+/*
+ * Add restriction for open (time) dimension.
+ * Values are expected to be int64 (already converted by caller).
+ */
 static bool
 dimension_restrict_info_open_add(DimensionRestrictInfoOpen *dri, StrategyNumber strategy,
-								 Oid collation, DimensionValues *dimvalues)
+								 DimensionValues *dimvalues)
 {
 	ListCell *item;
 	bool restriction_added = false;
 
-	/* can't handle IN/ANY with multiple values */
+	/*
+	 * For IN/ANY with multiple equality values on an open dimension,
+	 * use the bounding range [min, max] as an over-approximation.
+	 * This may include extra chunks, which PG constraint exclusion
+	 * will prune later. Much better than returning all chunks.
+	 */
 	if (dimvalues->use_or && list_length(dimvalues->values) > 1)
+	{
+		if (strategy != BTEqualStrategyNumber)
+			return false;
+
+		int64 min_val = PG_INT64_MAX;
+		int64 max_val = PG_INT64_MIN;
+		ListCell *lc;
+		foreach (lc, dimvalues->values)
+		{
+			int64 value = DatumGetInt64(PointerGetDatum(lfirst(lc)));
+			if (value < min_val)
+				min_val = value;
+			if (value > max_val)
+				max_val = value;
+		}
+
+		DimensionValues range_values =
+			(DimensionValues){ .values = list_make1(DatumGetPointer(Int64GetDatum(min_val))),
+							   .use_or = false,
+							   .type = dimvalues->type };
+
+		dimension_restrict_info_open_add(dri, BTGreaterEqualStrategyNumber, &range_values);
+
+		linitial(range_values.values) = DatumGetPointer(Int64GetDatum(max_val));
+		dimension_restrict_info_open_add(dri, BTLessEqualStrategyNumber, &range_values);
+
+		/*
+		 * This scalar array operation is not true everywhere inside the hypertable
+		 * restrictions, since we've used an approximation.
+		 */
 		return false;
+	}
+
+	Assert(list_length(dimvalues->values) == 1 || !dimvalues->use_or);
 
 	foreach (item, dimvalues->values)
 	{
-		Oid restype;
-		Datum datum = ts_dimension_transform_value(dri->base.dimension,
-												   collation,
-												   PointerGetDatum(lfirst(item)),
-												   dimvalues->type,
-												   &restype);
-		int64 value = ts_time_value_to_internal_or_infinite(datum, restype);
+		int64 value = DatumGetInt64(PointerGetDatum(lfirst(item)));
 
 		switch (strategy)
 		{
@@ -177,7 +216,7 @@ dimension_restrict_info_open_add(DimensionRestrictInfoOpen *dri, StrategyNumber 
 
 static List *
 dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, Oid collation,
-									   List *values)
+									   List *values, Oid value_type)
 {
 	List *partitions = NIL;
 	ListCell *item;
@@ -187,7 +226,7 @@ dimension_restrict_info_get_partitions(DimensionRestrictInfoClosed *dri, Oid col
 		Datum value = ts_dimension_transform_value(dri->base.dimension,
 												   collation,
 												   PointerGetDatum(lfirst(item)),
-												   InvalidOid,
+												   value_type,
 												   NULL);
 
 		partitions = list_append_unique_int(partitions, DatumGetInt32(value));
@@ -208,7 +247,8 @@ dimension_restrict_info_closed_add(DimensionRestrictInfoClosed *dri, StrategyNum
 		return false;
 	}
 
-	partitions = dimension_restrict_info_get_partitions(dri, collation, dimvalues->values);
+	partitions =
+		dimension_restrict_info_get_partitions(dri, collation, dimvalues->values, dimvalues->type);
 
 	/* the intersection is empty when using ALL operator (ANDing values)  */
 	if (list_length(partitions) > 1 && !dimvalues->use_or)
@@ -241,44 +281,6 @@ dimension_restrict_info_closed_add(DimensionRestrictInfoClosed *dri, StrategyNum
 	}
 	return restriction_added;
 }
-
-static bool
-dimension_restrict_info_add(DimensionRestrictInfo *dri, int strategy, Oid collation,
-							DimensionValues *values)
-{
-	switch (dri->dimension->type)
-	{
-		case DIMENSION_TYPE_OPEN:
-			return dimension_restrict_info_open_add((DimensionRestrictInfoOpen *) dri,
-													strategy,
-													collation,
-													values);
-		case DIMENSION_TYPE_STATS:
-			/* we reuse the DimensionRestrictInfoOpen structure for these */
-			return dimension_restrict_info_open_add((DimensionRestrictInfoOpen *) dri,
-													strategy,
-													collation,
-													values);
-		case DIMENSION_TYPE_CLOSED:
-			return dimension_restrict_info_closed_add((DimensionRestrictInfoClosed *) dri,
-													  strategy,
-													  collation,
-													  values);
-		default:
-			elog(ERROR, "unknown dimension type: %d", dri->dimension->type);
-			/* suppress compiler warning on MSVC */
-			return false;
-	}
-}
-
-typedef struct HypertableRestrictInfo
-{
-	int num_base_restrictions; /* number of base restrictions
-								* successfully added */
-	int num_dimensions;
-	DimensionRestrictInfo *dimension_restriction[FLEXIBLE_ARRAY_MEMBER]; /* array of dimension
-																		  * restrictions */
-} HypertableRestrictInfo;
 
 HypertableRestrictInfo *
 ts_hypertable_restrict_info_create(RelOptInfo *rel, Hypertable *ht)
@@ -337,7 +339,15 @@ hypertable_restrict_info_get(HypertableRestrictInfo *hri, AttrNumber attno)
 
 typedef DimensionValues *(*get_dimension_values)(Const *c, bool use_or);
 
-static void
+/*
+ * Returns true if the restriction was accepted exactly. That means it's true
+ * everywhere inside the HRI bounds. This is not the case for the expressions
+ * which we translate into HRI in an approximated way. For example, the scalar
+ * array operations are translated to the enclosing range of the array elements,
+ * and the scalar array expression itself can be false in some points in this
+ * range.
+ */
+static bool
 hypertable_restrict_info_add_expr(HypertableRestrictInfo *hri, PlannerInfo *root, Var *v,
 								  Expr *expr, Oid op_oid, get_dimension_values func_get_dim_values,
 								  bool use_or)
@@ -354,18 +364,18 @@ hypertable_restrict_info_add_expr(HypertableRestrictInfo *hri, PlannerInfo *root
 	dri = hypertable_restrict_info_get(hri, v->varattno);
 	/* the attribute is not a dimension */
 	if (dri == NULL)
-		return;
+		return false;
 
 	expr = (Expr *) eval_const_expressions(root, (Node *) expr);
 
 	if (!IsA(expr, Const) || !OidIsValid(op_oid) || !op_strict(op_oid))
-		return;
+		return false;
 
 	c = (Const *) expr;
 
 	/* quick check for a NULL constant */
 	if (c->constisnull)
-		return;
+		return false;
 
 	rte = rt_fetch(v->varno, root->parse->rtable);
 
@@ -373,14 +383,150 @@ hypertable_restrict_info_add_expr(HypertableRestrictInfo *hri, PlannerInfo *root
 	tce = lookup_type_cache(columntype, TYPECACHE_BTREE_OPFAMILY);
 
 	if (!op_in_opfamily(op_oid, tce->btree_opf))
-		return;
+		return false;
 
 	get_op_opfamily_properties(op_oid, tce->btree_opf, false, &strategy, &lefttype, &righttype);
-	dimvalues = func_get_dim_values(c, use_or);
-	if (dimension_restrict_info_add(dri, strategy, c->constcollid, dimvalues))
+
+	/*
+	 * For arrays (ScalarArrayOpExpr), we work with the element type.
+	 * Non-constant arrays were already filtered out above by the IsA(expr, Const)
+	 * check after eval_const_expressions.
+	 */
+	Oid consttype = c->consttype;
+	Oid const_element_type = get_element_type(consttype);
+	bool is_array = OidIsValid(const_element_type);
+	if (is_array)
+		consttype = const_element_type;
+
+	/*
+	 * Coerce literal values to column type if needed. Coercion is required when
+	 * types differ and we use a partitioning function. The partitioning functions
+	 * always expect the column type. It is always used for closed dimensions
+	 * (space partitioning), and can be set for open dimensions too.
+	 *
+	 * Open dimensions without custom partitioning function don't need coercion
+	 * because the ts_time_value_to_internal_or_infinite() handles the cross-type
+	 * comparisons (e.g., date vs timestamp) and integer types directly.
+	 *
+	 * In Postgres, the cross-type integer inequalities (e.g. int4 column <= int8
+	 * literal) work without coercion using cross-type functions like int48le().
+	 * However, our partition function interface uses the column type, not the
+	 * literal type.
+	 *
+	 * We only use implicit coercions because narrowing casts (int8 -> int4) can
+	 * fail at runtime with "integer out of range". When no implicit coercion
+	 * exists, we skip chunk exclusion for this clause - correct but slower.
+	 */
+	bool needs_coercion = (consttype != columntype) && (IS_CLOSED_DIMENSION(dri->dimension) ||
+														dri->dimension->partitioning != NULL);
+
+	if (needs_coercion)
 	{
-		hri->num_base_restrictions++;
+		Oid funcid;
+		CoercionPathType pathtype =
+			find_coercion_pathway(columntype, consttype, COERCION_IMPLICIT, &funcid);
+
+		if (pathtype != COERCION_PATH_FUNC)
+		{
+			/*
+			 * No usable implicit coercion, skip this clause for TimescaleDB
+			 * chunk exclusion. It might be still handled by Postgres constraint
+			 * exclusion.
+			 *
+			 * COERCION_PATH_RELABELTYPE (binary compatible) won't occur
+			 * here because PostgreSQL coerces such literals at parse time and
+			 * eval_const_expressions() folds any remaining RelabelType(Const).
+			 */
+			return false;
+		}
+
+		Assert(OidIsValid(funcid));
+
+		if (is_array)
+		{
+			ArrayIterator iterator =
+				array_create_iterator(DatumGetArrayTypeP(c->constvalue), 0, NULL);
+			Datum elem = (Datum) NULL;
+			bool isnull;
+			List *values = NIL;
+
+			while (array_iterate(iterator, &elem, &isnull))
+			{
+				if (!isnull)
+				{
+					Datum coerced = OidFunctionCall1Coll(funcid, c->constcollid, elem);
+					values = lappend(values, DatumGetPointer(coerced));
+				}
+			}
+			array_free_iterator(iterator);
+			dimvalues = dimension_values_create(values, columntype, use_or);
+		}
+		else
+		{
+			Datum coerced = OidFunctionCall1Coll(funcid, c->constcollid, c->constvalue);
+			dimvalues =
+				dimension_values_create(list_make1(DatumGetPointer(coerced)), columntype, use_or);
+		}
 	}
+	else
+	{
+		dimvalues = func_get_dim_values(c, use_or);
+	}
+
+	/*
+	 * Add restriction based on dimension type.
+	 */
+	bool proven_true_by_hri = false;
+	if (IS_CLOSED_DIMENSION(dri->dimension))
+	{
+		proven_true_by_hri = dimension_restrict_info_closed_add((DimensionRestrictInfoClosed *) dri,
+																strategy,
+																c->constcollid,
+																dimvalues);
+	}
+	else
+	{
+		/* Open and stats dimensions: convert values to int64 */
+		List *int64_values = NIL;
+		ListCell *lc;
+		Oid valuetype = dimvalues->type;
+
+		foreach (lc, dimvalues->values)
+		{
+			Datum value = PointerGetDatum(lfirst(lc));
+			int64 internal;
+
+			if (dri->dimension->partitioning != NULL)
+			{
+				/* Apply partitioning function first, then convert result to int64 */
+				Oid restype;
+				value = ts_dimension_transform_value(dri->dimension,
+													 c->constcollid,
+													 value,
+													 valuetype,
+													 &restype);
+				internal = ts_time_value_to_internal_or_infinite(value, restype);
+			}
+			else
+			{
+				internal = ts_time_value_to_internal_or_infinite(value, valuetype);
+			}
+			int64_values = lappend(int64_values, DatumGetPointer(Int64GetDatum(internal)));
+		}
+		dimvalues->values = int64_values;
+		dimvalues->type = INT8OID;
+
+		proven_true_by_hri = dimension_restrict_info_open_add((DimensionRestrictInfoOpen *) dri,
+															  strategy,
+															  dimvalues);
+	}
+
+	if (proven_true_by_hri)
+	{
+		hri->num_quals_proven_true_by_hri++;
+	}
+
+	return proven_true_by_hri;
 }
 
 static DimensionValues *
@@ -429,45 +575,47 @@ dimension_values_create_from_single_element(Const *c, bool user_or)
 								   user_or);
 }
 
-static void
-hypertable_restrict_info_add_restrict_info(HypertableRestrictInfo *hri, PlannerInfo *root,
-										   RestrictInfo *ri)
+bool
+ts_hypertable_restrict_info_add_clause(HypertableRestrictInfo *hri, PlannerInfo *root, Expr *e)
 {
 	Oid opno;
 	Var *var;
 	Expr *arg_value;
 
-	Expr *e = ri->clause;
-
 	/* Same as constraint_exclusion */
 	if (contain_mutable_functions((Node *) e))
-		return;
-
-	if (ts_extract_expr_args(e, &var, &arg_value, &opno, NULL))
 	{
-		get_dimension_values value_func;
-		bool use_or;
-
-		switch (nodeTag(e))
-		{
-			case T_OpExpr:
-			{
-				value_func = dimension_values_create_from_single_element;
-				use_or = false;
-				break;
-			}
-			case T_ScalarArrayOpExpr:
-			{
-				value_func = dimension_values_create_from_array;
-				use_or = castNode(ScalarArrayOpExpr, e)->useOr;
-				break;
-			}
-			default:
-				/* we don't support other node types */
-				return;
-		}
-		hypertable_restrict_info_add_expr(hri, root, var, arg_value, opno, value_func, use_or);
+		return false;
 	}
+
+	if (!ts_extract_expr_args(e, &var, &arg_value, &opno, NULL))
+	{
+		return false;
+	}
+
+	get_dimension_values value_func;
+	bool use_or;
+
+	switch (nodeTag(e))
+	{
+		case T_OpExpr:
+		{
+			value_func = dimension_values_create_from_single_element;
+			use_or = false;
+			break;
+		}
+		case T_ScalarArrayOpExpr:
+		{
+			value_func = dimension_values_create_from_array;
+			use_or = castNode(ScalarArrayOpExpr, e)->useOr;
+			break;
+		}
+		default:
+			/* we don't support other node types */
+			return false;
+	}
+
+	return hypertable_restrict_info_add_expr(hri, root, var, arg_value, opno, value_func, use_or);
 }
 
 void
@@ -480,7 +628,7 @@ ts_hypertable_restrict_info_add(HypertableRestrictInfo *hri, PlannerInfo *root,
 	{
 		RestrictInfo *ri = lfirst(lc);
 
-		hypertable_restrict_info_add_restrict_info(hri, root, ri);
+		ts_hypertable_restrict_info_add_clause(hri, root, ri->clause);
 	}
 }
 

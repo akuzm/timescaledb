@@ -22,6 +22,7 @@ static const WithClauseDefinition create_table_with_clauses_def[] = {
 	[CreateTableFlagAssociatedTablePrefix] = {.arg_names = {"associated_table_prefix", NULL}, .type_id = TEXTOID,},
 	[CreateTableFlagSegmentBy] = { .arg_names = {"segmentby", "segment_by", "compress_segmentby", NULL}, .type_id = TEXTOID,},
 	[CreateTableFlagOrderBy] = { .arg_names = {"orderby", "order_by", "compress_orderby", NULL}, .type_id = TEXTOID,},
+	[CreateTableFlagIndex] = { .arg_names = {"compress_index", "compress_sparse_index", "index", "sparse_index", NULL}, .type_id = TEXTOID,},
 };
 
 WithClauseResult *
@@ -59,6 +60,7 @@ ts_create_table_parse_chunk_time_interval(WithClauseResult option, Oid column_ty
 			case TIMESTAMPOID:
 			case TIMESTAMPTZOID:
 			case DATEOID:
+			case UUIDOID:
 			{
 				*interval_type = INTERVALOID;
 				return DirectFunctionCall3(interval_in,
@@ -66,6 +68,10 @@ ts_create_table_parse_chunk_time_interval(WithClauseResult option, Oid column_ty
 										   InvalidOid,
 										   -1);
 			}
+			default:
+				Ensure(false,
+					   "unexpected column type %s when setting chunk interval",
+					   format_type_be(column_type));
 		}
 	}
 	*interval_type = InvalidOid;

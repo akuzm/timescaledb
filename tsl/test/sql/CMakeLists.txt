@@ -7,25 +7,44 @@ set(TEST_FILES
     bgw_job_ddl.sql
     bgw_policy.sql
     bgw_security.sql
-    cagg_api.sql
-    cagg_deprecated_bucket_ng.sql
+    cagg_direct_compress.sql
     cagg_errors.sql
     cagg_invalidation.sql
+    cagg_invalidation_variable_bucket.sql
     cagg_policy.sql
     cagg_policy_move.sql
-    cagg_refresh.sql
+    cagg_policy_concurrent.sql
+    cagg_refresh_using_trigger.sql
     cagg_refresh_using_merge.sql
     cagg_utils.sql
     cagg_watermark.sql
-    chunk_column_stats.sql
+    chunk_publication_compression.sql
+    columnar_scan_cost.sql
     columnstore_aliases.sql
     compress_auto_sparse_index.sql
-    compress_bloom_sparse.sql
+    compress_batch_size.sql
+    compress_bitmap_scan.sql
+    compress_bloom_dml.sql
+    compress_bloom_hash.sql
+    compress_compbloom_basics.sql
+    compress_compbloom_config.sql
+    compress_compbloom_index_add.sql
+    compress_compbloom_index_drop.sql
+    compress_compbloom_manual_config.sql
+    compress_compbloom_upsert.sql
+    compress_sparse_config.sql
     compress_default.sql
     compress_dml_copy.sql
+    compress_explain.sql
+    compress_float8_corrupt.sql
+    compress_unordered_sort.sql
+    compress_qualpushdown_saop.sql
+    compress_qualpushdown_complex.sql
+    compress_sort_transform.sql
     compressed_collation.sql
     compressed_detoaster.sql
-    compress_float8_corrupt.sql
+    direct_compress_insert.sql
+    compression.sql
     compression_allocation.sql
     compression_conflicts.sql
     compression_constraints.sql
@@ -42,47 +61,28 @@ set(TEST_FILES
     compression_settings.sql
     compression_sorted_merge.sql
     compression_sorted_merge_distinct.sql
-    compression.sql
+    compression_sorted_merge_unordered.sql
+    compression_uuid.sql
     compression_trigger.sql
-    compress_sort_transform.sql
     create_table_with.sql
-    custom_hashagg.sql
-    decompress_chunk_cost.sql
     decompress_index.sql
-    foreign_keys.sql
-    hypercore_columnar.sql
-    hypercore_constraints.sql
-    hypercore_copy.sql
-    hypercore_cursor.sql
-    hypercore_ddl.sql
-    hypercore_delete.sql
-    hypercore_dump_restore.sql
-    hypercore_index_btree.sql
-    hypercore_index_hash.sql
-    hypercore_insert.sql
-    hypercore_join.sql
-    hypercore_merge.sql
-    hypercore_policy.sql
-    hypercore_stats.sql
-    hypercore_trigger.sql
-    hypercore_types.sql
-    hypercore_update.sql
-    hypercore_vacuum_full.sql
-    hypercore_vacuum.sql
-    merge_append_partially_compressed.sql
-    merge_chunks.sql
-    merge_compress.sql
-    modify_exclusion.sql
     move.sql
+    plan_skip_scan_notnull.sql
     policy_generalization.sql
+    rebuild_columnstore_tests.sql
+    recompression_integrity_tests.sql
+    recompression_integrity_unordered.sql
     reorder.sql
     size_utils_tsl.sql
     skip_scan.sql
     split_chunk.sql
     transparent_decompression_join_index.sql
+    unlogged.sql
+    uncompressed_size.sql
     vector_agg_functions.sql
     vector_agg_groupagg.sql
     vector_agg_param.sql
+    vector_agg_expr.sql
     vectorized_aggregation.sql)
 
 set(TEST_TEMPLATES
@@ -90,24 +90,35 @@ set(TEST_TEMPLATES
     cagg_query_using_merge.sql.in
     cagg_union_view.sql.in
     cagg_permissions.sql.in
+    columnar_index_scan.sql.in
+    compress_bloom_sparse.sql.in
     compression_permissions.sql.in
+    foreign_keys_test.sql.in
+    modify_exclusion.sql.in
     ordered_append.sql.in
     plan_skip_scan.sql.in
+    vector_agg_planning.sql.in
     transparent_decompression.sql.in
     transparent_decompression_ordered_index.sql.in)
+
+# WAL numbers will differ on 32-bit platform so we only run on 64-bit
+if("${CMAKE_SIZEOF_VOID_P}" STREQUAL "8")
+  list(APPEND TEST_FILES explain_wal.sql)
+endif()
 
 if(USE_TELEMETRY)
   list(APPEND TEST_FILES bgw_telemetry.sql)
 endif()
 
 if(NOT APPLE)
-  list(APPEND TEST_FILES compressed_copy.sql)
+  list(APPEND TEST_FILES direct_compress_copy.sql)
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   list(
     APPEND
     TEST_FILES
+    attach_chunk.sql
     bgw_custom.sql
     bgw_db_scheduler.sql
     bgw_job_stat_history.sql
@@ -119,12 +130,15 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     bgw_reorder_drop_chunks.sql
     scheduler_fixed.sql
     cagg_policy_incremental.sql
+    chunk_column_stats.sql
     compress_bgw_reorder_drop_chunks.sql
+    compress_bloom_legacy_v1.sql
     chunk_api.sql
     chunk_merge.sql
     chunk_utils_compression.sql
     chunk_utils_internal.sql
     compress_bloom_sparse_debug.sql
+    compress_composite_bloom_debug.sql
     compression_algos.sql
     compression_bgw.sql
     compression_bools.sql
@@ -141,50 +155,50 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     cagg_drop_chunks.sql
     cagg_dump.sql
     cagg_joins.sql
-    cagg_migrate.sql
     cagg_multi.sql
     cagg_on_cagg.sql
     cagg_on_cagg_joins.sql
     cagg_tableam.sql
     cagg_policy_run.sql
+    cagg_uuid.sql
+    columnar_scan_memory.sql
     decompress_memory.sql
     decompress_vector_qual.sql
-    exp_cagg_monthly.sql
-    exp_cagg_next_gen.sql
-    exp_cagg_origin.sql
-    exp_cagg_timezone.sql
-    hypercore.sql
-    hypercore_create.sql
-    hypercore_scans.sql
+    detach_chunk.sql
     hypertable_generalization.sql
     insert_memory_usage.sql
     information_view_chunk_count.sql
     read_only.sql
-    transparent_decompression_queries.sql
     tsl_tables.sql
+    uuid_policies.sql
     license_tsl.sql
+    merge_chunks.sql
+    merge_compress.sql
     fixed_schedules.sql
-    partialize_finalize.sql
     recompress_chunk_segmentwise.sql
     feature_flags.sql
+    vector_agg_byte.sql
     vector_agg_default.sql
     vector_agg_filter.sql
     vector_agg_grouping.sql
     vector_agg_text.sql
     vector_agg_memory.sql
+    vector_agg_modify_hypertable.sql
     vector_agg_segmentby.sql
-    vector_agg_uuid_segmentby.sql)
+    vector_agg_uuid.sql
+    vector_qual_default.sql
+    vacuum.sql)
 
   list(
     APPEND
     TEST_TEMPLATES
     cagg_bgw.sql.in
     cagg_ddl.sql.in
-    cagg_migrate_function.sql.in
-    cagg_repair.sql.in
     cagg_usage.sql.in
+    cagg.sql.in
     compression_update_delete.sql.in
-    continuous_aggs.sql.in)
+    compression_delete_bitmapscan.sql.in
+    transparent_decompression_queries.sql.in)
 
   if(USE_TELEMETRY)
     list(APPEND TEST_FILES telemetry_stats.sql)
@@ -192,18 +206,13 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 
 if((${PG_VERSION_MAJOR} GREATER_EQUAL "16"))
-  list(
-    APPEND
-    TEST_FILES
-    cagg_planning.sql
-    hypercore_parallel.sql
-    hypercore_vectoragg.sql
-    skip_scan_dagg.sql
-    plan_skip_scan_dagg.sql)
+  list(APPEND TEST_FILES cagg_planning.sql cagg_rewrites.sql skip_scan_dagg.sql)
+  list(APPEND TEST_TEMPLATES plan_skip_scan_dagg.sql.in)
 endif()
 
 if((${PG_VERSION_MAJOR} GREATER_EQUAL "17"))
-  list(APPEND TEST_FILES privilege_maintain.sql)
+  list(APPEND TEST_FILES privilege_maintain.sql
+       merge_append_partially_compressed.sql)
 endif()
 
 set(SOLO_TESTS
@@ -224,11 +233,11 @@ set(SOLO_TESTS
     cagg_bgw
     cagg_ddl-${PG_VERSION_MAJOR}
     cagg_dump
-    cagg_invalidation
     cagg_policy_incremental
-    hypercore
+    explain_wal
     move
     reorder
+    split_chunk
     telemetry_stats)
 
 # Check if PostgreSQL was compiled with JIT support

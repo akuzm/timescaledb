@@ -17,6 +17,15 @@ ALTER TABLE alter_before ALTER COLUMN notes SET STORAGE EXTERNAL;
 
 SELECT create_hypertable('alter_before', 'time', chunk_time_interval => 2628000000000);
 
+-- Test error hint for invalid timescaledb options on ALTER TABLE
+\set ON_ERROR_STOP 0
+-- Invalid timescaledb option should show hint with valid options
+\set VERBOSITY default
+ALTER TABLE alter_before SET (tsdb.invalid_option = true);
+ALTER TABLE alter_before SET (timescaledb.nonexistent = false);
+\set ON_ERROR_STOP 1
+\set VERBOSITY terse
+
 INSERT INTO alter_before VALUES ('2017-03-22T09:18:22', 23.5, 1);
 
 SELECT * FROM alter_before;
@@ -92,15 +101,15 @@ SELECT relname, reloptions FROM pg_class WHERE relname IN ('_hyper_2_3_chunk','_
 
 -- Need superuser to ALTER chunks in _timescaledb_internal schema
 \c :TEST_DBNAME :ROLE_SUPERUSER
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
 
 -- Rename chunk
 ALTER TABLE _timescaledb_internal._hyper_2_2_chunk RENAME TO new_chunk_name;
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
 
 -- Set schema
 ALTER TABLE _timescaledb_internal.new_chunk_name SET SCHEMA public;
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE id = 2;
 
 -- Test that we cannot rename chunk columns
 \set ON_ERROR_STOP 0
@@ -354,14 +363,13 @@ INSERT INTO original_name.my_table2 (date, quantity) VALUES ('2018-07-04T21:00:0
 ALTER SCHEMA original_name RENAME TO new_name;
 
 DROP SCHEMA new_name CASCADE;
-\dt new_name.*;
+SELECT * FROM test.relation WHERE schema = 'new_name';
 
 -- Make sure we can't rename internal schemas
 \set ON_ERROR_STOP 0
 ALTER SCHEMA _timescaledb_internal RENAME TO my_new_schema_name;
 ALTER SCHEMA _timescaledb_catalog RENAME TO my_new_schema_name;
 ALTER SCHEMA _timescaledb_cache RENAME TO my_new_schema_name;
-ALTER SCHEMA _timescaledb_config RENAME TO my_new_schema_name;
 \set ON_ERROR_STOP 1
 
 -- Make sure we can rename associated schemas
@@ -377,7 +385,7 @@ ALTER SCHEMA my_associated_schema RENAME TO new_associated_schema;
 INSERT INTO my_table (date, quantity) VALUES ('2018-08-10T23:00:00+00:00', 20);
 -- Make sure the schema name is changed in both catalog tables
 SELECT * from _timescaledb_catalog.hypertable;
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk from _timescaledb_catalog.chunk;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk from _timescaledb_catalog.chunk;
 
 DROP TABLE my_table;
 
@@ -391,8 +399,7 @@ INSERT INTO t_hypertable AS h VALUES ( 1, '2021-01-01 00:00:00', 3.2) ON CONFLIC
 BEGIN;
 ALTER INDEX t_hypertable_id_time_key RENAME TO t_new_constraint;
 
--- chunk_index and chunk_constraint should both have updated constraint names
-SELECT hypertable_index_name, index_name from _timescaledb_catalog.chunk_index WHERE hypertable_index_name = 't_new_constraint' ORDER BY 1,2;
+-- chunk_constraint should have updated constraint names
 SELECT hypertable_constraint_name, constraint_name from _timescaledb_catalog.chunk_constraint WHERE hypertable_constraint_name = 't_new_constraint' ORDER BY 1,2;
 
 INSERT INTO t_hypertable AS h VALUES ( 1, '2020-01-01 00:01:00', 3.2) ON CONFLICT (id, time) DO UPDATE SET value = h.value + EXCLUDED.value;
@@ -401,8 +408,7 @@ ROLLBACK;
 BEGIN;
 ALTER TABLE t_hypertable RENAME CONSTRAINT t_hypertable_id_time_key TO t_new_constraint;
 
--- chunk_index and chunk_constraint should both have updated constraint names
-SELECT hypertable_index_name, index_name from _timescaledb_catalog.chunk_index WHERE hypertable_index_name = 't_new_constraint' ORDER BY 1,2;
+-- chunk_constraint should have updated constraint names
 SELECT hypertable_constraint_name, constraint_name from _timescaledb_catalog.chunk_constraint WHERE hypertable_constraint_name = 't_new_constraint' ORDER BY 1,2;
 
 INSERT INTO t_hypertable AS h VALUES ( 1, '2020-01-01 00:01:00', 3.2) ON CONFLICT (id, time) DO UPDATE SET value = h.value + EXCLUDED.value;
@@ -419,7 +425,7 @@ CREATE INDEX idx_ht ON p_hypertable(a, c) WHERE d = FALSE;
 END;
 INSERT INTO p_hypertable(a, c, d) VALUES (1, 1, FALSE);
 
-\d+ _timescaledb_internal._hyper_14_28_chunk
+\d _timescaledb_internal._hyper_14_28_chunk
 
 DROP TABLE p_hypertable;
 
@@ -502,8 +508,24 @@ FROM show_chunks('replid') chid
 INNER JOIN pg_index i ON (i.indrelid = chid) AND indisreplident=true
 ORDER BY index_name;
 
+-- recreate the unique index after drop and insert to create a new chunk.
+-- This is a regression test for a bug where rd_replidindex was stale
+-- after relcache invalidation from chunk index creation, leading to
+-- "could not open relation with OID 0" error.
+CREATE UNIQUE INDEX time_key ON replid (time);
+INSERT INTO replid VALUES ('2023-01-04', 4);
+
+SELECT relname, relreplident FROM show_chunks('replid') ch INNER JOIN pg_class c ON (ch = c.oid) ORDER BY relname;
+
 -- Alter replica identity directly on a chunk is not supported
 SELECT ch AS chunk_name FROM show_chunks('replid') ch ORDER BY chunk_name LIMIT 1 \gset
+\set ON_ERROR_STOP 0
 ALTER TABLE :chunk_name REPLICA IDENTITY FULL;
+\set ON_ERROR_STOP 1
 SELECT relname, relreplident FROM show_chunks('replid') ch INNER JOIN pg_class c ON (ch = c.oid) ORDER BY relname;
+
+-- test implicit constraints gh issue #9132
+CREATE TABLE i9132(time timestamptz) WITH (tsdb.hypertable);
+INSERT INTO i9132 VALUES ('2024-01-01'), ('2024-02-02');
+ALTER TABLE i9132 ADD COLUMN id serial, ADD CONSTRAINT implicit_pk PRIMARY KEY (id, time);
 

@@ -10,13 +10,17 @@
  */
 
 #include <postgres.h>
+
 #include <access/htup_details.h>
 #include <catalog/dependency.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_trigger.h>
 #include <commands/trigger.h>
+#include <executor/spi.h>
 #include <fmgr.h>
+#include <lib/stringinfo.h>
 #include <nodes/makefuncs.h>
+#include <replication/slot.h>
 #include <storage/lmgr.h>
 #include <utils/acl.h>
 #include <utils/builtins.h>
@@ -133,6 +137,21 @@ init_materialization_invalidation_log_scan_by_materialization_id(ScanIterator *i
 		Int32GetDatum(materialization_id));
 }
 
+static void
+init_materialization_ranges_scan_by_materialization_id(ScanIterator *iterator,
+													   const int32 materialization_id)
+{
+	iterator->ctx.index = catalog_get_index(ts_catalog_get(),
+											CONTINUOUS_AGGS_MATERIALIZATION_RANGES,
+											CONTINUOUS_AGGS_MATERIALIZATION_RANGES_IDX);
+
+	ts_scan_iterator_scan_key_init(iterator,
+								   Anum_continuous_aggs_materialization_ranges_materialization_id,
+								   BTEqualStrategyNumber,
+								   F_INT4EQ,
+								   Int32GetDatum(materialization_id));
+}
+
 static int32
 number_of_continuous_aggs_attached(int32 raw_hypertable_id)
 {
@@ -194,7 +213,13 @@ hypertable_invalidation_log_delete(int32 raw_hypertable_id)
 }
 
 void
-ts_materialization_invalidation_log_delete_inner(int32 mat_hypertable_id)
+ts_get_invalidation_replication_slot_name(char *slotname, Size szslot)
+{
+	snprintf(slotname, szslot, "ts_%u_cagg", MyDatabaseId);
+}
+
+static void
+ts_materialization_invalidation_log_delete(int32 mat_hypertable_id)
 {
 	ScanIterator iterator =
 		ts_scan_iterator_create(CONTINUOUS_AGGS_MATERIALIZATION_INVALIDATION_LOG,
@@ -203,6 +228,23 @@ ts_materialization_invalidation_log_delete_inner(int32 mat_hypertable_id)
 
 	elog(DEBUG1, "materialization log delete for hypertable %d", mat_hypertable_id);
 	init_materialization_invalidation_log_scan_by_materialization_id(&iterator, mat_hypertable_id);
+
+	ts_scanner_foreach(&iterator)
+	{
+		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
+		ts_catalog_delete_tid(ti->scanrel, ts_scanner_get_tuple_tid(ti));
+	}
+}
+
+static void
+ts_materialization_ranges_delete(int32 mat_hypertable_id)
+{
+	ScanIterator iterator = ts_scan_iterator_create(CONTINUOUS_AGGS_MATERIALIZATION_RANGES,
+													RowExclusiveLock,
+													CurrentMemoryContext);
+
+	elog(DEBUG1, "materialization log delete for hypertable %d", mat_hypertable_id);
+	init_materialization_ranges_scan_by_materialization_id(&iterator, mat_hypertable_id);
 
 	ts_scanner_foreach(&iterator)
 	{
@@ -249,7 +291,6 @@ continuous_agg_formdata_make_tuple(const FormData_continuous_agg *fd, TupleDesc 
 
 	values[AttrNumberGetAttrOffset(Anum_continuous_agg_materialize_only)] =
 		BoolGetDatum(fd->materialized_only);
-	values[AttrNumberGetAttrOffset(Anum_continuous_agg_finalized)] = BoolGetDatum(fd->finalized);
 
 	return heap_form_tuple(desc, values, nulls);
 }
@@ -299,8 +340,6 @@ continuous_agg_formdata_fill(FormData_continuous_agg *fd, const TupleInfo *ti)
 
 	fd->materialized_only =
 		DatumGetBool(values[AttrNumberGetAttrOffset(Anum_continuous_agg_materialize_only)]);
-	fd->finalized = DatumGetBool(values[AttrNumberGetAttrOffset(Anum_continuous_agg_finalized)]);
-
 	if (should_free)
 		heap_freetuple(tuple);
 }
@@ -309,7 +348,7 @@ continuous_agg_formdata_fill(FormData_continuous_agg *fd, const TupleInfo *ti)
  * Fill the fields of a integer based bucketing function
  */
 static void
-cagg_fill_bucket_function_integer_based(ContinuousAggsBucketFunction *bf, bool *isnull,
+cagg_fill_bucket_function_integer_based(ContinuousAggBucketFunction *bf, bool *isnull,
 										Datum *values)
 {
 	/* Bucket width */
@@ -340,7 +379,7 @@ cagg_fill_bucket_function_integer_based(ContinuousAggsBucketFunction *bf, bool *
  * Fill the fields of a time based bucketing function
  */
 static void
-cagg_fill_bucket_function_time_based(ContinuousAggsBucketFunction *bf, bool *isnull, Datum *values)
+cagg_fill_bucket_function_time_based(ContinuousAggBucketFunction *bf, bool *isnull, Datum *values)
 {
 	/*
 	 * bucket_width
@@ -388,7 +427,7 @@ cagg_fill_bucket_function_time_based(ContinuousAggsBucketFunction *bf, bool *isn
 }
 
 static void
-continuous_agg_fill_bucket_function(int32 mat_hypertable_id, ContinuousAggsBucketFunction *bf)
+continuous_agg_fill_bucket_function(int32 mat_hypertable_id, ContinuousAggBucketFunction *bf)
 {
 	ScanIterator iterator;
 	int count = 0;
@@ -460,11 +499,18 @@ continuous_agg_init(ContinuousAgg *cagg, const Form_continuous_agg fd)
 {
 	Oid nspid = get_namespace_oid(NameStr(fd->user_view_schema), false);
 	Hypertable *cagg_ht = ts_hypertable_get_by_id(fd->mat_hypertable_id);
+	if (!cagg_ht)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("continuous aggregate hypertable with ID %d does not exist",
+						fd->mat_hypertable_id)));
 	const Dimension *time_dim;
-
-	Assert(NULL != cagg_ht);
 	time_dim = hyperspace_get_open_dimension(cagg_ht->space, 0);
-	Assert(NULL != time_dim);
+	if (!time_dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("continuous aggregate hypertable with ID %d has no open dimension",
+						fd->mat_hypertable_id)));
 	cagg->partition_type = ts_dimension_get_partition_type(time_dim);
 	cagg->relid = get_relname_relid(NameStr(fd->user_view_name), nspid);
 	memcpy(&cagg->data, fd, sizeof(cagg->data));
@@ -472,14 +518,14 @@ continuous_agg_init(ContinuousAgg *cagg, const Form_continuous_agg fd)
 	Assert(OidIsValid(cagg->relid));
 	Assert(OidIsValid(cagg->partition_type));
 
-	cagg->bucket_function = palloc0(sizeof(ContinuousAggsBucketFunction));
+	cagg->bucket_function = palloc0(sizeof(ContinuousAggBucketFunction));
 	continuous_agg_fill_bucket_function(cagg->data.mat_hypertable_id, cagg->bucket_function);
 }
 
-TSDLLEXPORT CaggsInfo
+TSDLLEXPORT ContinuousAggInfo
 ts_continuous_agg_get_all_caggs_info(int32 raw_hypertable_id)
 {
-	CaggsInfo all_caggs_info;
+	ContinuousAggInfo all_caggs_info;
 
 	List *caggs = ts_continuous_aggs_find_by_raw_table_id(raw_hypertable_id);
 	ListCell *lc;
@@ -529,33 +575,6 @@ ts_continuous_agg_hypertable_status(int32 hypertable_id)
 	}
 
 	return status;
-}
-
-TSDLLEXPORT bool
-ts_continuous_agg_hypertable_all_finalized(int32 raw_hypertable_id)
-{
-	ScanIterator iterator =
-		ts_scan_iterator_create(CONTINUOUS_AGG, AccessShareLock, CurrentMemoryContext);
-	bool all_finalized = true;
-
-	init_scan_by_raw_hypertable_id(&iterator, raw_hypertable_id);
-	ts_scanner_foreach(&iterator)
-	{
-		FormData_continuous_agg data;
-		TupleInfo *ti = ts_scan_iterator_tuple_info(&iterator);
-
-		continuous_agg_formdata_fill(&data, ti);
-
-		if (!data.finalized)
-		{
-			all_finalized = false;
-			break;
-		}
-	}
-
-	ts_scan_iterator_close(&iterator);
-
-	return all_finalized;
 }
 
 TSDLLEXPORT List *
@@ -802,7 +821,6 @@ drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 	ObjectAddress user_view = { 0 };
 	ObjectAddress partial_view = { 0 };
 	ObjectAddress direct_view = { 0 };
-	ObjectAddress raw_hypertable_trig = { 0 };
 	ObjectAddress raw_hypertable = { 0 };
 	ObjectAddress mat_hypertable = { 0 };
 	bool raw_hypertable_has_other_caggs;
@@ -829,6 +847,10 @@ drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 	 *
 	 * AccessExclusiveLock is needed to drop triggers and also prevent
 	 * concurrent DML commands.
+	 *
+	 * It is needed also in the case that we are using WAL-based invalidation
+	 * collection since we want to serialize create and drop of continuous
+	 * aggregates.
 	 */
 	if (drop_user_view)
 		user_view = get_and_lock_rel_by_name(&cadata->user_view_schema,
@@ -855,20 +877,6 @@ drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 						RowExclusiveLock);
 		LockRelationOid(catalog_get_table_id(catalog, CONTINUOUS_AGGS_INVALIDATION_THRESHOLD),
 						RowExclusiveLock);
-
-		/* The trigger will be dropped if the hypertable still exists and no other
-		 * caggs attached. */
-		if (OidIsValid(raw_hypertable.objectId))
-		{
-			ObjectAddressSet(raw_hypertable_trig,
-							 TriggerRelationId,
-							 get_trigger_oid(raw_hypertable.objectId,
-											 CAGGINVAL_TRIGGER_NAME,
-											 false));
-
-			/* Raw hypertable is locked above */
-			LockRelationOid(raw_hypertable_trig.objectId, AccessExclusiveLock);
-		}
 	}
 
 	/*
@@ -902,7 +910,8 @@ drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 			hypertable_invalidation_log_delete(form.raw_hypertable_id);
 		}
 
-		ts_materialization_invalidation_log_delete_inner(form.mat_hypertable_id);
+		ts_materialization_invalidation_log_delete(form.mat_hypertable_id);
+		ts_materialization_ranges_delete(form.mat_hypertable_id);
 
 		if (!raw_hypertable_has_other_caggs)
 		{
@@ -918,11 +927,6 @@ drop_continuous_agg(FormData_continuous_agg *cadata, bool drop_user_view)
 	/* Perform actual deletions now */
 	if (OidIsValid(user_view.objectId))
 		performDeletion(&user_view, DROP_RESTRICT, 0);
-
-	if (OidIsValid(raw_hypertable_trig.objectId))
-	{
-		ts_hypertable_drop_trigger(raw_hypertable.objectId, CAGGINVAL_TRIGGER_NAME);
-	}
 
 	if (OidIsValid(mat_hypertable.objectId))
 	{
@@ -1288,7 +1292,7 @@ ts_continuous_agg_bucket_on_interval(Oid bucket_function)
 
 	/* The function has to be a currently allowed function or one of the deprecated bucketing
 	 * functions */
-	Assert(func_info->allowed_in_cagg_definition || IS_DEPRECATED_TIME_BUCKET_NG_FUNC(func_info));
+	Assert(func_info->allowed_in_cagg_definition);
 
 	Oid first_bucket_arg = func_info->arg_types[0];
 
@@ -1296,94 +1300,66 @@ ts_continuous_agg_bucket_on_interval(Oid bucket_function)
 }
 
 /*
- * Calls the desired time bucket function depending on the arguments. If the experimental flag is
- * set on ContinuousAggsBucketFunction, one of time_bucket_ng() versions is used. This is a common
- * procedure used by ts_compute_* below.
+ * Calls the desired time bucket function depending on the arguments
+ * (i.e., whether it has timezone and offset/origin).
+ * This is a common procedure used by ts_compute_* below.
  */
 static Datum
-generic_time_bucket(const ContinuousAggsBucketFunction *bf, Datum timestamp)
+generic_time_bucket(const ContinuousAggBucketFunction *bf, Datum timestamp)
 {
 	FuncInfo *func_info = ts_func_cache_get_bucketing_func(bf->bucket_function);
 	Ensure(func_info != NULL, "unable to get bucket function for Oid %d", bf->bucket_function);
-	bool is_experimental = func_info->origin == ORIGIN_TIMESCALE_EXPERIMENTAL;
 
-	if (!is_experimental)
+	bool has_offset = (bf->bucket_time_offset != NULL);
+
+	if (bf->bucket_time_timezone != NULL)
 	{
-		if (bf->bucket_time_timezone != NULL)
-		{
-			if (TIMESTAMP_NOT_FINITE(bf->bucket_time_origin))
-			{
-				/* using default origin */
-				return DirectFunctionCall3(ts_timestamptz_timezone_bucket,
-										   IntervalPGetDatum(bf->bucket_time_width),
-										   timestamp,
-										   CStringGetTextDatum(bf->bucket_time_timezone));
-			}
-			else
-			{
-				/* custom origin specified */
-				return DirectFunctionCall4(ts_timestamptz_timezone_bucket,
-										   IntervalPGetDatum(bf->bucket_time_width),
-										   timestamp,
-										   CStringGetTextDatum(bf->bucket_time_timezone),
-										   TimestampTzGetDatum(bf->bucket_time_origin));
-			}
-		}
-
+		/*
+		 * Use LOCAL_FCINFO to call ts_timestamptz_timezone_bucket with all
+		 * 5 arguments, including origin and offset.
+		 */
+		LOCAL_FCINFO(fcinfo, 5);
+		InitFunctionCallInfoData(*fcinfo, NULL, 5, InvalidOid, NULL, NULL);
+		fcinfo->args[0] =
+			(NullableDatum){ .value = IntervalPGetDatum(bf->bucket_time_width), .isnull = false };
+		fcinfo->args[1] = (NullableDatum){ .value = timestamp, .isnull = false };
+		fcinfo->args[2] = (NullableDatum){ .value = CStringGetTextDatum(bf->bucket_time_timezone),
+										   .isnull = false };
 		if (TIMESTAMP_NOT_FINITE(bf->bucket_time_origin))
-		{
-			/* using default origin */
-			return DirectFunctionCall2(ts_timestamp_bucket,
-									   IntervalPGetDatum(bf->bucket_time_width),
-									   timestamp);
-		}
+			fcinfo->args[3] = (NullableDatum){ .value = (Datum) 0, .isnull = true };
 		else
-		{
-			/* custom origin specified */
-			return DirectFunctionCall3(ts_timestamp_bucket,
-									   IntervalPGetDatum(bf->bucket_time_width),
-									   timestamp,
-									   TimestampTzGetDatum(bf->bucket_time_origin));
-		}
+			fcinfo->args[3] = (NullableDatum){ .value = TimestampTzGetDatum(bf->bucket_time_origin),
+											   .isnull = false };
+		if (has_offset)
+			fcinfo->args[4] = (NullableDatum){ .value = IntervalPGetDatum(bf->bucket_time_offset),
+											   .isnull = false };
+		else
+			fcinfo->args[4] = (NullableDatum){ .value = (Datum) 0, .isnull = true };
+		return ts_timestamptz_timezone_bucket(fcinfo);
+	}
+
+	if (has_offset)
+	{
+		return DirectFunctionCall3(ts_timestamp_offset_bucket,
+								   IntervalPGetDatum(bf->bucket_time_width),
+								   timestamp,
+								   IntervalPGetDatum(bf->bucket_time_offset));
+	}
+
+	if (TIMESTAMP_NOT_FINITE(bf->bucket_time_origin))
+	{
+		/* using default origin */
+		return DirectFunctionCall2(ts_timestamp_bucket,
+								   IntervalPGetDatum(bf->bucket_time_width),
+								   timestamp);
 	}
 	else
 	{
-		if (bf->bucket_time_timezone != NULL)
-		{
-			if (TIMESTAMP_NOT_FINITE(bf->bucket_time_origin))
-			{
-				/* using default origin */
-				return DirectFunctionCall3(ts_time_bucket_ng_timezone,
-										   IntervalPGetDatum(bf->bucket_time_width),
-										   timestamp,
-										   CStringGetTextDatum(bf->bucket_time_timezone));
-			}
-			else
-			{
-				/* custom origin specified */
-				return DirectFunctionCall4(ts_time_bucket_ng_timezone_origin,
-										   IntervalPGetDatum(bf->bucket_time_width),
-										   timestamp,
-										   TimestampTzGetDatum(bf->bucket_time_origin),
-										   CStringGetTextDatum(bf->bucket_time_timezone));
-			}
-		}
-
-		if (TIMESTAMP_NOT_FINITE(bf->bucket_time_origin))
-		{
-			/* using default origin */
-			return DirectFunctionCall2(ts_time_bucket_ng_timestamp,
-									   IntervalPGetDatum(bf->bucket_time_width),
-									   timestamp);
-		}
-		else
-		{
-			/* custom origin specified */
-			return DirectFunctionCall3(ts_time_bucket_ng_timestamp,
-									   IntervalPGetDatum(bf->bucket_time_width),
-									   timestamp,
-									   TimestampTzGetDatum(bf->bucket_time_origin));
-		}
+		/* custom origin specified */
+		return DirectFunctionCall3(ts_timestamp_bucket,
+								   IntervalPGetDatum(bf->bucket_time_width),
+								   timestamp,
+								   TimestampTzGetDatum(bf->bucket_time_origin));
 	}
 }
 
@@ -1395,7 +1371,7 @@ generic_time_bucket(const ContinuousAggsBucketFunction *bf, Datum timestamp)
  * Otherwise, it happens in UTC.
  */
 static Datum
-generic_add_interval(const ContinuousAggsBucketFunction *bf, Datum timestamp)
+generic_add_interval(const ContinuousAggBucketFunction *bf, Datum timestamp)
 {
 	Datum tzname = 0;
 	bool has_timezone = (bf->bucket_time_timezone != NULL);
@@ -1436,7 +1412,7 @@ generic_add_interval(const ContinuousAggsBucketFunction *bf, Datum timestamp)
  */
 void
 ts_compute_inscribed_bucketed_refresh_window_variable(int64 *start, int64 *end,
-													  const ContinuousAggsBucketFunction *bf)
+													  const ContinuousAggBucketFunction *bf)
 {
 	Datum start_old, end_old, start_aligned, end_aliged;
 
@@ -1474,7 +1450,7 @@ ts_compute_inscribed_bucketed_refresh_window_variable(int64 *start, int64 *end,
  */
 void
 ts_compute_circumscribed_bucketed_refresh_window_variable(int64 *start, int64 *end,
-														  const ContinuousAggsBucketFunction *bf)
+														  const ContinuousAggBucketFunction *bf)
 {
 	Datum start_old, end_old, start_new, end_new;
 
@@ -1487,7 +1463,11 @@ ts_compute_circumscribed_bucketed_refresh_window_variable(int64 *start, int64 *e
 	start_new = generic_time_bucket(bf, start_old);
 	end_new = generic_time_bucket(bf, end_old);
 
-	if (DatumGetTimestamp(end_new) != DatumGetTimestamp(end_old))
+	/* Add interval to expand to next bucket if:
+	 * 1. end wasn't at a bucket boundary (end moved during bucketing), OR
+	 * 2. we have a single-point at a bucket boundary (start == end after bucketing) */
+	if (DatumGetTimestamp(end_new) != DatumGetTimestamp(end_old) ||
+		DatumGetTimestamp(start_new) == DatumGetTimestamp(end_new))
 	{
 		end_new = generic_add_interval(bf, end_new);
 	}
@@ -1505,7 +1485,7 @@ ts_compute_circumscribed_bucketed_refresh_window_variable(int64 *start, int64 *e
  */
 int64
 ts_compute_beginning_of_the_next_bucket_variable(int64 timeval,
-												 const ContinuousAggsBucketFunction *bf)
+												 const ContinuousAggBucketFunction *bf)
 {
 	Datum val_new;
 	Datum val_old;
@@ -1519,6 +1499,25 @@ ts_compute_beginning_of_the_next_bucket_variable(int64 timeval,
 	val_new = generic_time_bucket(bf, val_old);
 	val_new = generic_add_interval(bf, val_new);
 	return ts_time_value_to_internal(val_new, TIMESTAMPOID);
+}
+
+/*
+ * Calculates the beginning of the current bucket (i.e., floors timeval to the
+ * nearest bucket boundary).
+ *
+ * The algorithm is just:
+ *
+ * val = time_bucket(bucket_size, val)
+ */
+int64
+ts_compute_start_of_current_bucket_variable(int64 timeval, const ContinuousAggBucketFunction *bf)
+{
+	/*
+	 * It's OK to use TIMESTAMPOID here.
+	 * See the comment in ts_compute_inscribed_bucketed_refresh_window_variable()
+	 */
+	Datum val_beg = ts_internal_to_time_value(timeval, TIMESTAMPOID);
+	return ts_time_value_to_internal(generic_time_bucket(bf, val_beg), TIMESTAMPOID);
 }
 
 Oid
@@ -1543,19 +1542,36 @@ ts_continuous_agg_get_query(ContinuousAgg *cagg)
 	RewriteRule *rule;
 	Query *cagg_view_query;
 
-	/*
-	 * Get the partial_view definition for the finalized version because
-	 * the user view doesn't have the "GROUP BY" clause anymore.
-	 */
-	if (ContinuousAggIsFinalized(cagg))
-		cagg_view_oid = ts_get_relation_relid(NameStr(cagg->data.partial_view_schema),
-											  NameStr(cagg->data.partial_view_name),
-											  false);
-	else
-		cagg_view_oid = ts_get_relation_relid(NameStr(cagg->data.user_view_schema),
-											  NameStr(cagg->data.user_view_name),
-											  false);
+	cagg_view_oid = ts_get_relation_relid(NameStr(cagg->data.partial_view_schema),
+										  NameStr(cagg->data.partial_view_name),
+										  false);
 
+	cagg_view_rel = table_open(cagg_view_oid, AccessShareLock);
+	cagg_view_rules = cagg_view_rel->rd_rules;
+	Assert(cagg_view_rules && cagg_view_rules->numLocks == 1);
+
+	rule = cagg_view_rules->rules[0];
+	if (rule->event != CMD_SELECT)
+		ereport(ERROR, (errcode(ERRCODE_TS_UNEXPECTED), errmsg("unexpected rule event for view")));
+
+	cagg_view_query = (Query *) copyObject(linitial(rule->actions));
+	table_close(cagg_view_rel, NoLock);
+
+	return cagg_view_query;
+}
+
+Query *
+ts_continuous_agg_get_finalized_query(ContinuousAgg *cagg)
+{
+	Oid cagg_view_oid;
+	Relation cagg_view_rel;
+	RuleLock *cagg_view_rules;
+	RewriteRule *rule;
+	Query *cagg_view_query;
+
+	cagg_view_oid = ts_get_relation_relid(NameStr(cagg->data.user_view_schema),
+										  NameStr(cagg->data.user_view_name),
+										  false);
 	cagg_view_rel = table_open(cagg_view_oid, AccessShareLock);
 	cagg_view_rules = cagg_view_rel->rd_rules;
 	Assert(cagg_view_rules && cagg_view_rules->numLocks == 1);
@@ -1574,7 +1590,7 @@ ts_continuous_agg_get_query(ContinuousAgg *cagg)
  * Get the width of a fixed size bucket
  */
 int64
-ts_continuous_agg_fixed_bucket_width(const ContinuousAggsBucketFunction *bucket_function)
+ts_continuous_agg_fixed_bucket_width(const ContinuousAggBucketFunction *bucket_function)
 {
 	Assert(bucket_function->bucket_fixed_interval == true);
 
@@ -1594,7 +1610,7 @@ ts_continuous_agg_fixed_bucket_width(const ContinuousAggsBucketFunction *bucket_
  * Get the width of a bucket
  */
 int64
-ts_continuous_agg_bucket_width(const ContinuousAggsBucketFunction *bucket_function)
+ts_continuous_agg_bucket_width(const ContinuousAggBucketFunction *bucket_function)
 {
 	int64 bucket_width;
 

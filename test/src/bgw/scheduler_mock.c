@@ -312,14 +312,11 @@ test_job_2_error()
 	return true;
 }
 
-static pqsigfunc prev_signal_func = NULL;
-
 static void
 log_terminate_signal(SIGNAL_ARGS)
 {
 	write_stderr("job got term signal\n");
-	if (prev_signal_func != NULL)
-		prev_signal_func(postgres_signal_arg);
+	die(postgres_signal_arg);
 }
 
 TS_FUNCTION_INFO_V1(ts_bgw_test_job_sleep);
@@ -333,12 +330,8 @@ ts_bgw_test_job_sleep(PG_FUNCTION_ARGS)
 {
 	BackgroundWorkerBlockSignals();
 
-	/*
-	 * Only set prev_signal_func once to prevent it from being set to
-	 * log_terminate_signal.
-	 */
-	if (prev_signal_func == NULL)
-		prev_signal_func = pqsignal(SIGTERM, log_terminate_signal);
+	pqsignal(SIGTERM, log_terminate_signal);
+
 	/* Setup any signal handlers here */
 	BackgroundWorkerUnblockSignals();
 
@@ -364,18 +357,14 @@ test_job_3_long()
 {
 	BackgroundWorkerBlockSignals();
 
-	/*
-	 * Only set prev_signal_func once to prevent it from being set to
-	 * log_terminate_signal.
-	 */
-	if (prev_signal_func == NULL)
-		prev_signal_func = pqsignal(SIGTERM, log_terminate_signal);
+	pqsignal(SIGTERM, log_terminate_signal);
+
 	/* Setup any signal handlers here */
 	BackgroundWorkerUnblockSignals();
 
 	elog(WARNING, "Before sleep job 3");
 
-	DirectFunctionCall1(pg_sleep, Float8GetDatum(0.5L));
+	DirectFunctionCall1(pg_sleep, Float8GetDatum(2.0L));
 
 	elog(WARNING, "After sleep job 3");
 	return true;

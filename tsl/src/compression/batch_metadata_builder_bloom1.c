@@ -14,13 +14,13 @@
 
 #include <math.h>
 
-#include "compression.h"
-
-#include "batch_metadata_builder.h"
+#include "sparse_index_bloom1.h"
 
 #include "arrow_c_data_interface.h"
-
-#include "sparse_index_bloom1.h"
+#include "batch_metadata_builder.h"
+#include "city_combine.h"
+#include "compression.h"
+#include "guc.h"
 
 #ifdef TS_USE_UMASH
 #include "import/umash.h"
@@ -45,18 +45,31 @@
  */
 #define BLOOM1_BLOCK_BITS 256
 
+/* The NULL marker is used to preserve NULLs in the composite hash. The value is coming from Golden
+ * ratio constant so it is unlikely to degrade the collision resistance of the bloom filter.
+ * The purpose of the NULL marker is two fold: 1) to distinguish NULLs from actual values so
+ * we don't get the same hash for ('foo',NULL) and (NULL, 'foo') and 2) with having a specific
+ * marker, we can support IS NULL predicates on columns in addition to equality.
+ * */
+#define NULL_MARKER 0x9E3779B97F4A7C15ULL
+typedef struct Bloom1HasherInternal
+{
+	Bloom1Hasher functions;
+	PGFunction hash_functions[MAX_BLOOM_FILTER_COLUMNS];
+	FmgrInfo *hash_function_finfos[MAX_BLOOM_FILTER_COLUMNS];
+} Bloom1HasherInternal;
+
 typedef struct Bloom1MetadataBuilder
 {
 	BatchMetadataBuilder functions;
-
 	int16 bloom_attr_offset;
-
 	int allocated_varlena_bytes;
 	struct varlena *bloom_varlena;
-
-	PGFunction hash_function;
-	FmgrInfo *hash_function_finfo;
+	AttrNumber input_columns[MAX_BLOOM_FILTER_COLUMNS];
+	Bloom1HasherInternal hasher;
 } Bloom1MetadataBuilder;
+
+static void bloom1_hasher_init(Bloom1HasherInternal *hasher, const Oid *type_oids, int num_columns);
 
 /*
  * Low-bias invertible hash function from this article:
@@ -172,30 +185,32 @@ bloom1_get_hash_function(Oid type, FmgrInfo **finfo)
 			return bloom1_hash_8;
 
 		case F_HASHINT4EXTENDED:
+#if PG18_GE
+		/*
+		 * PG18 added a custom hashing function for date type.
+		 * For backwards compatibility, we need to continue using
+		 * our own custom function which was used for < PG18.
+		 *
+		 * https://github.com/postgres/postgres/commit/23d0b484
+		 */
+		case F_HASHDATEEXTENDED:
+#endif
 			return bloom1_hash_4;
+		default:
+			/*
+			 * Use the Postgres hash function. We might require the finfo, for
+			 * example for functions defined in procedural languages.
+			 */
+			*finfo = &entry->hash_extended_proc_finfo;
+			return entry->hash_extended_proc_finfo.fn_addr;
 	}
-
-	/*
-	 * For the Postgres hash function, finfo might be required, for example for
-	 * functions defined in procedural languages.
-	 */
-	*finfo = &entry->hash_extended_proc_finfo;
-	return entry->hash_extended_proc_finfo.fn_addr;
-}
-
-static void
-bloom1_update_null(void *builder_)
-{
-	/*
-	 * A null value cannot match an equality condition that we're optimizing
-	 * with bloom filters, so we don't need to consider them here.
-	 */
 }
 
 static void
 bloom1_reset(void *builder_, RowCompressor *compressor)
 {
 	Bloom1MetadataBuilder *builder = (Bloom1MetadataBuilder *) builder_;
+	Assert(builder->functions.builder_type == METADATA_BUILDER_BLOOM1);
 
 	struct varlena *bloom = builder->bloom_varlena;
 	memset(bloom, 0, builder->allocated_varlena_bytes);
@@ -217,11 +232,12 @@ bloom1_num_bits(const struct varlena *bloom)
 	return 8 * VARSIZE_ANY_EXHDR(bloom);
 }
 
-static void
-bloom1_insert_to_compressed_row(void *builder_, RowCompressor *compressor)
+void
+batch_metadata_builder_bloom1_insert_bloom_filter_to_compressed_row(void *bloom_varlena,
+																	int16 bloom_attr_offset,
+																	RowCompressor *compressor)
 {
-	Bloom1MetadataBuilder *builder = (Bloom1MetadataBuilder *) builder_;
-	struct varlena *bloom = builder->bloom_varlena;
+	struct varlena *bloom = (struct varlena *) bloom_varlena;
 	char *restrict words_buf = bloom1_words_buf(bloom);
 
 	const int orig_num_bits = bloom1_num_bits(bloom);
@@ -241,8 +257,8 @@ bloom1_insert_to_compressed_row(void *builder_, RowCompressor *compressor)
 		 * but technically possible, and the following calculations will
 		 * segfault in this case.
 		 */
-		compressor->compressed_is_null[builder->bloom_attr_offset] = true;
-		compressor->compressed_values[builder->bloom_attr_offset] = PointerGetDatum(NULL);
+		compressor->compressed_is_null[bloom_attr_offset] = true;
+		compressor->compressed_values[bloom_attr_offset] = PointerGetDatum(NULL);
 		return;
 	}
 
@@ -304,15 +320,25 @@ bloom1_insert_to_compressed_row(void *builder_, RowCompressor *compressor)
 	Assert(bloom1_num_bits(bloom) % (sizeof(*words_buf) * 8) == 0);
 	Assert(bloom1_num_bits(bloom) % 64 == 0);
 
-	compressor->compressed_is_null[builder->bloom_attr_offset] = false;
-	compressor->compressed_values[builder->bloom_attr_offset] = PointerGetDatum(bloom);
+	compressor->compressed_is_null[bloom_attr_offset] = false;
+	compressor->compressed_values[bloom_attr_offset] = PointerGetDatum(bloom);
+}
+
+static void
+bloom1_insert_to_compressed_row(void *builder_, RowCompressor *compressor)
+{
+	Bloom1MetadataBuilder *builder = (Bloom1MetadataBuilder *) builder_;
+	batch_metadata_builder_bloom1_insert_bloom_filter_to_compressed_row(builder->bloom_varlena,
+																		builder->bloom_attr_offset,
+																		compressor);
 }
 
 /*
  * Call a hash function that uses a postgres "extended hash" signature.
  */
-static inline uint64
-calculate_hash(PGFunction hash_function, FmgrInfo *finfo, Datum needle)
+uint64
+batch_metadata_builder_bloom1_calculate_hash(PGFunction hash_function, FmgrInfo *finfo,
+											 Datum needle)
 {
 	LOCAL_FCINFO(hashfcinfo, 2);
 	*hashfcinfo = (FunctionCallInfoBaseData){ 0 };
@@ -360,13 +386,14 @@ bloom1_get_one_offset(uint64 value_hash, uint32 index)
 	return low + (index * high + index * index) % BLOOM1_BLOCK_BITS;
 }
 
-static void
-bloom1_update_val(void *builder_, Datum needle)
+void
+batch_metadata_builder_bloom1_update_bloom_filter_with_hash(void *varlena_ptr, uint64 hash)
 {
-	Bloom1MetadataBuilder *builder = (Bloom1MetadataBuilder *) builder_;
+	Assert(varlena_ptr != NULL);
+	struct varlena *bloom_varlena = (struct varlena *) varlena_ptr;
 
-	char *restrict words_buf = bloom1_words_buf(builder->bloom_varlena);
-	const uint32 num_bits = bloom1_num_bits(builder->bloom_varlena);
+	char *restrict words_buf = bloom1_words_buf(bloom_varlena);
+	const uint32 num_bits = bloom1_num_bits(bloom_varlena);
 
 	/*
 	 * These calculations are a little inconvenient, but I had to switch to
@@ -381,16 +408,185 @@ bloom1_update_val(void *builder_, Datum needle)
 	const uint32 word_mask = num_word_bits - 1;
 	Assert((word_mask >> num_word_bits) == 0);
 
-	const uint64 datum_hash_1 =
-		calculate_hash(builder->hash_function, builder->hash_function_finfo, needle);
 	const uint32 absolute_mask = num_bits - 1;
 	for (int i = 0; i < BLOOM1_HASHES; i++)
 	{
-		const uint32 absolute_bit_index = bloom1_get_one_offset(datum_hash_1, i) & absolute_mask;
+		const uint32 absolute_bit_index = bloom1_get_one_offset(hash, i) & absolute_mask;
 		const uint32 word_index = absolute_bit_index >> log2_word_bits;
 		const uint32 word_bit_index = absolute_bit_index & word_mask;
 		words_buf[word_index] |= 1ULL << word_bit_index;
 	}
+}
+
+static uint64
+bloom1_hash_values(void *hasher_, const NullableDatum *values)
+{
+	Bloom1HasherInternal *hasher = (Bloom1HasherInternal *) hasher_;
+	int num_columns = hasher->functions.num_columns;
+
+	uint64 accumulated = 0;
+
+	if (values[0].isnull)
+		accumulated = NULL_MARKER;
+	else
+		accumulated = batch_metadata_builder_bloom1_calculate_hash(hasher->hash_functions[0],
+																   hasher->hash_function_finfos[0],
+																   values[0].value);
+
+	for (int i = 1; i < num_columns; i++)
+	{
+		if (values[i].isnull)
+		{
+			accumulated = city_hash_combine(accumulated, NULL_MARKER);
+		}
+		else
+		{
+			uint64 h = batch_metadata_builder_bloom1_calculate_hash(hasher->hash_functions[i],
+																	hasher->hash_function_finfos[i],
+																	values[i].value);
+			accumulated = city_hash_combine(accumulated, h);
+		}
+	}
+
+	return accumulated;
+}
+
+static void
+bloom1_update_row(void *builder_, TupleTableSlot *slot)
+{
+	Bloom1MetadataBuilder *builder = (Bloom1MetadataBuilder *) builder_;
+	Bloom1Hasher *hasher = &builder->hasher.functions;
+	int num_columns = hasher->num_columns;
+	NullableDatum values[MAX_BLOOM_FILTER_COLUMNS];
+
+	for (int i = 0; i < num_columns; i++)
+	{
+		values[i].value = slot_getattr(slot, builder->input_columns[i], &values[i].isnull);
+	}
+
+	/* For single-column blooms, skip NULLs to match old bloom1_update_null (no-op) behavior. */
+	if (num_columns == 1 && values[0].isnull)
+		return;
+
+	uint64 hash = hasher->hash_values(hasher, values);
+	batch_metadata_builder_bloom1_update_bloom_filter_with_hash(builder->bloom_varlena, hash);
+}
+
+/*
+ * We cache some information across function calls in this context.
+ */
+typedef struct Bloom1ContainsContext
+{
+	Oid element_type;
+	int16 element_typlen;
+	bool element_typbyval;
+	char element_typalign;
+
+	/* This is per-row, here for convenience. */
+	struct varlena *current_row_bloom;
+
+	Bloom1HasherInternal bloom_hasher;
+} Bloom1ContainsContext;
+
+static Bloom1ContainsContext *
+bloom1_contains_context_prepare(FunctionCallInfo fcinfo, bool use_element_type)
+{
+	Bloom1ContainsContext *context = (Bloom1ContainsContext *) fcinfo->flinfo->fn_extra;
+	if (context == NULL)
+	{
+		Ensure(PG_NARGS() == 2, "bloom1_contains called with wrong number of arguments");
+
+		context = MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, sizeof(*context));
+
+		context->element_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+		if (use_element_type)
+		{
+			context->element_type = get_element_type(context->element_type);
+			Ensure(OidIsValid(context->element_type),
+				   "cannot determine array element type for bloom1_contains_any");
+		}
+
+		Oid type_oids[MAX_BLOOM_FILTER_COLUMNS];
+		int num_columns;
+
+		if (context->element_type == RECORDOID)
+		{
+			HeapTupleHeader tuple = DatumGetHeapTupleHeader(PG_GETARG_DATUM(1));
+			Oid tupType = HeapTupleHeaderGetTypeId(tuple);
+			int32 tupTypmod = HeapTupleHeaderGetTypMod(tuple);
+			TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+			num_columns = tupdesc->natts;
+			if (num_columns > MAX_BLOOM_FILTER_COLUMNS)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("composite bloom filter supports at most %d columns, got %d",
+								MAX_BLOOM_FILTER_COLUMNS,
+								num_columns)));
+
+			for (int i = 0; i < num_columns; i++)
+				type_oids[i] = TupleDescAttr(tupdesc, i)->atttypid;
+			ReleaseTupleDesc(tupdesc);
+		}
+		else
+		{
+			type_oids[0] = context->element_type;
+			num_columns = 1;
+		}
+
+		bloom1_hasher_init(&context->bloom_hasher, type_oids, num_columns);
+
+		get_typlenbyvalalign(context->element_type,
+							 &context->element_typlen,
+							 &context->element_typbyval,
+							 &context->element_typalign);
+
+		fcinfo->flinfo->fn_extra = context;
+	}
+
+	if (PG_ARGISNULL(0))
+	{
+		context->current_row_bloom = NULL;
+	}
+	else
+	{
+		context->current_row_bloom = PG_GETARG_VARLENA_P(0);
+	}
+
+	return context;
+}
+
+static inline bool
+bloom1_contains_hash_internal(const char *words_buf, uint32 num_bits, uint64 hash)
+{
+	Assert(words_buf != NULL);
+
+	/* Must be a power of two. */
+	CheckCompressedData(num_bits == (1ULL << pg_leftmost_one_pos32(num_bits)));
+
+	/* Must be >= 64 bits. */
+	CheckCompressedData(num_bits >= 64);
+
+	const uint32 num_word_bits = sizeof(*words_buf) * 8;
+	Assert(num_bits % num_word_bits == 0);
+	const uint32 log2_word_bits = pg_leftmost_one_pos32(num_word_bits);
+	Assert(num_word_bits == (1ULL << log2_word_bits));
+
+	const uint32 word_mask = num_word_bits - 1;
+	Assert((word_mask >> num_word_bits) == 0);
+
+	const uint32 absolute_mask = num_bits - 1;
+	for (int i = 0; i < BLOOM1_HASHES; i++)
+	{
+		const uint32 absolute_bit_index = bloom1_get_one_offset(hash, i) & absolute_mask;
+		const uint32 word_index = absolute_bit_index >> log2_word_bits;
+		const uint32 word_bit_index = absolute_bit_index & word_mask;
+		if ((words_buf[word_index] & (1ULL << word_bit_index)) == 0)
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 /*
@@ -402,10 +598,72 @@ Datum
 bloom1_contains(PG_FUNCTION_ARGS)
 {
 	/*
+	 * A null value cannot match the equality condition, although this probably
+	 * should be optimized away by the planner.
+	 */
+	if (PG_ARGISNULL(1))
+	{
+		PG_RETURN_BOOL(false);
+	}
+
+	Bloom1ContainsContext *context =
+		bloom1_contains_context_prepare(fcinfo, /* use_element_type = */ false);
+
+	/*
 	 * This function is not strict, because if we don't have a bloom filter, this
 	 * means the condition can potentially be true.
 	 */
-	if (PG_ARGISNULL(0))
+	struct varlena *bloom = context->current_row_bloom;
+	if (bloom == NULL)
+	{
+		PG_RETURN_BOOL(true);
+	}
+
+	uint64 hash = 0;
+	NullableDatum values[MAX_BLOOM_FILTER_COLUMNS];
+	memset(values, 0, sizeof(values));
+
+	if (context->bloom_hasher.functions.num_columns > 1)
+	{
+		HeapTupleHeader tuple = DatumGetHeapTupleHeader(PG_GETARG_DATUM(1));
+		for (int i = 0; i < context->bloom_hasher.functions.num_columns; i++)
+			values[i].value = GetAttributeByNum(tuple, i + 1, &values[i].isnull);
+	}
+	else
+	{
+		values[0].value = PG_GETARG_DATUM(1);
+		values[0].isnull = false;
+	}
+
+	hash = bloom1_hash_values(&context->bloom_hasher, values);
+	PG_RETURN_BOOL(bloom1_contains_hash(PointerGetDatum(bloom), hash));
+}
+
+#define ST_SORT sort_hashes
+#define ST_ELEMENT_TYPE uint64
+#define ST_COMPARE(a, b) ((*(a) > *(b)) - (*(a) < *(b)))
+#define ST_SCOPE static
+#define ST_DEFINE
+#include <lib/sort_template.h>
+
+/*
+ * Checks whether any element of the given array can be present in the given
+ * bloom filter. This is used for predicate pushdown for x = any(array[...]).
+ * The SQL signature is:
+ * _timescaledb_functions.bloom1_contains_any(bloom1, anyarray)
+ */
+Datum
+bloom1_contains_any(PG_FUNCTION_ARGS)
+{
+	Bloom1ContainsContext *context =
+		bloom1_contains_context_prepare(fcinfo, /* use_element_type = */ true);
+
+	/*
+	 * This function is not strict, because if we don't have a bloom filter, this
+	 * means the condition can potentially be true.
+	 */
+	struct varlena *bloom = context->current_row_bloom;
+	if (bloom == NULL)
 	{
 		PG_RETURN_BOOL(true);
 	}
@@ -419,23 +677,69 @@ bloom1_contains(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 	}
 
-	Oid type_oid = get_fn_expr_argtype(fcinfo->flinfo, 1);
-	FmgrInfo *finfo = NULL;
-	PGFunction fn = bloom1_get_hash_function(type_oid, &finfo);
-	/*
-	 * Technically this function is callable by user with arbitrary argument
-	 * that might not have an extended hash function, so report this error
-	 * gracefully.
-	 */
-	if (fn == NULL)
+	int num_items;
+	Datum *items;
+	bool *nulls;
+	deconstruct_array(PG_GETARG_ARRAYTYPE_P(1),
+					  context->element_type,
+					  context->element_typlen,
+					  context->element_typbyval,
+					  context->element_typalign,
+					  &items,
+					  &nulls,
+					  &num_items);
+
+	if (num_items == 0)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("the argument type %s lacks an extended hash function",
-						format_type_be(type_oid))));
+		PG_RETURN_BOOL(false);
 	}
 
-	struct varlena *bloom = PG_GETARG_VARLENA_P(0);
+	/*
+	 * Calculate the per-item base hashes that will be used for computing the
+	 * individual bloom filter bit offsets. We can reuse the "items" space to
+	 * avoid more allocations, but have to allocate as a fallback on 32-bit
+	 * systems.
+	 */
+#if FLOAT8PASSBYVAL
+	uint64 *item_base_hashes = (uint64 *) items;
+#else
+	uint64 *item_base_hashes = palloc(sizeof(uint64) * num_items);
+#endif
+
+	FmgrInfo *finfo = context->bloom_hasher.hash_function_finfos[0];
+	PGFunction hash_fn = context->bloom_hasher.hash_functions[0];
+
+	int valid = 0;
+	for (int i = 0; i < num_items; i++)
+	{
+		if (nulls[i])
+		{
+			/*
+			 * A null value cannot match the equality condition.
+			 */
+			continue;
+		}
+
+		item_base_hashes[valid++] =
+			batch_metadata_builder_bloom1_calculate_hash(hash_fn, finfo, items[i]);
+	}
+
+	if (valid == 0)
+	{
+		/*
+		 * No non-null elements.
+		 */
+		PG_RETURN_BOOL(false);
+	}
+
+	/*
+	 * Sort the hashes for cache-friendly probing.
+	 */
+	sort_hashes(item_base_hashes, valid);
+
+	/*
+	 * Get the bloom filter parameters.
+	 */
 	const char *words_buf = bloom1_words_buf(bloom);
 	const uint32 num_bits = bloom1_num_bits(bloom);
 
@@ -453,34 +757,52 @@ bloom1_contains(PG_FUNCTION_ARGS)
 	const uint32 word_mask = num_word_bits - 1;
 	Assert((word_mask >> num_word_bits) == 0);
 
-	Datum needle = PG_GETARG_DATUM(1);
-	const uint64 datum_hash_1 = calculate_hash(fn, finfo, needle);
 	const uint32 absolute_mask = num_bits - 1;
-	for (int i = 0; i < BLOOM1_HASHES; i++)
+
+	/* Probe the bloom filter. */
+	for (int item_index = 0; item_index < valid; item_index++)
 	{
-		const uint32 absolute_bit_index = bloom1_get_one_offset(datum_hash_1, i) & absolute_mask;
-		const uint32 word_index = absolute_bit_index >> log2_word_bits;
-		const uint32 word_bit_index = absolute_bit_index & word_mask;
-		if ((words_buf[word_index] & (1ULL << word_bit_index)) == 0)
+		const uint64 base_hash = item_base_hashes[item_index];
+		bool match = true;
+		for (int i = 0; i < BLOOM1_HASHES; i++)
 		{
-			PG_RETURN_BOOL(false);
+			const uint32 absolute_bit_index = bloom1_get_one_offset(base_hash, i) & absolute_mask;
+			const uint32 word_index = absolute_bit_index >> log2_word_bits;
+			const uint32 word_bit_index = absolute_bit_index & word_mask;
+			if ((words_buf[word_index] & (1ULL << word_bit_index)) == 0)
+			{
+				match = false;
+				break;
+			}
+		}
+		if (match)
+		{
+			PG_RETURN_BOOL(true);
 		}
 	}
-	PG_RETURN_BOOL(true);
+
+	PG_RETURN_BOOL(false);
 }
 
 static int
-bloom1_varlena_alloc_size(int num_bits)
+bloom1_varlena_alloc_size(uint32 num_bits)
 {
 	/*
 	 * We are not supposed to go below 64 bits because we work in 64-bit words.
 	 */
 	Assert(num_bits % 64 == 0);
+	Assert(num_bits > 0);
+
+	/*
+	 * We must not go over varlena size limit.
+	 */
+	Assert(num_bits / 8 <= (1ULL << 30) - 1);
+
 	return VARHDRSZ + num_bits / 8;
 }
 
-BatchMetadataBuilder *
-batch_metadata_builder_bloom1_create(Oid type_oid, int bloom_attr_offset)
+int
+batch_metadata_builder_bloom1_varlena_size(void)
 {
 	/*
 	 * Better make the bloom filter size a power of two, because we compress the
@@ -489,31 +811,73 @@ batch_metadata_builder_bloom1_create(Oid type_oid, int bloom_attr_offset)
 	 */
 	const int expected_elements = TARGET_COMPRESSED_BATCH_SIZE * 16;
 	const int lowest_power = pg_leftmost_one_pos32(expected_elements * 2 - 1);
-	Assert(lowest_power <= 16);
+
+	/*
+	 * The total number of elements must fit into uint32, since that's what we
+	 * use for addressing the elements.
+	 */
+	Assert(lowest_power < 32);
+
 	const int desired_bits = 1ULL << lowest_power;
-	const int varlena_bytes = bloom1_varlena_alloc_size(desired_bits);
+	return bloom1_varlena_alloc_size(desired_bits);
+}
+
+static void
+bloom1_hasher_init(Bloom1HasherInternal *hasher, const Oid *type_oids, int num_columns)
+{
+	*hasher = (Bloom1HasherInternal){
+		.functions =
+			(Bloom1Hasher){
+				.hash_values = bloom1_hash_values,
+				.num_columns = num_columns,
+			},
+	};
+
+	for (int i = 0; i < num_columns; i++)
+	{
+		hasher->hash_functions[i] =
+			bloom1_get_hash_function(type_oids[i], &hasher->hash_function_finfos[i]);
+		if (hasher->hash_functions[i] == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("the argument type %s lacks an extended hash function",
+							format_type_be(type_oids[i]))));
+	}
+}
+
+Bloom1Hasher *
+bloom1_hasher_create(const Oid *type_oids, int num_columns)
+{
+	Bloom1HasherInternal *hasher = palloc(sizeof(*hasher));
+	bloom1_hasher_init(hasher, type_oids, num_columns);
+	return &hasher->functions;
+}
+
+BatchMetadataBuilder *
+batch_metadata_builder_bloom1_create(int num_columns, const Oid *type_oids,
+									 const AttrNumber *attnums, int bloom_attr_offset)
+{
+	Assert(num_columns >= 1 && num_columns <= MAX_BLOOM_FILTER_COLUMNS);
+
+	const int varlena_bytes = batch_metadata_builder_bloom1_varlena_size();
 
 	Bloom1MetadataBuilder *builder = palloc(sizeof(*builder));
 	*builder = (Bloom1MetadataBuilder){
 		.functions =
 			(BatchMetadataBuilder){
-				.update_val = bloom1_update_val,
-				.update_null = bloom1_update_null,
+				.update_row = bloom1_update_row,
 				.insert_to_compressed_row = bloom1_insert_to_compressed_row,
 				.reset = bloom1_reset,
+				.builder_type = METADATA_BUILDER_BLOOM1,
 			},
 		.bloom_attr_offset = bloom_attr_offset,
 		.allocated_varlena_bytes = varlena_bytes,
 	};
 
-	builder->hash_function = bloom1_get_hash_function(type_oid, &builder->hash_function_finfo);
-	if (builder->hash_function == NULL)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("the argument type %s lacks an extended hash function",
-						format_type_be(type_oid))));
-	}
+	memcpy(builder->input_columns, attnums, num_columns * sizeof(AttrNumber));
+
+	/* Initialize the embedded hasher */
+	bloom1_hasher_init(&builder->hasher, type_oids, num_columns);
 
 	/*
 	 * Initialize the bloom filter.
@@ -634,7 +998,64 @@ ts_bloom1_debug_hash(PG_FUNCTION_ARGS)
 
 	Assert(!PG_ARGISNULL(0));
 	Datum needle = PG_GETARG_DATUM(0);
-	PG_RETURN_UINT64(calculate_hash(fn, finfo, needle));
+	PG_RETURN_UINT64(batch_metadata_builder_bloom1_calculate_hash(fn, finfo, needle));
+}
+
+TS_FUNCTION_INFO_V1(ts_bloom1_composite_debug_hash);
+
+Datum
+ts_bloom1_composite_debug_hash(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+
+	HeapTupleHeader tuple = DatumGetHeapTupleHeader(PG_GETARG_DATUM(0));
+	Oid tupType = HeapTupleHeaderGetTypeId(tuple);
+	int32 tupTypmod = HeapTupleHeaderGetTypMod(tuple);
+	TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+	int num_fields = tupdesc->natts;
+	if (num_fields < 2 || num_fields > MAX_BLOOM_FILTER_COLUMNS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("composite bloom requires 2-%d fields, got %d",
+						MAX_BLOOM_FILTER_COLUMNS,
+						num_fields)));
+
+	Oid type_oids[MAX_BLOOM_FILTER_COLUMNS];
+	for (int i = 0; i < num_fields; i++)
+		type_oids[i] = TupleDescAttr(tupdesc, i)->atttypid;
+	ReleaseTupleDesc(tupdesc);
+
+	Bloom1Hasher *hasher = bloom1_hasher_create(type_oids, num_fields);
+
+	NullableDatum values[MAX_BLOOM_FILTER_COLUMNS];
+	for (int i = 0; i < num_fields; i++)
+		values[i].value = GetAttributeByNum(tuple, i + 1, &values[i].isnull);
+
+	uint64 hash = hasher->hash_values(hasher, values);
+	PG_RETURN_INT64((int64) hash);
 }
 
 #endif // #ifndef NDEBUG
+
+char const *bloom1_column_prefix = NULL;
+
+/* this function will be reused in a later PR when we push down pre-calculated
+ * hash value checks from the planner */
+bool
+bloom1_contains_hash(Datum bloom_datum, uint64 hash)
+{
+	struct varlena *bloom = DatumGetByteaPP(bloom_datum);
+	if (bloom == NULL)
+		return true; /* No bloom = might match */
+
+	const char *words_buf = VARDATA_ANY(bloom);
+	const uint32 num_bits = 8 * VARSIZE_ANY_EXHDR(bloom);
+
+	/* Validate bloom structure */
+	CheckCompressedData(num_bits == (1ULL << pg_leftmost_one_pos32(num_bits)));
+	CheckCompressedData(num_bits >= 64);
+
+	return bloom1_contains_hash_internal(words_buf, num_bits, hash);
+}

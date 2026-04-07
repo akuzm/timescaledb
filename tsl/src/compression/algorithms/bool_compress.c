@@ -7,6 +7,7 @@
 #include "bool_compress.h"
 #include "compression/arrow_c_data_interface.h"
 #include "compression/compression.h"
+#include "guc.h"
 #include "simple8b_rle.h"
 #include "simple8b_rle_bitarray.h"
 #include "simple8b_rle_bitmap.h"
@@ -168,6 +169,7 @@ extern DecompressionIterator *
 bool_decompression_iterator_from_datum_forward(Datum bool_compressed, Oid element_type)
 {
 	BoolDecompressionIterator *iterator = palloc(sizeof(*iterator));
+	CheckCompressedData(DatumGetPointer(bool_compressed) != NULL);
 	decompression_iterator_init(iterator,
 								(void *) PG_DETOAST_DATUM(bool_compressed),
 								element_type,
@@ -213,6 +215,7 @@ extern DecompressionIterator *
 bool_decompression_iterator_from_datum_reverse(Datum bool_compressed, Oid element_type)
 {
 	BoolDecompressionIterator *iterator = palloc(sizeof(*iterator));
+	CheckCompressedData(DatumGetPointer(bool_compressed) != NULL);
 	decompression_iterator_init(iterator,
 								(void *) PG_DETOAST_DATUM(bool_compressed),
 								element_type,
@@ -337,6 +340,8 @@ bool_decompress_all(Datum compressed, Oid element_type, MemoryContext dest_mctx)
 	ArrowArray *result = NULL;
 	uint64 *validity_bitmap = NULL;
 	uint64 *decompressed_values = NULL;
+
+	CheckCompressedData(DatumGetPointer(compressed) != NULL);
 
 	void *detoasted = PG_DETOAST_DATUM(compressed);
 	StringInfoData si = { .data = detoasted, .len = VARSIZE(compressed) };

@@ -55,7 +55,7 @@ INSERT INTO "1dim_neg" VALUES (19, 21.2);
 INSERT INTO "1dim_neg" VALUES (20, 21.2);
 SELECT * FROM "1dim_pre1970";
 SELECT * FROM "1dim_neg";
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk;
+SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, status, osm_chunk FROM _timescaledb_catalog.chunk;
 SELECT * FROM _timescaledb_catalog.dimension_slice;
 
 
@@ -74,11 +74,11 @@ SELECT * FROM test.show_constraints('_timescaledb_internal._hyper_7_16_chunk');
 SELECT * FROM "3dim";
 
 -- test that explain works
-EXPLAIN (COSTS FALSE)
+EXPLAIN (BUFFERS FALSE, COSTS FALSE)
 INSERT INTO "3dim" VALUES('2017-01-21T09:00:01', 32.9, 'green', 'nyc'),
                          ('2017-01-21T09:00:47', 27.3, 'purple', 'la') RETURNING *;
 
-EXPLAIN (COSTS FALSE)
+EXPLAIN (BUFFERS FALSE, COSTS FALSE)
 WITH "3dim_insert" AS (
      INSERT INTO "3dim" VALUES('2017-01-21T09:01:44', 19.3, 'black', 'la') RETURNING time, temp
 ), regular_insert AS (
@@ -201,3 +201,22 @@ SELECT * FROM data_records;
 
 \set QUIET on
 ROLLBACK;
+
+-- Test INSERT into hypertable with a generated column whose type is a
+-- domain with a NOT NULL constraint
+CREATE DOMAIN nn_int AS int CHECK (VALUE IS NOT NULL);
+
+CREATE TABLE generated_col_ht(
+    time timestamptz NOT NULL,
+    val int NOT NULL,
+    doubled nn_int GENERATED ALWAYS AS (val * 2) STORED
+);
+SELECT create_hypertable('generated_col_ht', 'time');
+
+INSERT INTO generated_col_ht(time, val) VALUES ('2024-01-01', 5);
+INSERT INTO generated_col_ht(time, val) VALUES ('2024-01-02', 10) RETURNING *;
+
+SELECT * FROM generated_col_ht ORDER BY time;
+
+DROP TABLE generated_col_ht;
+DROP DOMAIN nn_int;

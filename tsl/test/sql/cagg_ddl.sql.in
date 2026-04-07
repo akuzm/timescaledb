@@ -23,7 +23,7 @@ SELECT table_name FROM create_hypertable('conditions', 'timec');
 
 -- schema tests
 
-\c :TEST_DBNAME :ROLE_CLUSTER_SUPERUSER
+\c :TEST_DBNAME :ROLE_SUPERUSER
 
 SET timezone TO 'UTC+8';
 
@@ -272,6 +272,9 @@ TRUNCATE truncate_partitioned;
 SELECT * FROM truncate_partitioned;
 
 -- ALTER TABLE tests
+ALTER TABLE :drop_chunks_mat_table_u SET (parallel_workers = 4);
+ALTER TABLE :drop_chunks_mat_table_u RESET (parallel_workers);
+
 \set ON_ERROR_STOP 0
 -- test a variety of ALTER TABLE statements
 ALTER TABLE :drop_chunks_mat_table_u RENAME time_bucket TO bad_name;
@@ -295,7 +298,7 @@ ALTER TABLE :drop_chunks_mat_table_u_name RENAME TO new_name;
 SET ROLE :ROLE_DEFAULT_PERM_USER;
 SET client_min_messages TO NOTICE;
 
-SELECT * FROM new_name;
+SELECT * FROM new_name ORDER BY 1;
 
 SELECT * FROM drop_chunks_view ORDER BY 1;
 
@@ -390,8 +393,6 @@ SELECT drop_chunks('drop_chunks_table', older_than => (integer_now_test2()-9));
 SELECT * FROM drop_chunks_view ORDER BY time_bucket DESC;
 --earliest datapoint now in table
 SELECT * FROM drop_chunks_table ORDER BY time ASC limit 1;
---chunks are removed
-SELECT id, hypertable_id, schema_name, table_name, compressed_chunk_id, dropped, status, osm_chunk FROM _timescaledb_catalog.chunk WHERE dropped;
 --still see data in the view
 SELECT * FROM drop_chunks_view WHERE time_bucket < (integer_now_test2()-9) ORDER BY time_bucket DESC;
 --no data but covers dropped chunks
@@ -745,12 +746,22 @@ ALTER MATERIALIZED VIEW owner_check OWNER TO :ROLE_1;
 \set ON_ERROR_STOP 1
 
 -- Superuser can always change owner
-SET ROLE :ROLE_CLUSTER_SUPERUSER;
+SET ROLE :ROLE_SUPERUSER;
+
+-- Add a refresh policy before changing owner to verify job owner is propagated
+SELECT add_continuous_aggregate_policy('owner_check', NULL, 1::int8, '1 day'::interval) AS cagg_job_id \gset
+SELECT owner FROM _timescaledb_config.bgw_job WHERE id = :cagg_job_id;
+
 ALTER MATERIALIZED VIEW owner_check OWNER TO :ROLE_1;
 
 \x on
 SELECT * FROM cagg_info WHERE user_view::text = 'owner_check';
 \x off
+
+-- make sure policy job owner is propagated
+SELECT owner FROM _timescaledb_config.bgw_job WHERE id = :cagg_job_id;
+
+SELECT remove_continuous_aggregate_policy('owner_check');
 
 --
 -- Test drop continuous aggregate cases
@@ -930,12 +941,21 @@ INSERT INTO conditions VALUES ( '2018-11-02 09:20:00-08', 'NYC', 10);
 INSERT INTO conditions VALUES ( '2018-11-02 10:30:00-08', 'NYC', 20);
 
 CREATE MATERIALIZED VIEW conditions_daily
-WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
+WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
 SELECT location,
        time_bucket(INTERVAL '1 day', time) AS bucket,
        AVG(temperature)
   FROM conditions
 GROUP BY location, bucket
+WITH NO DATA;
+
+CREATE MATERIALIZED VIEW conditions_weekly
+WITH (timescaledb.continuous, timescaledb.materialized_only = true) AS
+SELECT location,
+       time_bucket(INTERVAL '7 day', bucket) AS bucket,
+       AVG(avg)
+  FROM conditions_daily
+GROUP BY 1, 2
 WITH NO DATA;
 
 SELECT format('%I.%I', '_timescaledb_internal', h.table_name) AS "MAT_TABLE_NAME",
@@ -970,6 +990,35 @@ ALTER MATERIALIZED VIEW conditions_daily SET (timescaledb.materialized_only = fa
 \set VERBOSITY verbose
 CALL refresh_continuous_aggregate('conditions_daily', NULL, NULL);
 \set VERBOSITY terse
+
+-- Rename another column after the flip and verify toggling back and
+-- forth still works. This exercises the rename when the user view
+-- already has a UNION ALL query (materialized_only = false).
+ALTER MATERIALIZED VIEW conditions_daily RENAME COLUMN avg TO average;
+
+SELECT * FROM test.show_columns('conditions_daily');
+SELECT * FROM test.show_columns(:'DIRECT_VIEW_NAME');
+SELECT * FROM test.show_columns(:'MAT_TABLE_NAME');
+
+ALTER MATERIALIZED VIEW conditions_daily SET (timescaledb.materialized_only = true);
+ALTER MATERIALIZED VIEW conditions_daily SET (timescaledb.materialized_only = false);
+
+-- Verify data is still accessible after multiple renames and toggles.
+SELECT * FROM conditions_daily ORDER BY location COLLATE "C", time;
+
+-- check hierarchical continuous aggregate still works after renames and toggles on the underlying cagg
+ALTER MATERIALIZED VIEW conditions_weekly SET (timescaledb.materialized_only = false);
+ALTER MATERIALIZED VIEW conditions_weekly SET (timescaledb.materialized_only = true);
+
+SELECT * FROM conditions_weekly ORDER BY location COLLATE "C", bucket;
+
+-- Verify that direct rename on the materialization hypertable is blocked.
+\set ON_ERROR_STOP 0
+ALTER TABLE :MAT_TABLE_NAME RENAME COLUMN average TO avg;
+\set ON_ERROR_STOP 1
+
+-- Rename back so subsequent tests that reference "avg" still work.
+ALTER MATERIALIZED VIEW conditions_daily RENAME COLUMN average TO avg;
 
 --
 -- Indexes on continuous aggregate
@@ -1437,3 +1486,57 @@ SELECT column_name, compress_interval_length from _timescaledb_catalog.dimension
 ALTER MATERIALIZED VIEW columnstore_options SET (tsdb.compress_chunk_time_interval='4 day');
 SELECT column_name, compress_interval_length from _timescaledb_catalog.dimension where column_name='time_bucket' ORDER BY id DESC LIMIT 1;
 
+-- test set returning functions in caggs
+CREATE TABLE kpis_raw (time TIMESTAMP NOT NULL, value INTEGER, groups TEXT[]) WITH (tsdb.hypertable);
+INSERT INTO kpis_raw (time, value, groups) VALUES
+  ('2025-01-01', 10, '{group1,group2,group3}'),
+  ('2025-01-02', 20, '{group1,group4}'),
+  ('2025-02-01', 10, '{group1,group3}'),
+  ('2025-02-01', 20, '{group1,group4}');
+
+CREATE MATERIALIZED VIEW kpis_cagg WITH (tsdb.continuous) AS
+SELECT time_bucket('7 day', time) AS bucket, count(*) AS number_of_records, avg(value) AS average, unnest(groups) AS kpi_group
+FROM kpis_raw GROUP BY bucket, kpi_group;
+SELECT * FROM kpis_cagg ORDER BY bucket, kpi_group;
+
+--TEST for caggs with non timescaledb namespace options
+--non timescaledb namespace options can be set via ALTER
+\set ON_ERROR_STOP 0
+-- will error out
+CREATE MATERIALIZED VIEW ht_try_weekly
+WITH (timescaledb.continuous, tigerlake.newoption = true) AS
+SELECT time_bucket(interval '1 week', time) AS ts_bucket, avg(value)
+FROM kpis_raw
+GROUP BY 1;
+
+--caught by Postgres now
+ALTER MATERIALIZED VIEW kpis_cagg SET (tigerlake.newoption = true);
+\set ON_ERROR_STOP 1
+
+-- TEST that cached alter stmt still works (see PR 8739)
+-- test DDL inside function
+CREATE TABLE hypertab_ddl( ts timestamp, a integer)
+WITH (timescaledb.hypertable);
+
+CREATE OR REPLACE FUNCTION ddl_function() RETURNS VOID LANGUAGE PLPGSQL AS $$
+BEGIN
+  DROP MATERIALIZED VIEW IF EXISTS cagg_hypertab_ddl;
+  CREATE MATERIALIZED VIEW cagg_hypertab_ddl WITH (timescaledb.continuous)
+  AS SELECT time_bucket( '1 day'::interval, ts), COUNT(*)
+  FROM hypertab_ddl GROUP BY 1 WITH NO DATA;
+END
+$$;
+
+SELECT ddl_function();
+SELECT view_name from timescaledb_information.continuous_aggregates WHERE hypertable_name='hypertab_ddl';
+SELECT ddl_function();
+SELECT view_name from timescaledb_information.continuous_aggregates WHERE hypertable_name='hypertab_ddl';
+
+-- TEST continuous aggregate with functionally dependent columns
+-- name column depends on id which is in GROUP BY so name doesnt have to be
+CREATE table sensor(id int PRIMARY KEY, name text);
+CREATE TABLE sensordata(time timestamptz,id int, value float) WITH	(timescaledb.hypertable);
+CREATE MATERIALIZED VIEW cagg_sensordata WITH (tsdb.continuous) AS
+SELECT s.id, s.name,time_bucket('15 minutes', sd.time) as bucket, avg(sd.value) FROM sensordata sd JOIN sensor s USING(id) GROUP BY s.id, bucket WITH NO DATA;
+
+SELECT * FROM cagg_sensordata;

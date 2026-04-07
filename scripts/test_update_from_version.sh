@@ -12,7 +12,7 @@ FROM_VERSION=${FROM_VERSION:-$(grep '^previous_version ' version.config | awk '{
 TO_VERSION=${TO_VERSION:-$(grep '^version ' version.config | awk '{ print $3 }')}
 
 TEST_REPAIR=${TEST_REPAIR:-false}
-TEST_VERSION=${TEST_VERSION:-v9}
+TEST_VERSION=${TEST_VERSION:-v10}
 
 OUTPUT_DIR=${OUTPUT_DIR:-update_test/${FROM_VERSION}_to_${TO_VERSION}}
 PGDATA="${OUTPUT_DIR}/data"
@@ -108,6 +108,9 @@ echo "Creating restored database"
 run_sql_file test/sql/updates/post.${TEST_VERSION}.sql baseline > "${OUTPUT_DIR}/post.baseline.log"
 run_sql_file test/sql/updates/post.${TEST_VERSION}.sql updated > "${OUTPUT_DIR}/post.updated.log"
 run_sql_file test/sql/updates/post.${TEST_VERSION}.sql restored > "${OUTPUT_DIR}/post.restored.log"
+
+sed -i -E -e 's!"*_ts_meta_v2_bl[0-9A-Za-z]+_([_0-9A-Za-z]+)"*!regress-test-bloom_\1!g' \
+    "${OUTPUT_DIR}"/post.*.log
 
 if [ "${TEST_REPAIR}" = "true" ]; then
   echo "Creating repair database"

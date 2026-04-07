@@ -18,24 +18,27 @@ list(
   compression_conflicts_iso.spec
   cagg_insert.spec
   cagg_multi_iso.spec
-  compressed_copy.spec
   deadlock_drop_chunks_compress.spec
   deadlock_drop_index_vacuum.spec
+  fk_hypertable_lock.spec
+  hypertable_row_lock.spec
   parallel_compression.spec
   osm_range_updates_iso.spec
   concurrent_decompress_update.spec
-  hypercore_tuple_lock.spec
-  hypercore_concurrent_vacuum.spec)
+  bgw_job_stat_history_retention_isolation.spec
+  delete_job_deadlock.spec)
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   list(APPEND TEST_TEMPLATES_MODULE ${TEST_TEMPLATES_MODULE_DEBUG})
   list(
     APPEND
     TEST_FILES
+    bgw_job_duplicate_race.spec
     cagg_concurrent_move.spec
     cagg_concurrent_invalidation.spec
     cagg_concurrent_refresh.spec
     compression_chunk_race.spec
+    direct_compress_copy.spec
     compression_freeze.spec
     compression_merge_race.spec
     compression_recompress.spec
@@ -47,7 +50,9 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     # These tests are using markers for the isolation tests (to avoid race
     # conditions causing differing output), which were added after 13.3 and in
     # all later major versions.
-    deadlock_recompress_chunk.spec)
+    deadlock_recompress_chunk.spec
+    detach_chunk_isolation.spec
+    attach_chunk_isolation.spec)
 
 endif(CMAKE_BUILD_TYPE MATCHES Debug)
 

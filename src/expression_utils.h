@@ -12,3 +12,10 @@
 
 bool TSDLLEXPORT ts_extract_expr_args(Expr *expr, Var **var, Expr **arg_value, Oid *opno,
 									  Oid *opcode);
+
+TSDLLEXPORT List *ts_build_trivial_custom_output_targetlist(List *scan_targetlist);
+TSDLLEXPORT Node *ts_resolve_outer_special_vars(Node *node, Plan *childplan);
+
+typedef Plan *(*ts_plan_tree_walkerfunc)(Plan *, void *);
+extern TSDLLEXPORT Plan *ts_plan_tree_walker(Plan *plan, ts_plan_tree_walkerfunc func,
+											 void *context);

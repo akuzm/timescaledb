@@ -191,12 +191,6 @@ option(EXPERIMENTAL "Skip postgres version compatibility check" OFF)
 option(GENERATE_DOWNGRADE_SCRIPT
        "Generate downgrade script. Defaults to not generate a downgrade script."
        OFF)
-cmake_dependent_option(
-  GENERATE_OLD_DOWNGRADE_SCRIPTS
-  "Generate downgrade scripts for old versions. Requires setting GENERATE_DOWNGRADE_SCRIPT to ON. Defaults to OFF."
-  OFF
-  "GENERATE_DOWNGRADE_SCRIPT"
-  ON)
 
 if(CMAKE_BUILD_TYPE MATCHES Debug)
   # CMAKE_BUILD_TYPE is set at CMake configuration type. But usage of
@@ -376,9 +370,9 @@ message(
 # Ensure that PostgreSQL version is supported and consistent with src/compat.h
 # version check
 if((${PG_VERSION_MAJOR} LESS "15")
-   OR (${PG_VERSION_MAJOR} GREATER "17")
+   OR (${PG_VERSION_MAJOR} GREATER "18")
    AND NOT (${EXPERIMENTAL}))
-  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 15, 16 and 17")
+  message(FATAL_ERROR "TimescaleDB only supports PostgreSQL 15, 16, 17 and 18")
 endif()
 
 # Get PostgreSQL configuration from pg_config
@@ -430,7 +424,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${EXT_CONTROL_FILE}
 
 find_program(
   CLANG_FORMAT
-  NAMES clang-format-14 clang-format
+  NAMES clang-format-17 clang-format
   PATHS /usr/bin /usr/local/bin /usr/local/opt/ /usr/local/opt/llvm/bin /opt/bin
   DOC "The path to clang-format")
 
@@ -447,8 +441,8 @@ if(CLANG_FORMAT)
         "Could not parse clang-format version ${CLANG_FORMAT_VERSION_OUTPUT}")
   endif()
 
-  if((${CMAKE_MATCH_1} LESS "14"))
-    message(WARNING "clang-format version 14 or greater required")
+  if((${CMAKE_MATCH_1} LESS "17"))
+    message(WARNING "clang-format version 17 or greater required")
     set(CLANG_FORMAT False)
   endif()
 endif()
@@ -539,8 +533,9 @@ if(LINTER)
           /opt/bin
     DOC "The path to the clang-tidy linter" REQUIRED)
 
-  message(STATUS "Using clang-tidy ${CLANG_TIDY}")
-  execute_process(COMMAND ${CLANG_TIDY} --version)
+  execute_process(COMMAND ${CLANG_TIDY} --version
+                  OUTPUT_VARIABLE CLANG_TIDY_VERSION)
+  message(STATUS "Using clang-tidy ${CLANG_TIDY}, ${CLANG_TIDY_VERSION}")
   string(
     CONCAT
       CMAKE_C_CLANG_TIDY
@@ -564,7 +559,9 @@ if(LINTER)
       ",-readability-identifier-length"
       ",-readability-isolate-declaration"
       ",-readability-magic-numbers"
+      ",-readability-math-missing-parentheses"
       ",-readability-non-const-parameter"
+      ",-readability-redundant-casting"
       "${CLANG_TIDY_EXTRA_OPTS}")
   if(WARNINGS_AS_ERRORS)
     set(CMAKE_C_CLANG_TIDY "${CMAKE_C_CLANG_TIDY};--warnings-as-errors=*")
@@ -665,6 +662,13 @@ if(CODECOVERAGE)
   # -fprofile-arcs -ftest-coverage when compiling and -lgcov when linking
   add_compile_options(--coverage -O0)
   add_link_options(--coverage)
+  # When a source file is recompiled, the compiler regenerates the .gcno file
+  # but any .gcda file from a previous test run remains with a stale checksum.
+  # lcov then silently produces incorrect coverage data.  Delete the .gcda
+  # alongside the .o to prevent this.  The $$ escaping produces a literal $ for
+  # the shell in both Ninja and Make generators.
+  set(CMAKE_C_COMPILE_OBJECT
+      "${CMAKE_C_COMPILE_OBJECT} && o=<OBJECT> && rm -f \$\${o%.o}.gcda")
 endif(CODECOVERAGE)
 
 # TAP test support

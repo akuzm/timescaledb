@@ -23,10 +23,10 @@ jobs:
         sudo ln -sf /usr/bin/clang-tidy-19 /usr/bin/clang-tidy
 
     - name: Checkout timescaledb
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
     - name: Checkout pg_ladybug
-      uses: actions/checkout@v4
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         repository: 'timescale/pg_ladybug'
         path: 'pg_ladybug'
@@ -36,7 +36,7 @@ jobs:
       run:  |
         cd pg_ladybug
         cmake -S . -B build -DLLVM_ROOT=/usr/lib/llvm-19
-        make -C build
+        make -C build -j $(getconf _NPROCESSORS_ONLN)
         sudo make -C build install
 
     - name: Verify pg_ladybug
@@ -51,5 +51,5 @@ jobs:
 
     - name: Build timescaledb
       run: |
-        make -C build
+        make -C build -j $(getconf _NPROCESSORS_ONLN)
 

@@ -36,6 +36,7 @@
 #include <utils/typcache.h>
 
 #include "compat/compat.h"
+#include "bgw_policy/policies_v2.h"
 #include "chunk.h"
 #include "chunk_index.h"
 #include "compression.h"
@@ -43,8 +44,11 @@
 #include "compression/sparse_index_bloom1.h"
 #include "create.h"
 #include "custom_type_cache.h"
+#include "dimension.h"
+#include "foreach_ptr.h"
 #include "guc.h"
 #include "hypertable_cache.h"
+#include "jsonb_utils.h"
 #include "trigger.h"
 #include "ts_catalog/array_utils.h"
 #include "ts_catalog/catalog.h"
@@ -54,9 +58,11 @@
 #include "with_clause/alter_table_with_clause.h"
 #include "with_clause/create_table_with_clause.h"
 
-static const char *sparse_index_types[] = { "min", "max", "bloom1" };
+#include "bgw_policy/compression_api.h"
 
 #ifdef USE_ASSERT_CHECKING
+static const char *sparse_index_types[] = { "min", "max" };
+
 static bool
 is_sparse_index_type(const char *type)
 {
@@ -68,6 +74,16 @@ is_sparse_index_type(const char *type)
 		}
 	}
 
+	if (strcmp(bloom1_column_prefix, type) == 0)
+	{
+		return true;
+	}
+
+	if (ts_guc_read_legacy_bloom1_v1 && strcmp("bloom1", type) == 0)
+	{
+		return true;
+	}
+
 	return false;
 }
 #endif
@@ -75,8 +91,16 @@ is_sparse_index_type(const char *type)
 static void validate_hypertable_for_compression(Hypertable *ht);
 static List *build_columndefs(CompressionSettings *settings, Oid src_reloid);
 static ColumnDef *build_columndef_singlecolumn(const char *colname, Oid typid);
-static void compression_settings_update(Hypertable *ht, CompressionSettings *settings,
-										WithClauseResult *with_clause_options);
+static void compression_settings_set_manually_for_create(Hypertable *ht,
+														 CompressionSettings *settings,
+														 WithClauseResult *with_clause_options);
+static void compression_settings_set_manually_for_alter(Hypertable *ht,
+														CompressionSettings *settings,
+														WithClauseResult *with_clause_options);
+static void create_default_composite_bloom(IndexInfo *index_info, Hypertable *ht,
+										   CompressionSettings *settings,
+										   JsonbParseState *parse_state,
+										   TsBmsList *sparse_index_columns, bool *has_object);
 
 static char *
 compression_column_segment_metadata_name(const char *type, int16 column_index)
@@ -94,6 +118,28 @@ compression_column_segment_metadata_name(const char *type, int16 column_index)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("bad segment metadata column name")));
 	}
 	return buf;
+}
+
+/*
+ * Validate that compression settings don't exceed PostgreSQL's INDEX_MAX_KEYS limit.
+ *
+ * Compression creates an implicit index on the compressed chunk with:
+ * - 1 index key per segmentby column
+ * - 2 index keys per orderby column (for min/max metadata)
+ */
+static void
+validate_compression_index_key_limit(CompressionSettings *settings)
+{
+	int num_segmentby_keys = ts_array_length(settings->fd.segmentby);
+	int num_orderby_keys = 2 * ts_array_length(settings->fd.orderby);
+	if ((num_segmentby_keys + num_orderby_keys) > INDEX_MAX_KEYS)
+		ereport(ERROR,
+				(errcode(ERRCODE_TOO_MANY_COLUMNS),
+				 errmsg("too many segmentby and orderby columns"),
+				 errdetail("Combined segmentby keys (%d) and orderby keys (%d) cannot exceed %d",
+						   num_segmentby_keys,
+						   num_orderby_keys,
+						   INDEX_MAX_KEYS)));
 }
 
 char *
@@ -116,39 +162,81 @@ column_segment_max_name(int16 column_index)
  * in this case we disambiguate them with their md5 hash.
  */
 char *
-compressed_column_metadata_name_v2(const char *metadata_type, const char *column_name)
+compressed_column_metadata_name_v2(const char *metadata_type, const char **column_names,
+								   int num_columns)
 {
 	Assert(is_sparse_index_type(metadata_type));
 	Assert(strlen(metadata_type) <= 6);
+	Assert(column_names != NULL);
+	Assert(num_columns > 0);
+	Assert(num_columns <= MAX_BLOOM_FILTER_COLUMNS);
 
-	const int len = strlen(column_name);
-	Assert(len < NAMEDATALEN);
+	int len = 0;
+	StringInfoData buf = { 0 };
+	initStringInfo(&buf);
+
+	for (int i = 0; i < num_columns; i++)
+	{
+		Assert(column_names[i] != NULL);
+#ifdef USE_ASSERT_CHECKING
+		int col_len = strlen(column_names[i]);
+#endif
+		Assert(col_len > 0 && col_len < NAMEDATALEN);
+		if (i > 0)
+			appendStringInfoChar(&buf, '_');
+		appendStringInfo(&buf, "%s", column_names[i]);
+	}
+
+	len = buf.len;
 
 	/*
 	 * We have to fit the name into NAMEDATALEN - 1 which is 63 bytes:
-	 * 12 (_ts_meta_v2_) + 6 (metadata_type) + 1 (_) + x (column_name) + 1 (_) + 4 (hash) = 63;
-	 * x = 63 - 24 = 39.
+	 * 12 (_ts_meta_v2_) + 6 (metadata_type) + [1 (_) + x (column_name)]x num_columns  + 1 (_) + 4
+	 * (hash) = 63; x = 63 - 24 = 39.
 	 */
+
 	char *result;
 	if (len > 39)
 	{
 		const char *errstr = NULL;
 		char hash[33];
-		Ensure(pg_md5_hash(column_name, len, hash, &errstr), "md5 computation failure");
-
-		result = psprintf("_ts_meta_v2_%.6s_%.4s_%.39s", metadata_type, hash, column_name);
+		Ensure(pg_md5_hash(buf.data, len, hash, &errstr), "md5 computation failure");
+		result = psprintf("_ts_meta_v2_%.6s_%.4s_%.39s", metadata_type, hash, buf.data);
 	}
 	else
 	{
-		result = psprintf("_ts_meta_v2_%.6s_%.39s", metadata_type, column_name);
+		result = psprintf("_ts_meta_v2_%.6s_%.39s", metadata_type, buf.data);
 	}
 	Assert(strlen(result) < NAMEDATALEN);
 	return result;
 }
 
+char *
+compressed_column_metadata_name_list_v2(const char *metadata_type, List *column_names_list)
+{
+	int num_column_names = list_length(column_names_list);
+	Ensure(num_column_names > 0, "list of column names must be non-empty");
+	Ensure(num_column_names <= MAX_BLOOM_FILTER_COLUMNS,
+		   "list of column names must be less than or equal to %d, got %d",
+		   MAX_BLOOM_FILTER_COLUMNS,
+		   num_column_names);
+
+	const char *column_names[MAX_BLOOM_FILTER_COLUMNS];
+	ListCell *cell = NULL;
+	int i = 0;
+	foreach (cell, column_names_list)
+	{
+		column_names[i] = (const char *) lfirst(cell);
+		i++;
+	}
+
+	return compressed_column_metadata_name_v2(metadata_type, column_names, num_column_names);
+}
+
 int
 compressed_column_metadata_attno(const CompressionSettings *settings, Oid chunk_reloid,
-								 AttrNumber chunk_attno, Oid compressed_reloid, char *metadata_type)
+								 AttrNumber chunk_attno, Oid compressed_reloid,
+								 char const *metadata_type)
 {
 	Assert(is_sparse_index_type(metadata_type));
 
@@ -162,7 +250,8 @@ compressed_column_metadata_attno(const CompressionSettings *settings, Oid chunk_
 		return get_attnum(compressed_reloid, metadata_name);
 	}
 
-	char *metadata_name = compressed_column_metadata_name_v2(metadata_type, attname);
+	char *metadata_name =
+		compressed_column_metadata_name_v2(metadata_type, (const char **) &attname, 1);
 	return get_attnum(compressed_reloid, metadata_name);
 }
 
@@ -170,7 +259,7 @@ compressed_column_metadata_attno(const CompressionSettings *settings, Oid chunk_
  * The heuristic for whether we should use the bloom filter sparse index.
  */
 static bool
-should_create_bloom_sparse_index(Form_pg_attribute attr, TypeCacheEntry *type, Oid src_reloid)
+should_create_bloom_sparse_index(Oid atttypid, TypeCacheEntry *type, Oid src_reloid)
 {
 	/*
 	 * The index must be enabled by the GUC.
@@ -185,7 +274,7 @@ should_create_bloom_sparse_index(Form_pg_attribute attr, TypeCacheEntry *type, O
 	 * which have better characteristics.
 	 */
 	FmgrInfo *finfo = NULL;
-	if (bloom1_get_hash_function(attr->atttypid, &finfo) == NULL)
+	if (bloom1_get_hash_function(atttypid, &finfo) == NULL)
 	{
 		return false;
 	}
@@ -197,8 +286,8 @@ should_create_bloom_sparse_index(Form_pg_attribute attr, TypeCacheEntry *type, O
 	 *    with the update time that is used as orderby.
 	 * This makes minmax indexes more suitable than bloom filters.
 	 */
-	if (attr->atttypid == TIMESTAMPTZOID || attr->atttypid == TIMESTAMPOID ||
-		attr->atttypid == TIMEOID || attr->atttypid == TIMETZOID || attr->atttypid == DATEOID)
+	if (atttypid == TIMESTAMPTZOID || atttypid == TIMESTAMPOID || atttypid == TIMEOID ||
+		atttypid == TIMETZOID || atttypid == DATEOID)
 	{
 		return false;
 	}
@@ -206,7 +295,7 @@ should_create_bloom_sparse_index(Form_pg_attribute attr, TypeCacheEntry *type, O
 	/*
 	 * For fractional arithmetic types, equality queries are unlikely.
 	 */
-	if (attr->atttypid == FLOAT4OID || attr->atttypid == FLOAT8OID || attr->atttypid == NUMERICOID)
+	if (atttypid == FLOAT4OID || atttypid == FLOAT8OID || atttypid == NUMERICOID)
 	{
 		return false;
 	}
@@ -221,19 +310,109 @@ should_create_bloom_sparse_index(Form_pg_attribute attr, TypeCacheEntry *type, O
 		return false;
 	}
 
-	/*
-	 * Bloom filter pushdown is not implemented for TAM at the moment, so keep
-	 * the old behavior with minmax sparse indexes. This check is actually not
-	 * enough, because the compressed chunk table is created when the
-	 * uncompressed chunk table is converted to TAM, and at this time it still
-	 * has the normal heap access method.
-	 */
-	if (ts_is_hypercore_am(ts_get_rel_am(src_reloid)))
+	return true;
+}
+
+/*
+ * Create a column definition for a sparse index column. The attributes passed is a
+ * List of Form_pg_attribute elements. Min and max indices only use
+ * the first element. Bloom filters may use multiple columns.
+ */
+static ColumnDef *
+create_sparse_index_column_def(List *attributes, const char *metadata_type)
+{
+	Assert(is_sparse_index_type(metadata_type));
+	ColumnDef *column_def = NULL;
+	List *column_names = NIL;
+
+	/* At least one valid attribute must be present */
+	Assert(attributes != NULL);
+	Assert(list_length(attributes) > 0);
+	Assert(list_length(attributes) <= MAX_BLOOM_FILTER_COLUMNS);
+
+	const bool is_bloom = strcmp(metadata_type, bloom1_column_prefix) == 0;
+
 	{
-		return false;
+		/* Populate the column names array */
+		ListCell *cell = NULL;
+		int i = 0;
+		foreach (cell, attributes)
+		{
+			Form_pg_attribute attr = (Form_pg_attribute) lfirst(cell);
+			Ensure(i < MAX_BLOOM_FILTER_COLUMNS,
+				   "too many columns for bloom filter, got %d, max %d, name: %s",
+				   i + 1,
+				   MAX_BLOOM_FILTER_COLUMNS,
+				   NameStr(attr->attname));
+			column_names = lappend(column_names, NameStr(attr->attname));
+			i++;
+		}
 	}
 
-	return true;
+	if (is_bloom)
+	{
+		/*
+		 * The types must be hashable. For some types we use our own hash functions
+		 * which have better characteristics.
+		 */
+		ListCell *cell = NULL;
+		foreach (cell, attributes)
+		{
+			Form_pg_attribute attr = (Form_pg_attribute) lfirst(cell);
+			FmgrInfo *finfo = NULL;
+			if (bloom1_get_hash_function(attr->atttypid, &finfo) == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("invalid bloom filter column type %s, name: %s",
+								format_type_be(attr->atttypid),
+								NameStr(attr->attname)),
+						 errdetail("Could not identify a hashing function for the type.")));
+		}
+
+		column_def =
+			makeColumnDef(compressed_column_metadata_name_list_v2(metadata_type, column_names),
+						  ts_custom_type_cache_get(CUSTOM_TYPE_BLOOM1)->type_oid,
+						  /* typmod = */ -1,
+						  /* collation = */ 0);
+
+		/*
+		 * We have our custom compression for bloom filters, and the
+		 * result is almost incompressible with lz4 (~2%), so disable it.
+		 */
+		column_def->storage = TYPSTORAGE_EXTERNAL;
+
+		/* Composite bloom filters are more selective, try to store them inline. */
+		if (list_length(column_names) > 1)
+		{
+			column_def->storage = TYPSTORAGE_MAIN;
+		}
+	}
+	else /* either min or max */
+	{
+		Form_pg_attribute attr = (Form_pg_attribute) lfirst(list_head(attributes));
+		TypeCacheEntry *type = lookup_type_cache(attr->atttypid, TYPECACHE_LT_OPR);
+
+		/*
+		 * a comparison operator if required for min max operations
+		 */
+		if (!OidIsValid(type->lt_opr))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("invalid minmax column type %s", format_type_be(attr->atttypid)),
+					 errdetail("Could not identify a less-than operator for the type.")));
+
+		column_def =
+			makeColumnDef(compressed_column_metadata_name_list_v2(metadata_type, column_names),
+						  attr->atttypid,
+						  attr->atttypmod,
+						  attr->attcollation);
+		if (attr->attstorage != TYPSTORAGE_PLAIN)
+		{
+			column_def->storage = TYPSTORAGE_MAIN;
+		}
+	}
+
+	return column_def;
 }
 
 /*
@@ -251,56 +430,27 @@ build_columndefs(CompressionSettings *settings, Oid src_reloid)
 	ArrayType *segmentby = settings->fd.segmentby;
 	List *compressed_column_defs = NIL;
 	List *segmentby_column_defs = NIL;
+	Jsonb *sparse_cfg = settings->fd.index;
+	SparseIndexSettings *parsed_settings =
+		sparse_cfg ? ts_convert_to_sparse_index_settings(sparse_cfg) : NULL;
+	Bitmapset *all_composite_bloom_obj_ids = NULL;
+	List *per_column_settings = ts_get_per_column_compression_settings(parsed_settings);
 
 	Relation rel = table_open(src_reloid, AccessShareLock);
 
-	Bitmapset *index_columns = NULL;
-	if (ts_guc_auto_sparse_indexes)
-	{
-		/*
-		 * Check which columns have btree indexes. We will create sparse minmax
-		 * indexes for them in compressed chunk.
-		 */
-		ListCell *lc;
-		List *index_oids = RelationGetIndexList(rel);
-		foreach (lc, index_oids)
-		{
-			Oid index_oid = lfirst_oid(lc);
-			Relation index_rel = index_open(index_oid, AccessShareLock);
-			IndexInfo *index_info = BuildIndexInfo(index_rel);
-			index_close(index_rel, NoLock);
-
-			/*
-			 * We want to create the sparse minmax index, if it can satisfy the same
-			 * kinds of queries as the uncompressed index. The simplest case is btree
-			 * which can satisfy equality and comparison tests, same as sparse minmax.
-			 *
-			 * If an uncompressed column has an index, we want to create a
-			 * sparse index for it as well. A sparse index can't satisfy ordering
-			 * queries, but at least we can use a bloom index to satisfy equality
-			 * queries. Create it when we have uncompressed index types that can
-			 * also satisfy equality.
-			 */
-			if (index_info->ii_Am != BTREE_AM_OID && index_info->ii_Am != HASH_AM_OID &&
-				index_info->ii_Am != BRIN_AM_OID)
-			{
-				continue;
-			}
-
-			for (int i = 0; i < index_info->ii_NumIndexKeyAttrs; i++)
-			{
-				const AttrNumber attno = index_info->ii_IndexAttrNumbers[i];
-				if (attno == InvalidAttrNumber)
-				{
-					continue;
-				}
-
-				index_columns = bms_add_member(index_columns, attno);
-			}
-		}
-	}
-
 	TupleDesc tupdesc = rel->rd_att;
+
+	int num_sparse_index_objects =
+		parsed_settings != NULL ? list_length(parsed_settings->objects) : 0;
+	List **composite_attr_lists = NULL;
+	if (num_sparse_index_objects > 0)
+	{
+		/* Allocate an array of Lists that contain Form_pg_attribute elements for each sparse index
+		 * configuration object. Minmax and single bloom filter configuration objects will have a
+		 * single element list.
+		 */
+		composite_attr_lists = palloc0(sizeof(List *) * num_sparse_index_objects);
+	}
 
 	for (int attoffset = 0; attoffset < tupdesc->natts; attoffset++)
 	{
@@ -324,6 +474,52 @@ build_columndefs(CompressionSettings *settings, Oid src_reloid)
 														  attr->atttypmod,
 														  attr->attcollation));
 			continue;
+		}
+
+		PerColumnCompressionSettings *per_column_setting =
+			per_column_settings ?
+				ts_get_per_column_compression_settings_by_column_name(per_column_settings,
+																	  NameStr(attr->attname)) :
+				NULL;
+
+		if (per_column_setting != NULL && composite_attr_lists != NULL)
+		{
+			if (per_column_setting->minmax_obj_id != -1 &&
+				per_column_setting->minmax_obj_id < num_sparse_index_objects)
+			{
+				/* Minmax index configuration objects will have a single element list */
+				Assert(list_length(composite_attr_lists[per_column_setting->minmax_obj_id]) == 0);
+				composite_attr_lists[per_column_setting->minmax_obj_id] =
+					lappend(composite_attr_lists[per_column_setting->minmax_obj_id], attr);
+			}
+
+			if (per_column_setting->single_bloom_obj_id != -1 &&
+				per_column_setting->single_bloom_obj_id < num_sparse_index_objects)
+			{
+				/* Single bloom filter configuration objects will have a single element list */
+				Assert(list_length(composite_attr_lists[per_column_setting->single_bloom_obj_id]) ==
+					   0);
+				composite_attr_lists[per_column_setting->single_bloom_obj_id] =
+					lappend(composite_attr_lists[per_column_setting->single_bloom_obj_id], attr);
+			}
+
+			if (per_column_setting->composite_bloom_index_obj_ids != NULL)
+			{
+				/* The bitmapset tells which sparse index configuration objects the current
+				 * column participates in. Iterate over the bitmapset and add an entry
+				 * to the composite_attr_lists. */
+				int i = -1;
+				while ((i = bms_next_member(per_column_setting->composite_bloom_index_obj_ids,
+											i)) >= 0)
+				{
+					composite_attr_lists[i] = lappend(composite_attr_lists[i], attr);
+				}
+
+				/* capture all composite bloom index objects */
+				all_composite_bloom_obj_ids =
+					bms_union(all_composite_bloom_obj_ids,
+							  per_column_setting->composite_bloom_index_obj_ids);
+			}
 		}
 
 		/*
@@ -362,73 +558,86 @@ build_columndefs(CompressionSettings *settings, Oid src_reloid)
 			def->storage = TYPSTORAGE_PLAIN;
 			compressed_column_defs = lappend(compressed_column_defs, def);
 		}
-		else if (bms_is_member(attr->attnum, index_columns))
+		else if (per_column_setting != NULL && composite_attr_lists != NULL)
 		{
-			TypeCacheEntry *type =
-				lookup_type_cache(attr->atttypid, TYPECACHE_LT_OPR | TYPECACHE_HASH_EXTENDED_PROC);
+			/* check sparse index columndefs is applicable */
+			bool is_bloom = per_column_setting->single_bloom_obj_id != -1;
+			bool is_minmax = per_column_setting->minmax_obj_id != -1;
 
 			/*
-			 * We can have various unusual user-defined types which do not
-			 * support comparison or hashing. The sparse indexes for the
-			 * non-orderby columns are not required for correctness, so just
-			 * don't create the sparse index if we lack the suitable operators.
+			 * We allow only one sparse index per column. Columns used in the ORDER BY
+			 * clause implicitly have a minmax index and adding a bloom filter on them is not
+			 * allowed.
+			 *
+			 * The parser is expected to enforce this constraint earlier, but we check again
+			 * here as a safeguard.
 			 */
-			bool can_use_minmax = OidIsValid(type->lt_opr);
+			Ensure((!is_bloom || !is_minmax),
+				   "Should not create bloom filter for minmax column \"%s\"",
+				   NameStr(attr->attname));
 
-			if (should_create_bloom_sparse_index(attr, type, src_reloid))
+			/* build sparse index columndefs if applicable */
+			if (is_bloom)
 			{
+				if (!ts_guc_enable_sparse_index_bloom)
+				{
+					ereport(WARNING,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("Creating bloom sparse index is disabled"),
+							 errhint("Either set \"enable_sparse_index_bloom\" to true or remove "
+									 "the bloom filter indexes from \"sparse_index\" configuration "
+									 "of the hypertable.")));
+				}
 				/*
 				 * Add bloom filter sparse index for this column.
 				 */
 				ColumnDef *bloom_column_def =
-					makeColumnDef(compressed_column_metadata_name_v2("bloom1",
-																	 NameStr(attr->attname)),
-								  ts_custom_type_cache_get(CUSTOM_TYPE_BLOOM1)->type_oid,
-								  /* typmod = */ -1,
-								  /* collation = */ 0);
-
-				/*
-				 * We have our custom compression for bloom filters, and the
-				 * result is almost incompressible with lz4 (~2%), so disable it.
-				 */
-				bloom_column_def->storage = TYPSTORAGE_EXTERNAL;
+					create_sparse_index_column_def(composite_attr_lists[per_column_setting
+																			->single_bloom_obj_id],
+												   bloom1_column_prefix);
 
 				compressed_column_defs = lappend(compressed_column_defs, bloom_column_def);
 			}
-			else if (can_use_minmax)
+			else if (is_minmax)
 			{
 				/*
 				 * Add minmax sparse index for this column.
 				 */
 				ColumnDef *def =
-					makeColumnDef(compressed_column_metadata_name_v2("min", NameStr(attr->attname)),
-								  attr->atttypid,
-								  attr->atttypmod,
-								  attr->attcollation);
-				if (attr->attstorage != TYPSTORAGE_PLAIN)
-				{
-					def->storage = TYPSTORAGE_MAIN;
-				}
+					create_sparse_index_column_def(composite_attr_lists[per_column_setting
+																			->minmax_obj_id],
+												   "min");
 				compressed_column_defs = lappend(compressed_column_defs, def);
 
-				def =
-					makeColumnDef(compressed_column_metadata_name_v2("max", NameStr(attr->attname)),
-								  attr->atttypid,
-								  attr->atttypmod,
-								  attr->attcollation);
-				if (attr->attstorage != TYPSTORAGE_PLAIN)
-				{
-					def->storage = TYPSTORAGE_MAIN;
-				}
+				def = create_sparse_index_column_def(composite_attr_lists[per_column_setting
+																			  ->minmax_obj_id],
+													 "max");
 				compressed_column_defs = lappend(compressed_column_defs, def);
 			}
 		}
-
 		compressed_column_defs = lappend(compressed_column_defs,
 										 makeColumnDef(NameStr(attr->attname),
 													   compresseddata_oid,
 													   /* typmod = */ -1,
 													   /* collOid = */ InvalidOid));
+	}
+
+	/* add the composite bloom columns */
+	if (composite_attr_lists != NULL && per_column_settings != NULL)
+	{
+		/* iterate over the all_composite_bloom_obj_ids bitmapset */
+		int i = -1;
+		while ((i = bms_next_member(all_composite_bloom_obj_ids, i)) >= 0)
+		{
+			Assert(i < num_sparse_index_objects);
+			Assert(composite_attr_lists[i] != NULL);
+			List *attr_list = composite_attr_lists[i];
+			if (attr_list != NULL)
+			{
+				ColumnDef *def = create_sparse_index_column_def(attr_list, bloom1_column_prefix);
+				compressed_column_defs = lappend(compressed_column_defs, def);
+			}
+		}
 	}
 
 	/*
@@ -476,13 +685,77 @@ build_columndef_singlecolumn(const char *colname, Oid typid)
 }
 
 /*
+ * Create compress chunk with specific settings.
+ *
+ * Same as create_compress_chunk but with an extra CompressionSettings parameter
+ *
+ */
+Chunk *
+create_compress_chunk_with_settings(Hypertable *compress_ht, Chunk *src_chunk,
+									CompressionSettings *settings)
+{
+	Catalog *catalog = ts_catalog_get();
+	CatalogSecurityContext sec_ctx;
+	Chunk *compress_chunk;
+	int namelen;
+	Oid tablespace_oid;
+
+	Assert(compress_ht->space->num_dimensions == 0);
+
+	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
+	compress_chunk =
+		ts_chunk_create_base(ts_catalog_table_next_seq_id(catalog, CHUNK), 0, RELKIND_RELATION);
+	ts_catalog_restore_user(&sec_ctx);
+
+	compress_chunk->fd.hypertable_id = compress_ht->fd.id;
+	compress_chunk->hypertable_relid = compress_ht->main_table_relid;
+	namestrcpy(&compress_chunk->fd.schema_name, INTERNAL_SCHEMA_NAME);
+
+	namelen = snprintf(NameStr(compress_chunk->fd.table_name),
+					   NAMEDATALEN,
+					   "compress%s_%d_chunk",
+					   NameStr(compress_ht->fd.associated_table_prefix),
+					   compress_chunk->fd.id);
+
+	if (namelen >= NAMEDATALEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid name \"%s\" for compressed chunk",
+						NameStr(compress_chunk->fd.table_name)),
+				 errdetail("The associated table prefix is too long.")));
+
+	ts_chunk_insert_lock(compress_chunk, RowExclusiveLock);
+
+	tablespace_oid = get_rel_tablespace(src_chunk->table_id);
+
+	List *column_defs = build_columndefs(settings, src_chunk->table_id);
+	compress_chunk->table_id =
+		compression_chunk_create(src_chunk, compress_chunk, column_defs, tablespace_oid, settings);
+
+	if (!OidIsValid(compress_chunk->table_id))
+		elog(ERROR, "could not create columnstore chunk table");
+
+	settings->fd.compress_relid = compress_chunk->table_id;
+	ts_compression_settings_update(settings);
+
+	ts_chunk_index_create_all(compress_chunk->fd.hypertable_id,
+							  compress_chunk->hypertable_relid,
+							  compress_chunk->fd.id,
+							  compress_chunk->table_id,
+							  tablespace_oid);
+
+	return compress_chunk;
+}
+
+/*
  * Create compress chunk for specific table.
  *
  * If table_id is InvalidOid, create a new table.
  *
  */
 Chunk *
-create_compress_chunk(Hypertable *compress_ht, Chunk *src_chunk, Oid table_id)
+create_compress_chunk(Hypertable *compress_ht, Chunk *src_chunk, Oid table_id,
+					  bool skip_segmentby_default)
 {
 	Catalog *catalog = ts_catalog_get();
 	CatalogSecurityContext sec_ctx;
@@ -545,6 +818,7 @@ create_compress_chunk(Hypertable *compress_ht, Chunk *src_chunk, Oid table_id)
 	 * is actually triggered allowing us to generate better compression
 	 * settings.
 	 */
+
 	if (!settings)
 	{
 		settings = ts_compression_settings_create(src_chunk->hypertable_relid,
@@ -552,19 +826,27 @@ create_compress_chunk(Hypertable *compress_ht, Chunk *src_chunk, Oid table_id)
 												  NULL,
 												  NULL,
 												  NULL,
+												  NULL,
 												  NULL);
-
-		Hypertable *ht = ts_hypertable_get_by_id(src_chunk->fd.hypertable_id);
-		compression_settings_update(ht, settings, ts_alter_table_with_clause_parse(NIL));
 	}
+
+	Hypertable *ht = ts_hypertable_get_by_id(src_chunk->fd.hypertable_id);
+
+	compression_settings_set_defaults(ht,
+									  settings,
+									  ts_alter_table_with_clause_parse(NIL),
+									  skip_segmentby_default);
 
 	if (OidIsValid(table_id))
 		compress_chunk->table_id = table_id;
 	else
 	{
 		List *column_defs = build_columndefs(settings, src_chunk->table_id);
-		compress_chunk->table_id =
-			compression_chunk_create(src_chunk, compress_chunk, column_defs, tablespace_oid);
+		compress_chunk->table_id = compression_chunk_create(src_chunk,
+															compress_chunk,
+															column_defs,
+															tablespace_oid,
+															settings);
 	}
 
 	if (!OidIsValid(compress_chunk->table_id))
@@ -695,7 +977,8 @@ validate_existing_constraints(Hypertable *ht, CompressionSettings *settings)
 				const char *attname = get_attname(settings->fd.relid, attnums[j], false);
 
 				/* is colno a segment-by or order_by column */
-				if (!form->conindid && !ts_array_is_member(settings->fd.segmentby, attname) &&
+				if (!form->conindid && (settings->fd.segmentby && settings->fd.orderby) &&
+					!ts_array_is_member(settings->fd.segmentby, attname) &&
 					!ts_array_is_member(settings->fd.orderby, attname))
 					ereport(WARNING,
 							(errmsg("column \"%s\" should be used for segmenting or ordering",
@@ -751,7 +1034,8 @@ validate_existing_indexes(Hypertable *ht, CompressionSettings *settings)
 			if (attno == 0)
 				continue; /* skip check for expression column */
 			const char *attname = get_attname(ht->main_table_relid, attno, false);
-			if (!ts_array_is_member(settings->fd.segmentby, attname) &&
+			if ((settings->fd.segmentby && settings->fd.orderby) &&
+				!ts_array_is_member(settings->fd.segmentby, attname) &&
 				!ts_array_is_member(settings->fd.orderby, attname))
 				ereport(WARNING,
 						(errmsg("column \"%s\" should be used for segmenting or ordering",
@@ -827,20 +1111,90 @@ add_column_to_compression_table(Oid relid, CompressionSettings *settings, Column
 	modify_compressed_toast_table_storage(settings, list_make1(coldef), relid);
 }
 
-/* Drop column from internal compression table */
+/* Drop column from internal compression table, drop the bloom filter columns as well and
+ * update the compression settings for the chunk */
 static void
-drop_column_from_compression_table(Oid relid, char *name)
+drop_column_from_compression_table(CompressionSettings *comp_settings, char *name)
 {
+	Oid relid = comp_settings->fd.compress_relid;
 	AlterTableCmd *cmd;
+	List *cmds = NIL;
+	Jsonb *jb = comp_settings->fd.index;
 
 	/* create altertable stmt to drop column from the compressed hypertable */
 	cmd = makeNode(AlterTableCmd);
 	cmd->subtype = AT_DropColumn;
 	cmd->name = name;
 	cmd->missing_ok = true;
+	cmds = list_make1(cmd);
+
+	if (jb)
+	{
+		SparseIndexSettings *parsed_settings = ts_convert_to_sparse_index_settings(jb);
+		if (parsed_settings)
+		{
+			bool removed_any = false;
+
+			ListCell *obj_cell = NULL;
+			foreach (obj_cell, parsed_settings->objects)
+			{
+				bool removed = false;
+				const char *bloom_column_name = NULL;
+				SparseIndexSettingsObject *obj = (SparseIndexSettingsObject *) lfirst(obj_cell);
+				foreach_ptr(SparseIndexSettingsPair, pair, obj->pairs)
+				{
+					if (strcmp(pair->key, ts_sparse_index_common_keys[SparseIndexKeyCol]) != 0)
+					{
+						continue;
+					}
+					foreach_ptr(const char, value, pair->values)
+					{
+						if (strcmp(value, name) == 0)
+						{
+							removed = true;
+							Assert(list_length(pair->values) <= MAX_BLOOM_FILTER_COLUMNS);
+
+							bloom_column_name =
+								compressed_column_metadata_name_list_v2(bloom1_column_prefix,
+																		pair->values);
+							Assert(bloom_column_name != NULL);
+							break;
+						}
+					}
+					if (removed)
+					{
+						break;
+					}
+				}
+				/* if the column was removed, we need to remove the object from the list */
+				if (removed)
+				{
+					removed_any = true;
+					if (bloom_column_name)
+					{
+						cmd = makeNode(AlterTableCmd);
+						cmd->subtype = AT_DropColumn;
+						cmd->name = pstrdup(bloom_column_name);
+						cmd->missing_ok = true;
+						cmds = lappend(cmds, cmd);
+					}
+					parsed_settings->objects =
+						foreach_delete_current(parsed_settings->objects, obj_cell);
+				}
+			}
+
+			if (removed_any)
+			{
+				jb = ts_convert_from_sparse_index_settings(parsed_settings);
+				comp_settings->fd.index = jb;
+				ts_compression_settings_update(comp_settings);
+			}
+			ts_free_sparse_index_settings(parsed_settings);
+		}
+	}
 
 	/* alter the table and drop column */
-	ts_alter_table_with_event_trigger(relid, NULL, list_make1(cmd), true);
+	ts_alter_table_with_event_trigger(relid, NULL, cmds, true);
 }
 
 static bool
@@ -901,6 +1255,11 @@ tsl_process_compress_table(Hypertable *ht, WithClauseResult *with_clause_options
 		return disable_compression(ht, with_clause_options);
 	}
 
+	if (!with_clause_options[AlterTableFlagCompressChunkTimeInterval].is_default)
+	{
+		update_compress_chunk_time_interval(ht, with_clause_options);
+	}
+
 	settings = ts_compression_settings_get(ht->main_table_relid);
 	if (!settings)
 	{
@@ -909,10 +1268,11 @@ tsl_process_compress_table(Hypertable *ht, WithClauseResult *with_clause_options
 												  NULL,
 												  NULL,
 												  NULL,
+												  NULL,
 												  NULL);
 	}
 
-	compression_settings_update(ht, settings, with_clause_options);
+	compression_settings_set_manually_for_alter(ht, settings, with_clause_options);
 
 	if (!TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 	{
@@ -1035,20 +1395,16 @@ validate_hypertable_for_compression(Hypertable *ht)
 		Form_pg_trigger trigrec = (Form_pg_trigger) GETSTRUCT(tuple);
 
 		/*
-		 * We currently cannot support transition tables for DELETE triggers
-		 * on compressed tables that are not using hypercore table access
-		 * method since deleting a complete segment will not build a
+		 * We currently don't support transition tables for DELETE triggers
+		 * on compressed tables because deleting a complete segment will not build a
 		 * transition table for the delete.
 		 */
 		fastgetattr(tuple, Anum_pg_trigger_tgoldtable, pg_trigger->rd_att, &oldtable_isnull);
 		if (!oldtable_isnull && !TRIGGER_FOR_ROW(trigrec->tgtype) &&
-			TRIGGER_FOR_DELETE(trigrec->tgtype) && !ts_is_hypercore_am(ht->amoid))
+			TRIGGER_FOR_DELETE(trigrec->tgtype))
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("DELETE triggers with transition tables not supported"),
-					errdetail(
-						"Compressed hypertables not using \"hypercore\" access method are not "
-						"supported if the trigger use transition tables."));
+					errmsg("DELETE triggers with transition tables not supported"));
 	}
 
 	systable_endscan(scan);
@@ -1059,8 +1415,8 @@ validate_hypertable_for_compression(Hypertable *ht)
 /*
  * Get the default segment by value for a hypertable
  */
-static ArrayType *
-compression_setting_segmentby_get_default(const Hypertable *ht)
+ArrayType *
+tsl_compression_setting_segmentby_get_default(const Hypertable *ht)
 {
 	StringInfoData command;
 	StringInfoData result;
@@ -1120,7 +1476,7 @@ compression_setting_segmentby_get_default(const Hypertable *ht)
 	if (!isnull)
 	{
 		message = DatumGetTextPP(datum);
-		elog(WARNING,
+		elog(LOG_SERVER_ONLY,
 			 "there was some uncertainty picking the default segment by for the hypertable: %s",
 			 text_to_cstring(message));
 	}
@@ -1142,10 +1498,6 @@ compression_setting_segmentby_get_default(const Hypertable *ht)
 
 	initStringInfo(&result);
 	ts_array_append_stringinfo(column_res, &result);
-	elog(NOTICE,
-		 "default segment by for hypertable \"%s\" is set to \"%s\"",
-		 get_rel_name(ht->main_table_relid),
-		 result.data);
 
 	elog(LOG_SERVER_ONLY,
 		 "segment_by default: hypertable=\"%s\" columns=\"%s\" function: \"%s.%s\" confidence=%d",
@@ -1236,7 +1588,7 @@ compression_setting_orderby_get_default(Hypertable *ht, ArrayType *segmentby)
 	if (!isnull)
 	{
 		message = DatumGetTextPP(datum);
-		elog(WARNING,
+		elog(LOG_SERVER_ONLY,
 			 "there was some uncertainty picking the default order by for the hypertable: %s",
 			 text_to_cstring(message));
 	}
@@ -1260,17 +1612,6 @@ compression_setting_orderby_get_default(Hypertable *ht, ArrayType *segmentby)
 	else
 		orderby = "";
 
-	if (*orderby == '\0')
-		ereport(NOTICE,
-				(errmsg("default order by for hypertable \"%s\" is set to \"\"",
-						get_rel_name(ht->main_table_relid))),
-				errdetail("Segmentwise recompression will be disabled"));
-	else
-		elog(NOTICE,
-			 "default order by for hypertable \"%s\" is set to \"%s\"",
-			 get_rel_name(ht->main_table_relid),
-			 orderby);
-
 	elog(LOG_SERVER_ONLY,
 		 "order_by default: hypertable=\"%s\" clauses=\"%s\" function=\"%s.%s\" confidence=%d",
 		 get_rel_name(ht->main_table_relid),
@@ -1278,53 +1619,399 @@ compression_setting_orderby_get_default(Hypertable *ht, ArrayType *segmentby)
 		 get_namespace_name(get_func_namespace(orderby_fn)),
 		 get_func_name(orderby_fn),
 		 confidence);
+
+	if (*orderby == '\0')
+	{
+		return (OrderBySettings){ 0 };
+	}
+
 	return ts_compress_parse_order_collist(orderby, ht);
 }
 
+/* sparse indexes will only be set by default if there was no configuration */
+static bool
+can_set_default_sparse_index(CompressionSettings *settings)
+{
+	return (settings->fd.index == NULL) ||
+		   !ts_jsonb_has_key_value_str_field(settings->fd.index,
+											 ts_sparse_index_common_keys[SparseIndexKeySource],
+											 ts_sparse_index_source_names
+												 [_SparseIndexSourceEnumConfig]);
+}
+
 static void
-compression_settings_update(Hypertable *ht, CompressionSettings *settings,
-							WithClauseResult *with_clause_options)
+create_default_composite_bloom(IndexInfo *index_info, Hypertable *ht, CompressionSettings *settings,
+							   JsonbParseState *parse_state, TsBmsList *sparse_index_columns,
+							   bool *has_object)
+{
+	int num_cols = index_info->ii_NumIndexKeyAttrs;
+
+	/* Allocate bloom config for the number of columns in the index */
+	BloomFilterConfig bloom_config;
+	bloom_config.base.type = _SparseIndexTypeEnumBloom;
+	bloom_config.base.source = _SparseIndexSourceEnumDefault;
+	bloom_config.columns = palloc0(num_cols * sizeof(SparseIndexColumn));
+
+	/* Extract columns, filtering out segmentby columns.
+	 * Note: orderby columns are not filtered out here because they can
+	 * be in composite bloom filters.
+	 */
+	int valid_columns = 0;
+
+	/*
+	 * The index must be enabled by the GUC.
+	 */
+	if (!ts_guc_enable_sparse_index_bloom)
+	{
+		return;
+	}
+
+	/* Bitmapset of column attnums */
+	Bitmapset *attnums_bitmap = NULL;
+
+	/* Check the total width of the hashable columns */
+	int total_width = 0;
+
+	for (int i = 0; i < num_cols; i++)
+	{
+		AttrNumber attno = index_info->ii_IndexAttrNumbers[i];
+
+		/* Skip expression indexes */
+		if (attno == InvalidAttrNumber)
+			continue;
+
+		char *attname = get_attname(ht->main_table_relid, attno, false);
+
+		/* Skip segmentby columns but continue processing other columns */
+		if (ts_array_is_member(settings->fd.segmentby, attname))
+			continue;
+
+		Oid atttypid = get_atttype(ht->main_table_relid, attno);
+
+		/* Check if hashable */
+		FmgrInfo *finfo = NULL;
+		if (bloom1_get_hash_function(atttypid, &finfo) == NULL)
+			continue;
+
+		TypeCacheEntry *type = lookup_type_cache(atttypid, TYPECACHE_HASH_EXTENDED_PROC);
+		total_width += (type->typlen > 0 ? type->typlen : 4);
+
+		/* Equality queries are unlikely for floating-point types, so we skip them. */
+		if (atttypid == FLOAT4OID || atttypid == FLOAT8OID)
+			continue;
+
+		/* Add to bloom config */
+		bloom_config.columns[valid_columns].attnum = attno;
+		bloom_config.columns[valid_columns].name = attname;
+		bloom_config.columns[valid_columns].type = atttypid;
+		valid_columns++;
+
+		attnums_bitmap = bms_add_member(attnums_bitmap, attno);
+	}
+
+	/* Need at least 2 valid columns for composite bloom and the total width must be at least 4
+	 * bytes. */
+	if (valid_columns < 2 || total_width < 4)
+	{
+		pfree(bloom_config.columns);
+		bms_free(attnums_bitmap);
+		return;
+	}
+
+	/* Check if this exact bloom already exists */
+	if (ts_bmslist_contains_set(*sparse_index_columns, attnums_bitmap))
+	{
+		pfree(bloom_config.columns);
+		bms_free(attnums_bitmap);
+		return;
+	}
+
+	bloom_config.num_columns = valid_columns;
+
+	/* Column names must be in attnum order for metadata column naming */
+	qsort(bloom_config.columns,
+		  bloom_config.num_columns,
+		  sizeof(SparseIndexColumn),
+		  ts_qsort_attrnumber_cmp);
+
+	/* Add the bloom's column set to the list */
+	*sparse_index_columns = ts_bmslist_add_set(*sparse_index_columns, attnums_bitmap);
+
+	/* Convert to JSONB and add to array */
+	ts_convert_sparse_index_config_to_jsonb(parse_state, &bloom_config.base);
+	*has_object = true;
+
+	pfree(bloom_config.columns);
+}
+
+static Jsonb *
+compression_setting_sparse_index_get_default(Hypertable *ht, CompressionSettings *settings)
+{
+	bool has_object = false;
+	TsBmsList sparse_index_columns = ts_bmslist_create();
+	JsonbParseState *parse_state = NULL;
+
+	/*
+	 * Sparse indexes are only created automatically if they are not set in compression settings
+	 */
+	if (!ts_guc_auto_sparse_indexes || !can_set_default_sparse_index(settings))
+		return NULL;
+
+	/*
+	 * Check which columns have btree indexes. We will create sparse minmax
+	 * indexes for them in compressed chunk.
+	 */
+	Relation rel = table_open(ht->main_table_relid, AccessShareLock);
+
+	ListCell *lc;
+	List *index_oids = RelationGetIndexList(rel);
+
+	pushJsonbValue(&parse_state, WJB_BEGIN_ARRAY, NULL);
+	foreach (lc, index_oids)
+	{
+		Oid index_oid = lfirst_oid(lc);
+		Relation index_rel = index_open(index_oid, AccessShareLock);
+		IndexInfo *index_info = BuildIndexInfo(index_rel);
+		index_close(index_rel, NoLock);
+
+		/*
+		 * We want to create the sparse minmax index, if it can satisfy the same
+		 * kinds of queries as the uncompressed index. The simplest case is btree
+		 * which can satisfy equality and comparison tests, same as sparse minmax.
+		 *
+		 * If an uncompressed column has an index, we want to create a
+		 * sparse index for it as well. A sparse index can't satisfy ordering
+		 * queries, but at least we can use a bloom index to satisfy equality
+		 * queries. Create it when we have uncompressed index types that can
+		 * also satisfy equality.
+		 */
+		if (index_info->ii_Am != BTREE_AM_OID && index_info->ii_Am != HASH_AM_OID &&
+			index_info->ii_Am != BRIN_AM_OID)
+		{
+			continue;
+		}
+
+		int num_cols = index_info->ii_NumIndexKeyAttrs;
+		if (ts_guc_enable_sparse_index_bloom && num_cols >= 2 &&
+			num_cols <= MAX_BLOOM_FILTER_COLUMNS)
+		{
+			create_default_composite_bloom(index_info,
+										   ht,
+										   settings,
+										   parse_state,
+										   &sparse_index_columns,
+										   &has_object);
+		}
+
+		for (int i = 0; i < num_cols; i++)
+		{
+			char *attname;
+			Oid atttypid;
+			MinmaxIndexColumnConfig minmax_config;
+			BloomFilterConfig bloom_config;
+			SparseIndexConfigBase *config = NULL;
+			TypeCacheEntry *type;
+			const int attno = index_info->ii_IndexAttrNumbers[i];
+			if (attno == InvalidAttrNumber)
+			{
+				continue;
+			}
+			attname = get_attname(ht->main_table_relid, attno, false);
+			/* do not create sparse index for orderby columns */
+			if (ts_array_is_member(settings->fd.orderby, attname) ||
+				ts_array_is_member(settings->fd.segmentby, attname) ||
+				ts_bmslist_contains_items(sparse_index_columns, &attno, 1))
+				continue;
+
+			atttypid = get_atttype(ht->main_table_relid, attno);
+
+			type = lookup_type_cache(atttypid, TYPECACHE_LT_OPR | TYPECACHE_HASH_EXTENDED_PROC);
+
+			/* construct sparse index config */
+			if (ts_guc_enable_sparse_index_bloom &&
+				should_create_bloom_sparse_index(atttypid, type, ht->main_table_relid))
+			{
+				config = &bloom_config.base;
+				config->type = _SparseIndexTypeEnumBloom;
+				bloom_config.num_columns = 1;
+				bloom_config.columns = palloc(1 * sizeof(SparseIndexColumn));
+				bloom_config.columns[0].attnum = attno;
+				bloom_config.columns[0].name = attname;
+				bloom_config.columns[0].type = atttypid;
+			}
+			else if (OidIsValid(type->lt_opr))
+			{
+				config = &minmax_config.base;
+				config->type = _SparseIndexTypeEnumMinmax;
+				minmax_config.col = attname;
+			}
+			else
+				continue;
+
+			config->source = _SparseIndexSourceEnumDefault;
+
+			/* convert to json object */
+			ts_convert_sparse_index_config_to_jsonb(parse_state, config);
+			sparse_index_columns = ts_bmslist_add_member(sparse_index_columns, &attno, 1);
+			has_object = true;
+		}
+	}
+	table_close(rel, AccessShareLock);
+	ts_bmslist_free(sparse_index_columns);
+	return has_object ? JsonbValueToJsonb(pushJsonbValue(&parse_state, WJB_END_ARRAY, NULL)) : NULL;
+}
+
+void
+compression_settings_set_defaults(Hypertable *ht, CompressionSettings *settings,
+								  WithClauseResult *with_clause_options,
+								  bool skip_segmentby_default)
 {
 	/* orderby arrays should always be in sync either all NULL or none */
 	Assert(
 		(settings->fd.orderby && settings->fd.orderby_desc && settings->fd.orderby_nullsfirst) ||
 		(!settings->fd.orderby && !settings->fd.orderby_desc && !settings->fd.orderby_nullsfirst));
 
-	if (!with_clause_options[AlterTableFlagCompressChunkTimeInterval].is_default)
+	bool add_orderby_sparse_index = false;
+	/* get default settings which will be stored at chunk level */
+	if (!(settings->fd.orderby) && with_clause_options[AlterTableFlagOrderBy].is_default)
 	{
-		update_compress_chunk_time_interval(ht, with_clause_options);
+		if (!skip_segmentby_default && !settings->fd.segmentby &&
+			with_clause_options[AlterTableFlagSegmentBy].is_default)
+		{
+			settings->fd.segmentby = tsl_compression_setting_segmentby_get_default(ht);
+		}
+		settings->fd.index = ts_remove_orderby_sparse_index(settings);
+		OrderBySettings obs = compression_setting_orderby_get_default(ht, settings->fd.segmentby);
+		settings->fd.orderby = obs.orderby;
+		settings->fd.orderby_desc = obs.orderby_desc;
+		settings->fd.orderby_nullsfirst = obs.orderby_nullsfirst;
+		add_orderby_sparse_index = settings->fd.index != NULL;
 	}
 
+	if (ts_guc_auto_sparse_indexes && can_set_default_sparse_index(settings))
+	{
+		settings->fd.index = compression_setting_sparse_index_get_default(ht, settings);
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+	else if (add_orderby_sparse_index)
+	{
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+
+	/* should always be valid, but call as a sanity check */
+	validate_compression_index_key_limit(settings);
+}
+
+static void
+compression_settings_set_manually_for_alter(Hypertable *ht, CompressionSettings *settings,
+											WithClauseResult *with_clause_options)
+{
+	/* orderby arrays should always be in sync either all NULL or none */
+	Assert(
+		(settings->fd.orderby && settings->fd.orderby_desc && settings->fd.orderby_nullsfirst) ||
+		(!settings->fd.orderby && !settings->fd.orderby_desc && !settings->fd.orderby_nullsfirst));
+
+	if (with_clause_options[AlterTableFlagSegmentBy].is_default &&
+		with_clause_options[AlterTableFlagOrderBy].is_default &&
+		with_clause_options[AlterTableFlagIndex].is_default)
+		return;
+
+	bool add_orderby_sparse_index = false;
 	if (!with_clause_options[AlterTableFlagSegmentBy].is_default)
 	{
 		settings->fd.segmentby =
 			ts_compress_hypertable_parse_segment_by(with_clause_options[AlterTableFlagSegmentBy],
 													ht);
 	}
-	else if (!settings->fd.segmentby && !settings->fd.orderby &&
-			 with_clause_options[AlterTableFlagOrderBy].is_default)
-	{
-		settings->fd.segmentby = compression_setting_segmentby_get_default(ht);
-	}
 
-	if (!with_clause_options[AlterTableFlagOrderBy].is_default || !settings->fd.orderby)
+	if (!with_clause_options[AlterTableFlagOrderBy].is_default)
 	{
-		OrderBySettings obs;
-		if (with_clause_options[AlterTableFlagOrderBy].is_default)
-		{
-			obs = compression_setting_orderby_get_default(ht, settings->fd.segmentby);
-		}
-		else
-		{
-			obs = ts_compress_hypertable_parse_order_by(with_clause_options[AlterTableFlagOrderBy],
-														ht);
-			obs = add_time_to_order_by_if_not_included(obs, settings->fd.segmentby, ht);
-		}
+		settings->fd.index = ts_remove_orderby_sparse_index(settings);
+		OrderBySettings obs =
+			ts_compress_hypertable_parse_order_by(with_clause_options[AlterTableFlagOrderBy], ht);
+		obs = add_time_to_order_by_if_not_included(obs, settings->fd.segmentby, ht);
 		settings->fd.orderby = obs.orderby;
 		settings->fd.orderby_desc = obs.orderby_desc;
 		settings->fd.orderby_nullsfirst = obs.orderby_nullsfirst;
+		add_orderby_sparse_index = settings->fd.index != NULL;
 	}
 
+	if (!with_clause_options[AlterTableFlagIndex].is_default)
+	{
+		if (!settings->fd.orderby)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot set sparse index option without orderby option"),
+					 errdetail("Either set both options or remove both options to trigger default "
+							   "values")));
+		}
+		settings->fd.index =
+			ts_compress_hypertable_parse_index(with_clause_options[AlterTableFlagIndex], ht);
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+	else if (add_orderby_sparse_index)
+	{
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+
+	validate_compression_index_key_limit(settings);
+
+	/* update manual settings */
+	ts_compression_settings_update(settings);
+}
+
+static void
+compression_settings_set_manually_for_create(Hypertable *ht, CompressionSettings *settings,
+											 WithClauseResult *with_clause_options)
+{
+	if (with_clause_options[CreateTableFlagSegmentBy].is_default &&
+		with_clause_options[CreateTableFlagOrderBy].is_default &&
+		with_clause_options[CreateTableFlagIndex].is_default)
+		return;
+
+	bool add_orderby_sparse_index = false;
+	if (!with_clause_options[CreateTableFlagSegmentBy].is_default)
+	{
+		settings->fd.segmentby =
+			ts_compress_hypertable_parse_segment_by(with_clause_options[CreateTableFlagSegmentBy],
+													ht);
+	}
+
+	if (!with_clause_options[CreateTableFlagOrderBy].is_default)
+	{
+		settings->fd.index = ts_remove_orderby_sparse_index(settings);
+		OrderBySettings obs =
+			ts_compress_hypertable_parse_order_by(with_clause_options[CreateTableFlagOrderBy], ht);
+		obs = add_time_to_order_by_if_not_included(obs, settings->fd.segmentby, ht);
+		settings->fd.orderby = obs.orderby;
+		settings->fd.orderby_desc = obs.orderby_desc;
+		settings->fd.orderby_nullsfirst = obs.orderby_nullsfirst;
+		add_orderby_sparse_index = settings->fd.index != NULL;
+	}
+
+	if (!with_clause_options[CreateTableFlagIndex].is_default)
+	{
+		if (!settings->fd.orderby)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot set sparse index option without orderby option"),
+					 errdetail("Either set both options or remove both options to trigger default "
+							   "values")));
+		}
+		settings->fd.index =
+			ts_compress_hypertable_parse_index(with_clause_options[CreateTableFlagIndex], ht);
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+	else if (add_orderby_sparse_index)
+	{
+		settings->fd.index = ts_add_orderby_sparse_index(settings);
+	}
+
+	validate_compression_index_key_limit(settings);
+
+	/* update manual settings */
 	ts_compression_settings_update(settings);
 }
 
@@ -1372,7 +2059,13 @@ tsl_process_compress_table_drop_column(Hypertable *ht, char *name)
 	ts_feature_flag_check(FEATURE_HYPERTABLE_COMPRESSION);
 
 	CompressionSettings *settings = ts_compression_settings_get(ht->main_table_relid);
+	Ensure(settings != NULL,
+		   "compression settings not found for hypertable \"%s\"",
+		   get_rel_name(ht->main_table_relid));
 
+	Jsonb *jb = settings->fd.index;
+
+	/* check if the column is a segmentby or orderby column */
 	if (settings && (ts_array_is_member(settings->fd.segmentby, name) ||
 					 ts_array_is_member(settings->fd.orderby, name)))
 		ereport(ERROR,
@@ -1382,11 +2075,16 @@ tsl_process_compress_table_drop_column(Hypertable *ht, char *name)
 
 	List *chunks = ts_chunk_get_by_hypertable_id(ht->fd.compressed_hypertable_id);
 	ListCell *lc;
+	int num_chunks = list_length(chunks);
+	CompressionSettings **chunk_settings = palloc(sizeof(CompressionSettings *) * num_chunks);
+
+	int i = 0;
 	foreach (lc, chunks)
 	{
 		Chunk *chunk = lfirst(lc);
 		CompressionSettings *settings =
 			ts_compression_settings_get_by_compress_relid(chunk->table_id);
+		chunk_settings[i++] = settings;
 		if (ts_array_is_member(settings->fd.segmentby, name) ||
 			ts_array_is_member(settings->fd.orderby, name))
 			ereport(ERROR,
@@ -1397,10 +2095,60 @@ tsl_process_compress_table_drop_column(Hypertable *ht, char *name)
 
 	if (TS_HYPERTABLE_HAS_COMPRESSION_TABLE(ht))
 	{
-		foreach (lc, chunks)
+		for (int i = 0; i < num_chunks; i++)
 		{
-			Chunk *chunk = lfirst(lc);
-			drop_column_from_compression_table(chunk->table_id, name);
+			CompressionSettings *comp_settings = chunk_settings[i];
+			drop_column_from_compression_table(comp_settings, name);
+		}
+	}
+
+	/* update the compression settings for the main table */
+	if (jb)
+	{
+		SparseIndexSettings *parsed_settings = ts_convert_to_sparse_index_settings(jb);
+		if (parsed_settings)
+		{
+			bool removed_any = false;
+			ListCell *obj_cell = NULL;
+			foreach (obj_cell, parsed_settings->objects)
+			{
+				bool removed = false;
+				SparseIndexSettingsObject *obj = (SparseIndexSettingsObject *) lfirst(obj_cell);
+				Assert(obj != NULL);
+				foreach_ptr(SparseIndexSettingsPair, pair, obj->pairs)
+				{
+					if (strcmp(pair->key, ts_sparse_index_common_keys[SparseIndexKeyCol]) != 0)
+					{
+						continue;
+					}
+					foreach_ptr(const char, value, pair->values)
+					{
+						if (strcmp(value, name) == 0)
+						{
+							removed = true;
+							break;
+						}
+					}
+					if (removed)
+					{
+						break;
+					}
+				}
+				/* if the column was removed, we need to remove the object from the list */
+				if (removed)
+				{
+					removed_any = true;
+					parsed_settings->objects =
+						foreach_delete_current(parsed_settings->objects, obj_cell);
+				}
+			}
+			if (removed_any)
+			{
+				jb = ts_convert_from_sparse_index_settings(parsed_settings);
+				settings->fd.index = jb;
+				ts_compression_settings_update(settings);
+			}
+			ts_free_sparse_index_settings(parsed_settings);
 		}
 	}
 }
@@ -1418,6 +2166,12 @@ tsl_process_compress_table_rename_column(Hypertable *ht, const RenameStmt *stmt)
 	Assert(stmt->relationType == OBJECT_TABLE && stmt->renameType == OBJECT_COLUMN);
 	Assert(TS_HYPERTABLE_HAS_COMPRESSION_ENABLED(ht));
 
+	struct RenameFromTo
+	{
+		char *from;
+		char *to;
+	};
+
 	if (strncmp(stmt->newname,
 				COMPRESSION_COLUMN_METADATA_PREFIX,
 				strlen(COMPRESSION_COLUMN_METADATA_PREFIX)) == 0)
@@ -1434,7 +2188,9 @@ tsl_process_compress_table_rename_column(Hypertable *ht, const RenameStmt *stmt)
 	RenameStmt *compressed_col_stmt = (RenameStmt *) copyObject(stmt);
 	RenameStmt *compressed_index_stmt = (RenameStmt *) copyObject(stmt);
 	List *chunks = ts_chunk_get_by_hypertable_id(ht->fd.compressed_hypertable_id);
+	CompressionSettings *ht_settings = NULL;
 	ListCell *lc;
+
 	foreach (lc, chunks)
 	{
 		Chunk *chunk = lfirst(lc);
@@ -1442,73 +2198,183 @@ tsl_process_compress_table_rename_column(Hypertable *ht, const RenameStmt *stmt)
 			makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), -1);
 		ExecRenameStmt(compressed_col_stmt);
 
-		compressed_index_stmt->relation = compressed_col_stmt->relation;
-		for (size_t i = 0; i < sizeof(sparse_index_types) / sizeof(sparse_index_types[0]); i++)
+		List *rename_from_to = NIL;
+		CompressionSettings *settings = ts_compression_settings_get(chunk->table_id);
+		if (!settings || settings->fd.index == NULL)
 		{
-			char *old_index_name =
-				compressed_column_metadata_name_v2(sparse_index_types[i], stmt->subname);
-			if (get_attnum(chunk->table_id, old_index_name) == InvalidAttrNumber)
+			/* only lookup ht settings if we haven't already */
+			if (!ht_settings)
 			{
-				continue;
+				ht_settings = ts_compression_settings_get(ht->main_table_relid);
+			}
+			settings = ht_settings;
+		}
+
+		/* check the minmax and single bloom index columns no matter what the compression settings
+		 * says */
+		{
+			/* handle minmax index */
+			struct RenameFromTo *from_to =
+				(struct RenameFromTo *) palloc(sizeof(struct RenameFromTo));
+			from_to->from =
+				compressed_column_metadata_name_v2("min", (const char **) &stmt->subname, 1);
+			from_to->to =
+				compressed_column_metadata_name_v2("min", (const char **) &stmt->newname, 1);
+			rename_from_to = lappend(rename_from_to, from_to);
+			from_to = (struct RenameFromTo *) palloc(sizeof(struct RenameFromTo));
+			from_to->from =
+				compressed_column_metadata_name_v2("max", (const char **) &stmt->subname, 1);
+			from_to->to =
+				compressed_column_metadata_name_v2("max", (const char **) &stmt->newname, 1);
+			rename_from_to = lappend(rename_from_to, from_to);
+		}
+
+		{
+			/* handle single bloom index */
+			struct RenameFromTo *from_to =
+				(struct RenameFromTo *) palloc(sizeof(struct RenameFromTo));
+			from_to->from = compressed_column_metadata_name_v2(bloom1_column_prefix,
+															   (const char **) &stmt->subname,
+															   1);
+			from_to->to = compressed_column_metadata_name_v2(bloom1_column_prefix,
+															 (const char **) &stmt->newname,
+															 1);
+			rename_from_to = lappend(rename_from_to, from_to);
+		}
+
+		if (settings && settings->fd.index != NULL)
+		{
+			SparseIndexSettings *parsed_settings =
+				ts_convert_to_sparse_index_settings(settings->fd.index);
+			List *per_column_settings = ts_get_per_column_compression_settings(parsed_settings);
+			PerColumnCompressionSettings *per_column_setting =
+				per_column_settings ?
+					ts_get_per_column_compression_settings_by_column_name(per_column_settings,
+																		  stmt->subname) :
+					NULL;
+
+			if (per_column_setting != NULL)
+			{
+				if (per_column_setting->composite_bloom_index_obj_ids != NULL)
+				{
+					/* one column may participate in multiple composite bloom indices, so we need to
+					 * handle all of them */
+					int i = -1;
+					struct RenameFromTo *from_to = NULL;
+
+					while ((i = bms_next_member(per_column_setting->composite_bloom_index_obj_ids,
+												i)) >= 0)
+					{
+						SparseIndexSettingsObject *obj =
+							(SparseIndexSettingsObject *) list_nth(parsed_settings->objects, i);
+						Assert(obj != NULL);
+						List *column_names = ts_get_column_names_from_parsed_object(obj);
+						Assert(column_names != NULL);
+						Assert(list_length(column_names) > 1);
+						Assert(list_length(column_names) <= MAX_BLOOM_FILTER_COLUMNS);
+						char *new_name[MAX_BLOOM_FILTER_COLUMNS] = { NULL };
+						int j = 0;
+						ListCell *cell = NULL;
+						foreach (cell, column_names)
+						{
+							const char *column_name = (const char *) lfirst(cell);
+							if (strcmp(column_name, stmt->subname) == 0)
+							{
+								new_name[j] = stmt->newname;
+							}
+							else
+							{
+								new_name[j] = pstrdup(column_name);
+							}
+							j++;
+						}
+						/* handle composite bloom index */
+						from_to = (struct RenameFromTo *) palloc(sizeof(struct RenameFromTo));
+						from_to->from =
+							compressed_column_metadata_name_list_v2(bloom1_column_prefix,
+																	column_names);
+						from_to->to = compressed_column_metadata_name_v2(bloom1_column_prefix,
+																		 (const char **) new_name,
+																		 list_length(column_names));
+						rename_from_to = lappend(rename_from_to, from_to);
+					}
+				}
+			}
+			ts_free_sparse_index_settings(parsed_settings);
+		}
+
+		compressed_index_stmt->relation = compressed_col_stmt->relation;
+		if (rename_from_to != NULL)
+		{
+			ListCell *cell = NULL;
+			foreach (cell, rename_from_to)
+			{
+				struct RenameFromTo *from_to = (struct RenameFromTo *) lfirst(cell);
+				Assert(from_to != NULL);
+				Assert(from_to->from != NULL);
+				Assert(from_to->to != NULL);
+				if (get_attnum(chunk->table_id, from_to->from) == InvalidAttrNumber)
+				{
+					continue;
+				}
+
+				compressed_index_stmt->subname = from_to->from;
+				compressed_index_stmt->newname = from_to->to;
+				ExecRenameStmt(compressed_index_stmt);
 			}
 
-			char *new_index_name =
-				compressed_column_metadata_name_v2(sparse_index_types[i], stmt->newname);
-			compressed_index_stmt->subname = old_index_name;
-			compressed_index_stmt->newname = new_index_name;
-			ExecRenameStmt(compressed_index_stmt);
+			list_free_deep(rename_from_to);
 		}
 	}
 }
 
 /*
  * Enables compression for a hypertable without creating initial configuration
+ *
+ * This is used when creating a hypertable with CREATE TABLE ... WITH (timescaledb.hypertable)
  */
 void
-tsl_compression_enable(Hypertable *ht, WithClauseResult *with_clause_options)
+tsl_columnstore_setup(Hypertable *ht, WithClauseResult *with_clause_options)
 {
 	LockRelationOid(catalog_get_table_id(ts_catalog_get(), HYPERTABLE), RowExclusiveLock);
 	Oid ownerid = ts_rel_get_owner(ht->main_table_relid);
 	Oid tablespace_oid = get_rel_tablespace(ht->main_table_relid);
-	if (!with_clause_options[CreateTableFlagOrderBy].is_default ||
-		!with_clause_options[CreateTableFlagSegmentBy].is_default)
-	{
-		CompressionSettings *settings = ts_compression_settings_create(ht->main_table_relid,
-																	   InvalidOid,
-																	   NULL,
-																	   NULL,
-																	   NULL,
-																	   NULL);
+	CompressionSettings *settings = ts_compression_settings_create(ht->main_table_relid,
+																   InvalidOid,
+																   NULL,
+																   NULL,
+																   NULL,
+																   NULL,
+																   NULL);
 
-		if (!with_clause_options[CreateTableFlagSegmentBy].is_default)
-		{
-			settings->fd.segmentby =
-				ts_compress_hypertable_parse_segment_by(with_clause_options
-															[CreateTableFlagSegmentBy],
-														ht);
-		}
-
-		if (!with_clause_options[CreateTableFlagOrderBy].is_default || !settings->fd.orderby)
-		{
-			OrderBySettings obs;
-			if (with_clause_options[CreateTableFlagOrderBy].is_default)
-			{
-				obs = compression_setting_orderby_get_default(ht, settings->fd.segmentby);
-			}
-			else
-			{
-				obs = ts_compress_hypertable_parse_order_by(with_clause_options
-																[CreateTableFlagOrderBy],
-															ht);
-				obs = add_time_to_order_by_if_not_included(obs, settings->fd.segmentby, ht);
-			}
-			settings->fd.orderby = obs.orderby;
-			settings->fd.orderby_desc = obs.orderby_desc;
-			settings->fd.orderby_nullsfirst = obs.orderby_nullsfirst;
-		}
-
-		ts_compression_settings_update(settings);
-	}
+	compression_settings_set_manually_for_create(ht, settings, with_clause_options);
 	int compress_htid = compression_hypertable_create(ht, ownerid, tablespace_oid);
 	ts_hypertable_set_compressed(ht, compress_htid);
+
+	/* Add default compression policy when compression is enabled via CREATE TABLE WITH */
+	/* Use the chunk interval as the compression interval */
+	const Dimension *time_dim = hyperspace_get_open_dimension(ht->space, 0);
+	if (time_dim != NULL)
+	{
+		Oid compress_after_type = ts_dimension_get_partition_type(time_dim);
+		Datum compress_after_datum;
+		if (IS_TIMESTAMP_TYPE(compress_after_type) || IS_UUID_TYPE(compress_after_type))
+			compress_after_type = INTERVALOID;
+
+		compress_after_datum =
+			ts_internal_to_interval_value(time_dim->fd.interval_length, compress_after_type);
+
+		policy_compression_add_internal(
+			ht->main_table_relid,
+			compress_after_datum,
+			compress_after_type,
+			NULL,								   /* created_before */
+			DEFAULT_COMPRESSION_SCHEDULE_INTERVAL, /* default_schedule_interval
+													*/
+			true,								   /* user_defined_schedule_interval */
+			true,								   /* if_not_exists */
+			false,								   /* fixed_schedule */
+			GetCurrentTimestamp() + USECS_PER_DAY, /* initial_start */
+			NULL /* timezone */);
+	}
 }

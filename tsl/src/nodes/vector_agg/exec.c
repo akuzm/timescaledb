@@ -9,6 +9,8 @@
 #include <commands/explain.h>
 #include <executor/executor.h>
 #include <executor/tuptable.h>
+#include <fmgr.h>
+#include <funcapi.h>
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
@@ -17,31 +19,28 @@
 
 #include "nodes/vector_agg/exec.h"
 
+#include "compat/compat.h"
 #include "compression/arrow_c_data_interface.h"
-#include "hypercore/arrow_tts.h"
-#include "hypercore/vector_quals.h"
 #include "nodes/columnar_scan/columnar_scan.h"
-#include "nodes/decompress_chunk/compressed_batch.h"
-#include "nodes/decompress_chunk/exec.h"
-#include "nodes/decompress_chunk/vector_quals.h"
+#include "nodes/columnar_scan/compressed_batch.h"
+#include "nodes/columnar_scan/exec.h"
+#include "nodes/columnar_scan/vector_quals.h"
 #include "nodes/vector_agg.h"
+#include "nodes/vector_agg/filter_word_iterator.h"
 #include "nodes/vector_agg/plan.h"
+#include "nodes/vector_agg/vector_slot.h"
+
+#if PG18_GE
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#endif
+
+static CompressedBatchVectorQualState
+compressed_batch_init_vector_quals(DecompressContext *dcontext, List *quals, TupleTableSlot *slot);
 
 static int
-get_input_offset_decompress_chunk(const DecompressChunkState *decompress_state, const Var *var)
+get_input_offset(const DecompressContext *dcontext, const Var *var)
 {
-	const DecompressContext *dcontext = &decompress_state->decompress_context;
-
-	/*
-	 * All variable references in the vectorized aggregation node were
-	 * translated to uncompressed chunk variables when it was created.
-	 */
-	const CustomScan *cscan = castNode(CustomScan, decompress_state->csstate.ss.ps.plan);
-	Ensure((Index) var->varno == (Index) cscan->scan.scanrelid,
-		   "got vector varno %d expected %d",
-		   var->varno,
-		   cscan->scan.scanrelid);
-
 	const CompressionColumnDescription *value_column_description = NULL;
 	for (int i = 0; i < dcontext->num_data_columns; i++)
 	{
@@ -61,56 +60,441 @@ get_input_offset_decompress_chunk(const DecompressChunkState *decompress_state, 
 	return index;
 }
 
-static void
-get_column_storage_properties_decompress_chunk(const DecompressChunkState *state, int input_offset,
-											   GroupingColumn *result)
-{
-	const DecompressContext *dcontext = &state->decompress_context;
-	const CompressionColumnDescription *desc = &dcontext->compressed_chunk_columns[input_offset];
-	result->value_bytes = desc->value_bytes;
-	result->by_value = desc->by_value;
-}
-
 /*
- * Given a Var reference, get the offset of the corresponding attribute in the
- * input tuple.
- *
- * For a node returning arrow slots, this is just the attribute number in the
- * Var. But if the node is DecompressChunk, it is necessary to translate
- * between the compressed and non-compressed columns.
+ * Workspace for converting the results of a Postgres function into a columnar
+ * format.
  */
-static int
-get_input_offset(const CustomScanState *state, const Var *var)
+typedef struct
 {
-	if (TTS_IS_ARROWTUPLE(state->ss.ss_ScanTupleSlot))
-		return AttrNumberGetAttrOffset(var->varattno);
+	DecompressionType type;
 
-	return get_input_offset_decompress_chunk((const DecompressChunkState *) state, var);
-}
+	uint64 *restrict validity;
 
-/*
- * Get the type length and "byval" properties for the grouping column given by
- * the input offset.
- *
- * For a node returning arrow slots, the properties can be read directly from
- * the scanned relation's tuple descriptor. For DecompressChunk, the input
- * offset references the compressed relation.
- */
+	int allocated_body_bytes;
+	uint8 *restrict body_buffer;
+
+	uint32 *restrict offset_buffer;
+	uint32 current_offset;
+} ColumnarResult;
+
 static void
-get_column_storage_properties(const CustomScanState *state, int input_offset,
-							  GroupingColumn *result)
+columnar_result_init_for_type(ColumnarResult *columnar_result,
+							  DecompressBatchState const *batch_state, Oid typeoid)
 {
-	if (TTS_IS_ARROWTUPLE(state->ss.ss_ScanTupleSlot))
+	int16 typlen;
+	bool typbyval;
+	get_typlenbyval(typeoid, &typlen, &typbyval);
+	if (typeoid == BOOLOID)
 	{
-		const TupleDesc tupdesc = RelationGetDescr(state->ss.ss_currentRelation);
-		result->by_value = TupleDescAttr(tupdesc, input_offset)->attbyval;
-		result->value_bytes = TupleDescAttr(tupdesc, input_offset)->attlen;
+		columnar_result->type = DT_ArrowBits;
+	}
+	else if (typlen == -1)
+	{
+		columnar_result->type = DT_ArrowText;
+	}
+	else
+	{
+		Assert(typlen > 0);
+		columnar_result->type = typlen;
+	}
+
+	const int nrows = batch_state->total_batch_rows;
+	const size_t num_validity_words = (nrows + 63) / 64;
+	if (columnar_result->type == DT_ArrowBits)
+	{
+		columnar_result->allocated_body_bytes = sizeof(uint64) * num_validity_words;
+	}
+	else if (columnar_result->type == DT_ArrowText)
+	{
+		/*
+		 * Arrow variable-length types require n + 1 offsets to store the end
+		 * position of the last element. Pad to 64 bytes per Arrow spec.
+		 */
+		columnar_result->offset_buffer =
+			MemoryContextAllocZero(batch_state->per_batch_context,
+								   pad_to_multiple(64,
+												   sizeof(*columnar_result->offset_buffer) *
+													   (nrows + 1)));
+		columnar_result->allocated_body_bytes = pad_to_multiple(64, 10);
+	}
+	else
+	{
+		Assert(columnar_result->type > 0);
+		columnar_result->allocated_body_bytes =
+			pad_to_multiple(64, 1 + columnar_result->type * nrows);
+	}
+
+	columnar_result->body_buffer = MemoryContextAllocZero(batch_state->per_batch_context,
+														  columnar_result->allocated_body_bytes);
+}
+
+static pg_attribute_always_inline void
+columnar_result_set_row(ColumnarResult *columnar_result, DecompressBatchState const *batch_state,
+						int row, Datum datum, bool isnull)
+{
+	const int nrows = batch_state->total_batch_rows;
+	Assert(row < nrows);
+
+	if (isnull)
+	{
+		if (columnar_result->validity == NULL)
+		{
+			const int num_validity_words = (nrows + 63) / 64;
+			columnar_result->validity =
+				MemoryContextAlloc(batch_state->per_batch_context,
+								   num_validity_words * sizeof(*columnar_result->validity));
+			memset(columnar_result->validity,
+				   -1,
+				   num_validity_words * sizeof(*columnar_result->validity));
+			if (nrows % 64 != 0)
+			{
+				const uint64 tail_mask = ~0ULL >> (64 - nrows % 64);
+				columnar_result->validity[nrows / 64] &= tail_mask;
+			}
+		}
+
+		arrow_set_row_validity(columnar_result->validity, row, false);
+
 		return;
 	}
 
-	get_column_storage_properties_decompress_chunk((const DecompressChunkState *) state,
-												   input_offset,
-												   result);
+	switch ((int) columnar_result->type)
+	{
+		case DT_ArrowBits:
+		{
+			arrow_set_row_validity((uint64 *restrict) columnar_result->body_buffer,
+								   row,
+								   DatumGetBool(datum));
+			break;
+		}
+		case DT_ArrowText:
+		{
+			const int result_bytes = VARSIZE_ANY_EXHDR(datum);
+			const int required_body_bytes =
+				pad_to_multiple(64, columnar_result->current_offset + result_bytes);
+			if (required_body_bytes > columnar_result->allocated_body_bytes)
+			{
+				/*
+				 * We reallocate based on how many rows in the batch we have
+				 * left, not to overshoot too much. At the same time, we
+				 * shouldn't reallocate too often either. The parameters were
+				 * tuned manually on a few real data sets until this balance
+				 * looked somewhat acceptable.
+				 */
+				const int new_body_bytes =
+					required_body_bytes * Min(10, Max(1.2, 1.2 * nrows / ((float) row + 1))) + 1;
+				Assert(new_body_bytes >= required_body_bytes);
+				columnar_result->body_buffer =
+					repalloc(columnar_result->body_buffer, new_body_bytes);
+				columnar_result->allocated_body_bytes = new_body_bytes;
+			}
+
+			memcpy(&columnar_result->body_buffer[columnar_result->current_offset],
+				   VARDATA_ANY(datum),
+				   result_bytes);
+			columnar_result->offset_buffer[row] = columnar_result->current_offset;
+			columnar_result->current_offset += result_bytes;
+			break;
+		}
+		case 2:
+		case 4:
+#ifdef USE_FLOAT8_BYVAL
+		case 8:
+#endif
+			memcpy(row * columnar_result->type + (uint8 *restrict) columnar_result->body_buffer,
+				   &datum,
+				   sizeof(Datum));
+			break;
+#ifndef USE_FLOAT8_BYVAL
+		case 8:
+#endif
+		case 16:
+			memcpy(row * columnar_result->type + (uint8 *restrict) columnar_result->body_buffer,
+				   DatumGetPointer(datum),
+				   columnar_result->type);
+			break;
+		default:
+			elog(ERROR, "wrong arrow result type %d", columnar_result->type);
+	}
+}
+
+static CompressedColumnValues
+columnar_result_finalize(ColumnarResult *columnar_result, DecompressBatchState const *batch_state)
+{
+	const int nrows = batch_state->total_batch_rows;
+
+	ArrowArray *arrow_result = NULL;
+	if (columnar_result->type == DT_ArrowBits)
+	{
+		arrow_result = MemoryContextAllocZero(batch_state->per_batch_context,
+											  sizeof(ArrowArray) + 2 * sizeof(void *));
+		arrow_result->buffers = (void *) &arrow_result[1];
+		arrow_result->buffers[1] = columnar_result->body_buffer;
+	}
+	else if (columnar_result->type == DT_ArrowText)
+	{
+		columnar_result->offset_buffer[nrows] = columnar_result->current_offset;
+
+		arrow_result = MemoryContextAllocZero(batch_state->per_batch_context,
+											  sizeof(ArrowArray) + 3 * sizeof(void *));
+		arrow_result->buffers = (void *) &arrow_result[1];
+		arrow_result->buffers[1] = columnar_result->offset_buffer;
+		arrow_result->buffers[2] = columnar_result->body_buffer;
+	}
+	else
+	{
+		Assert(columnar_result->type > 0);
+
+		arrow_result = MemoryContextAllocZero(batch_state->per_batch_context,
+											  sizeof(ArrowArray) + 2 * sizeof(void *));
+		arrow_result->buffers = (void *) &arrow_result[1];
+		arrow_result->buffers[1] = columnar_result->body_buffer;
+	}
+
+	arrow_result->length = nrows;
+
+	arrow_result->buffers[0] = columnar_result->validity;
+	arrow_result->null_count =
+		arrow_result->length - arrow_num_valid(arrow_result->buffers[0], nrows);
+
+	CompressedColumnValues result = {
+		.decompression_type = columnar_result->type,
+		.buffers = { arrow_result->buffers[0],
+					 arrow_result->buffers[1],
+					 columnar_result->type == DT_ArrowText ? arrow_result->buffers[2] : NULL },
+		.arrow = arrow_result,
+	};
+	return result;
+}
+
+static pg_noinline CompressedColumnValues
+vector_slot_evaluate_function(DecompressContext *dcontext, TupleTableSlot *slot,
+							  uint64 const *filter, List *args, Oid funcoid, Oid inputcollid)
+{
+	const DecompressBatchState *batch_state = (const DecompressBatchState *) slot;
+
+	const int nargs = list_length(args);
+
+	FmgrInfo flinfo;
+	fmgr_info(funcoid, &flinfo);
+	FunctionCallInfo fcinfo = palloc0(SizeForFunctionCallInfo(nargs));
+	InitFunctionCallInfoData(*fcinfo, &flinfo, nargs, inputcollid, NULL, NULL);
+
+	CompressedColumnValues *arg_values = palloc0(nargs * sizeof(*arg_values));
+	bool have_null_bitmap = false;
+	bool have_null_scalars = false;
+	ListCell *lc;
+	foreach (lc, args)
+	{
+		const int i = foreach_current_index(lc);
+		CompressedColumnValues arg_value =
+			vector_slot_evaluate_expression(dcontext, slot, filter, lfirst(lc));
+		Ensure(arg_value.decompression_type != DT_Invalid, "got DT_Invalid for argument %d", i);
+
+		have_null_bitmap =
+			(arg_value.arrow != NULL && arg_value.arrow->null_count > 0) || have_null_bitmap;
+
+		arg_value.output_value = &fcinfo->args[i].value;
+		arg_value.output_isnull = &fcinfo->args[i].isnull;
+
+		if (arg_value.decompression_type == DT_ArrowText ||
+			arg_value.decompression_type == DT_ArrowTextDict)
+		{
+			const int maxbytes = get_max_varlena_bytes(arg_value.arrow);
+			*arg_value.output_value =
+				PointerGetDatum(MemoryContextAlloc(batch_state->per_batch_context, maxbytes));
+		}
+		else if (arg_value.decompression_type == DT_Scalar)
+		{
+			/*
+			 * The values of the scalar columns have to be stored once at
+			 * initialization, they won't be updated per-row.
+			 */
+			*arg_value.output_value = PointerGetDatum(arg_value.buffers[1]);
+			*arg_value.output_isnull = DatumGetBool(PointerGetDatum(arg_value.buffers[0]));
+
+			have_null_scalars = *arg_value.output_isnull || have_null_scalars;
+		}
+
+		arg_values[i] = arg_value;
+	}
+
+	/*
+	 * We only evaluate strict functions, so if we have a scalar null argument,
+	 * return a scalar null.
+	 */
+	if (have_null_scalars)
+	{
+		pfree(fcinfo);
+		pfree(arg_values);
+		return (CompressedColumnValues){ .decompression_type = DT_Scalar,
+										 .buffers[0] = DatumGetPointer(BoolGetDatum(true)) };
+	}
+
+	/*
+	 * Our Postgres function is strict, so we should avoid calling it on null
+	 * inputs.
+	 */
+	const int nrows = batch_state->total_batch_rows;
+	const size_t num_validity_words = (nrows + 63) / 64;
+	uint64 *input_validity = NULL;
+	if (have_null_bitmap || filter != NULL)
+	{
+		uint64 *restrict combined_validity =
+			MemoryContextAlloc(batch_state->per_batch_context,
+							   sizeof(*combined_validity) * num_validity_words);
+		memset(combined_validity, -1, num_validity_words * sizeof(*combined_validity));
+		arrow_validity_and(num_validity_words, combined_validity, filter);
+		for (int i = 0; i < nargs; i++)
+		{
+			arrow_validity_and(num_validity_words, combined_validity, arg_values[i].buffers[0]);
+		}
+		input_validity = combined_validity;
+	}
+
+	/*
+	 * Call the Postgres function on every row. Here as well, we have to deal
+	 * with very selective filters and avoid evaluating the functions on long
+	 * consecutive ranges of filtered out rows, to improve the performance.
+	 */
+	ColumnarResult columnar_result = { 0 };
+	columnar_result_init_for_type(&columnar_result, batch_state, get_func_rettype(funcoid));
+	MemoryContext function_call_context =
+		AllocSetContextCreate(CurrentMemoryContext, "bulk function call", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(function_call_context);
+	FilterWordIterator iter = filter_word_iterator_init(nrows, input_validity);
+	int last_processed_row = 0;
+	for (;;)
+	{
+		/*
+		 * The Arrow format requires the offsets to monotonically increase even
+		 * for the invalid rows.
+		 */
+		if (columnar_result.offset_buffer != NULL)
+		{
+			for (int row = last_processed_row; row < iter.start_row; row++)
+			{
+				columnar_result.offset_buffer[row] = columnar_result.current_offset;
+			}
+		}
+		if (!filter_word_iterator_is_valid(&iter))
+		{
+			break;
+		}
+		for (int row = iter.start_row; row < iter.end_row; row++)
+		{
+			/*
+			 * The Arrow format requires the offsets to monotonically increase even
+			 * for the invalid rows.
+			 */
+			if (columnar_result.offset_buffer != NULL)
+			{
+				columnar_result.offset_buffer[row] = columnar_result.current_offset;
+			}
+
+			/*
+			 * Do not evaluate the function on null inputs because it is strict.
+			 */
+			if (!arrow_row_is_valid(input_validity, row))
+			{
+				continue;
+			}
+
+			compressed_columns_to_postgres_data(arg_values, nargs, row);
+
+			const Datum datum = FunctionCallInvoke(fcinfo);
+
+			/*
+			 * A strict function can still return a null for a non-null argument.
+			 */
+			const bool isnull = fcinfo->isnull;
+
+			columnar_result_set_row(&columnar_result, batch_state, row, datum, isnull);
+
+			MemoryContextReset(function_call_context);
+		}
+
+		last_processed_row = iter.end_row;
+		filter_word_iterator_advance(&iter);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(function_call_context);
+
+	/*
+	 * Figure out the validity bitmap of the result rows. Besides the null
+	 * inputs, the function itself can return nulls for some rows.
+	 */
+	if (columnar_result.validity != NULL)
+	{
+		arrow_validity_and(num_validity_words, columnar_result.validity, input_validity);
+	}
+	else
+	{
+		columnar_result.validity = (uint64 *) input_validity;
+	}
+
+	pfree(fcinfo);
+	pfree(arg_values);
+
+	return columnar_result_finalize(&columnar_result, batch_state);
+}
+
+/*
+ * Return the arrow array or the datum (in case of single scalar value) for a
+ * given expression as a CompressedColumnValues struct.
+ */
+CompressedColumnValues
+vector_slot_evaluate_expression(DecompressContext *dcontext, TupleTableSlot *slot,
+								uint64 const *filter, const Expr *argument)
+{
+	const DecompressBatchState *batch_state = (const DecompressBatchState *) slot;
+	switch (((Node *) argument)->type)
+	{
+		case T_Const:
+		{
+			const Const *c = (const Const *) argument;
+			CompressedColumnValues result = { .decompression_type = DT_Scalar,
+											  .buffers[1] = DatumGetPointer(c->constvalue),
+											  .buffers[0] =
+												  DatumGetPointer(BoolGetDatum(c->constisnull)) };
+			return result;
+		}
+		case T_Var:
+		{
+			const Var *var = (const Var *) argument;
+			const uint16 offset = get_input_offset(dcontext, var);
+			const CompressedColumnValues *values = &batch_state->compressed_columns[offset];
+			Ensure(values->decompression_type != DT_Invalid,
+				   "got DT_Invalid decompression type at offset %d",
+				   offset);
+			return *values;
+		}
+		case T_OpExpr:
+		{
+			const OpExpr *o = (const OpExpr *) argument;
+			return vector_slot_evaluate_function(dcontext,
+												 slot,
+												 filter,
+												 o->args,
+												 o->opfuncid,
+												 o->inputcollid);
+		}
+		case T_FuncExpr:
+		{
+			const FuncExpr *f = (const FuncExpr *) argument;
+			return vector_slot_evaluate_function(dcontext,
+												 slot,
+												 filter,
+												 f->args,
+												 f->funcid,
+												 f->inputcollid);
+		}
+		default:
+			Ensure(false,
+				   "wrong node type %s for vector expression",
+				   ts_get_node_name((Node *) argument));
+			return (CompressedColumnValues){ .decompression_type = DT_Invalid };
+	}
 }
 
 static void
@@ -122,7 +506,6 @@ vector_agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	VectorAggState *vector_agg_state = (VectorAggState *) node;
 	vector_agg_state->input_ended = false;
-	CustomScanState *childstate = (CustomScanState *) linitial(vector_agg_state->custom.custom_ps);
 
 	/*
 	 * Set up the helper structures used to evaluate stable expressions in
@@ -165,7 +548,6 @@ vector_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		else
 		{
 			/* This is a grouping column. */
-			Assert(IsA(tlentry->expr, Var));
 			grouping_column_counter++;
 		}
 	}
@@ -199,7 +581,7 @@ vector_agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 			Aggref *aggref = castNode(Aggref, tlentry->expr);
 
-			VectorAggFunctions *func = get_vector_aggregate(aggref->aggfnoid);
+			VectorAggFunctions *func = get_vector_aggregate(aggref->aggfnoid, aggref->inputcollid);
 			Assert(func != NULL);
 			def->func = *func;
 
@@ -210,12 +592,11 @@ vector_agg_begin(CustomScanState *node, EState *estate, int eflags)
 				/* The aggregate should be a partial aggregate */
 				Assert(aggref->aggsplit == AGGSPLIT_INITIAL_SERIAL);
 
-				Var *var = castNode(Var, castNode(TargetEntry, linitial(aggref->args))->expr);
-				def->input_offset = get_input_offset(childstate, var);
+				def->argument = castNode(TargetEntry, linitial(aggref->args))->expr;
 			}
 			else
 			{
-				def->input_offset = -1;
+				def->argument = NULL;
 			}
 
 			if (aggref->aggfilter != NULL)
@@ -227,14 +608,18 @@ vector_agg_begin(CustomScanState *node, EState *estate, int eflags)
 		else
 		{
 			/* This is a grouping column. */
-			Assert(IsA(tlentry->expr, Var));
 
 			GroupingColumn *col = &vector_agg_state->grouping_columns[grouping_column_counter++];
+			col->expr = tlentry->expr;
 			col->output_offset = i;
 
-			Var *var = castNode(Var, tlentry->expr);
-			col->input_offset = get_input_offset(childstate, var);
-			get_column_storage_properties(childstate, col->input_offset, col);
+			TupleDesc tdesc = NULL;
+			Oid type = InvalidOid;
+			TypeFuncClass type_class = get_expr_result_type((Node *) tlentry->expr, &type, &tdesc);
+			Ensure(type_class == TYPEFUNC_SCALAR,
+				   "wrong grouping column type class %d",
+				   type_class);
+			get_typlenbyval(type, &col->value_bytes, &col->by_value);
 		}
 	}
 
@@ -291,9 +676,9 @@ vector_agg_rescan(CustomScanState *node)
 /*
  * Get the next slot to aggregate for a compressed batch.
  *
- * Implements "get next slot" on top of DecompressChunk. Note that compressed
- * tuples are read directly from the DecompressChunk child node, which means
- * that the processing normally done in DecompressChunk is actually done here
+ * Implements "get next slot" on top of ColumnarScan. Note that compressed
+ * tuples are read directly from the ColumnarScan child node, which means
+ * that the processing normally done in ColumnarScan is actually done here
  * (batch processing and filtering).
  *
  * Returns an TupleTableSlot that implements a compressed batch.
@@ -301,8 +686,8 @@ vector_agg_rescan(CustomScanState *node)
 static TupleTableSlot *
 compressed_batch_get_next_slot(VectorAggState *vector_agg_state)
 {
-	DecompressChunkState *decompress_state =
-		(DecompressChunkState *) linitial(vector_agg_state->custom.custom_ps);
+	ColumnarScanState *decompress_state =
+		(ColumnarScanState *) linitial(vector_agg_state->custom.custom_ps);
 	DecompressContext *dcontext = &decompress_state->decompress_context;
 	BatchQueue *batch_queue = decompress_state->batch_queue;
 	DecompressBatchState *batch_state = batch_array_get_at(&batch_queue->batch_array, 0);
@@ -330,13 +715,13 @@ compressed_batch_get_next_slot(VectorAggState *vector_agg_state)
 		if (dcontext->ps->instrument)
 		{
 			/*
-			 * Ensure proper EXPLAIN output for the underlying DecompressChunk
+			 * Ensure proper EXPLAIN output for the underlying ColumnarScan
 			 * node.
 			 *
 			 * This value is normally updated by InstrStopNode(), and is
 			 * required so that the calculations in InstrEndLoop() run properly.
 			 * We have to call it manually because we run the underlying
-			 * DecompressChunk manually and not as a normal Postgres node.
+			 * ColumnarScan manually and not as a normal Postgres node.
 			 */
 			dcontext->ps->instrument->running = true;
 		}
@@ -349,7 +734,7 @@ compressed_batch_get_next_slot(VectorAggState *vector_agg_state)
 
 	/*
 	 * Count rows filtered out by vectorized filters for EXPLAIN. Normally
-	 * this is done in tuple-by-tuple interface of DecompressChunk, so that
+	 * this is done in tuple-by-tuple interface of ColumnarScan, so that
 	 * it doesn't say it filtered out more rows that were returned (e.g.
 	 * with LIMIT). Here we always work in full batches. The batches that
 	 * were fully filtered out, and their rows, were already counted in
@@ -361,13 +746,13 @@ compressed_batch_get_next_slot(VectorAggState *vector_agg_state)
 	if (dcontext->ps->instrument)
 	{
 		/*
-		 * Ensure proper EXPLAIN output for the underlying DecompressChunk
+		 * Ensure proper EXPLAIN output for the underlying ColumnarScan
 		 * node.
 		 *
 		 * This value is normally updated by InstrStopNode(), and is
 		 * required so that the calculations in InstrEndLoop() run properly.
 		 * We have to call it manually because we run the underlying
-		 * DecompressChunk manually and not as a normal Postgres node.
+		 * ColumnarScan manually and not as a normal Postgres node.
 		 */
 		dcontext->ps->instrument->tuplecount += not_filtered_rows;
 	}
@@ -376,93 +761,37 @@ compressed_batch_get_next_slot(VectorAggState *vector_agg_state)
 }
 
 /*
- * Get the next slot to aggregate for a arrow tuple table slot.
- *
- * Implements "get next slot" on top of ColumnarScan (or any node producing
- * ArrowTupleTableSlots). It just reads the slot from the child node.
- */
-static TupleTableSlot *
-arrow_get_next_slot(VectorAggState *vector_agg_state)
-{
-	TupleTableSlot *slot = vector_agg_state->custom.ss.ss_ScanTupleSlot;
-
-	if (!TTS_EMPTY(slot))
-	{
-		Assert(TTS_IS_ARROWTUPLE(slot));
-
-		/* If we read an arrow slot previously, the entire arrow array should
-		 * have been aggregated so we should mark it is consumed so that we
-		 * get the next array (or end) when we read the next slot. */
-
-		arrow_slot_mark_consumed(slot);
-	}
-
-	slot = ExecProcNode(linitial(vector_agg_state->custom.custom_ps));
-
-	if (TupIsNull(slot))
-	{
-		/* The input has ended. */
-		vector_agg_state->input_ended = true;
-		return NULL;
-	}
-
-	Assert(TTS_IS_ARROWTUPLE(slot));
-
-	/* Filtering should have happened in the scan node below so the slot
-	 * should not be consumed here. */
-	Assert(!arrow_slot_is_consumed(slot));
-
-	/* Remember the slot until we're called next time */
-	vector_agg_state->custom.ss.ss_ScanTupleSlot = slot;
-
-	return slot;
-}
-
-/*
  * Initialize vector quals for a compressed batch.
  *
  * Used to implement vectorized aggregate function filter clause.
  */
-static VectorQualState *
-compressed_batch_init_vector_quals(VectorAggState *agg_state, VectorAggDef *agg_def,
-								   TupleTableSlot *slot)
+static CompressedBatchVectorQualState
+compressed_batch_init_vector_quals(DecompressContext *dcontext, List *quals, TupleTableSlot *slot)
 {
-	DecompressChunkState *decompress_state =
-		(DecompressChunkState *) linitial(agg_state->custom.custom_ps);
-	DecompressContext *dcontext = &decompress_state->decompress_context;
 	DecompressBatchState *batch_state = (DecompressBatchState *) slot;
 
-	agg_state->vqual_state = (CompressedBatchVectorQualState) {
+	return (CompressedBatchVectorQualState) {
 				.vqstate = {
-					.vectorized_quals_constified = agg_def->filter_clauses,
+					.vectorized_quals_constified = quals,
 					.num_results = batch_state->total_batch_rows,
 					.per_vector_mcxt = batch_state->per_batch_context,
-					.slot = decompress_state->csstate.ss.ss_ScanTupleSlot,
+					.slot = slot,
 					.get_arrow_array = compressed_batch_get_arrow_array,
 				},
 				.batch_state = batch_state,
 				.dcontext = dcontext,
 			};
-
-	return &agg_state->vqual_state.vqstate;
-}
-
-/*
- * Initialize FILTER vector quals for an arrow tuple slot.
- *
- * Used to implement vectorized aggregate function filter clause.
- */
-static VectorQualState *
-arrow_init_vector_quals(VectorAggState *agg_state, VectorAggDef *agg_def, TupleTableSlot *slot)
-{
-	vector_qual_state_init(&agg_state->vqual_state.vqstate, agg_def->filter_clauses, slot);
-	return &agg_state->vqual_state.vqstate;
 }
 
 static TupleTableSlot *
 vector_agg_exec(CustomScanState *node)
 {
 	VectorAggState *vector_agg_state = (VectorAggState *) node;
+
+	ColumnarScanState *decompress_state =
+		(ColumnarScanState *) linitial(vector_agg_state->custom.custom_ps);
+	DecompressContext *dcontext = &decompress_state->decompress_context;
+
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	ResetExprContext(econtext);
 
@@ -483,6 +812,12 @@ vector_agg_exec(CustomScanState *node)
 	}
 
 	/*
+	 * Have no more partial aggregation results but might still have input.
+	 * Reset the grouping policy and start a new cycle of partial aggregation.
+	 */
+	grouping->gp_reset(grouping);
+
+	/*
 	 * If the partial aggregation results have ended, and the input has ended,
 	 * we're done.
 	 */
@@ -490,12 +825,6 @@ vector_agg_exec(CustomScanState *node)
 	{
 		return NULL;
 	}
-
-	/*
-	 * Have no more partial aggregation results and still have input, have to
-	 * reset the grouping policy and start a new cycle of partial aggregation.
-	 */
-	grouping->gp_reset(grouping);
 
 	/*
 	 * Now we loop through the input compressed tuples, until they end or until
@@ -528,21 +857,36 @@ vector_agg_exec(CustomScanState *node)
 		for (int i = 0; i < naggs; i++)
 		{
 			VectorAggDef *agg_def = &vector_agg_state->agg_defs[i];
-			if (agg_def->filter_clauses == NIL)
+			uint64 *filter_clause_result = NULL;
+			if (agg_def->filter_clauses != NIL)
 			{
-				continue;
+				CompressedBatchVectorQualState vqstate =
+					compressed_batch_init_vector_quals(dcontext, agg_def->filter_clauses, slot);
+				if (vector_qual_compute(&vqstate.vqstate) != AllRowsPass)
+				{
+					filter_clause_result = vqstate.vqstate.vector_qual_result;
+				}
 			}
 
-			VectorQualState *vqstate =
-				vector_agg_state->init_vector_quals(vector_agg_state, agg_def, slot);
-			vector_qual_compute(vqstate);
-			agg_def->filter_result = vqstate->vector_qual_result;
+			DecompressBatchState *batch_state = (DecompressBatchState *) slot;
+			if (filter_clause_result != NULL)
+			{
+				const int num_validity_words = (batch_state->total_batch_rows + 63) / 64;
+				arrow_validity_and(num_validity_words,
+								   filter_clause_result,
+								   batch_state->vector_qual_result);
+				agg_def->effective_batch_filter = filter_clause_result;
+			}
+			else
+			{
+				agg_def->effective_batch_filter = batch_state->vector_qual_result;
+			}
 		}
 
 		/*
 		 * Finally, pass the compressed batch to the grouping policy.
 		 */
-		grouping->gp_add_batch(grouping, slot);
+		grouping->gp_add_batch(grouping, dcontext, slot);
 	}
 
 	/*
@@ -599,7 +943,7 @@ Node *
 vector_agg_state_create(CustomScan *cscan)
 {
 	VectorAggState *state = (VectorAggState *) newNode(sizeof(VectorAggState), T_CustomScanState);
-	CustomScan *childscan = castNode(CustomScan, linitial(cscan->custom_plans));
+	Assert(ts_is_columnar_scan_plan((Plan *) linitial(cscan->custom_plans)));
 
 	state->custom.methods = &exec_methods;
 
@@ -607,15 +951,8 @@ vector_agg_state_create(CustomScan *cscan)
 	 * Initialize VectorAggState to process vector slots from different
 	 * subnodes.
 	 *
-	 * VectorAgg supports two child nodes: ColumnarScan (producing arrow tuple
-	 * table slots) and DecompressChunk (producing compressed batches).
-	 *
-	 * When the child is ColumnarScan, VectorAgg expects Arrow slots that
-	 * carry arrow arrays. ColumnarScan performs standard qual filtering and
-	 * vectorized qual filtering prior to handing the slot up to VectorAgg.
-	 *
-	 * When the child is DecompressChunk, VectorAgg doesn't read the slot from
-	 * the child node. Instead, it bypasses DecompressChunk and reads
+	 * When the child is ColumnarScan, VectorAgg doesn't read the slot from
+	 * the child node. Instead, it bypasses ColumnarScan and reads
 	 * compressed tuples directly from the grandchild. It therefore needs to
 	 * handle batch decompression and vectorized qual filtering itself, in its
 	 * own "get next slot" implementation.
@@ -624,17 +961,7 @@ vector_agg_state_create(CustomScan *cscan)
 	 * aggregate function FILTER clauses for arrow tuple table slots and
 	 * compressed batches, respectively.
 	 */
-	if (is_columnar_scan(&childscan->scan.plan))
-	{
-		state->get_next_slot = arrow_get_next_slot;
-		state->init_vector_quals = arrow_init_vector_quals;
-	}
-	else
-	{
-		Assert(strcmp(childscan->methods->CustomName, "DecompressChunk") == 0);
-		state->get_next_slot = compressed_batch_get_next_slot;
-		state->init_vector_quals = compressed_batch_init_vector_quals;
-	}
+	state->get_next_slot = compressed_batch_get_next_slot;
 
 	return (Node *) state;
 }

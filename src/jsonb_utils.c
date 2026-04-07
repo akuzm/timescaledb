@@ -8,12 +8,14 @@
 #include <common/jsonapi.h>
 #include <fmgr.h>
 #include <utils/builtins.h>
+#include <utils/fmgroids.h>
 #include <utils/json.h>
 #include <utils/jsonb.h>
 
 #include "compat/compat.h"
 #include "export.h"
 #include "jsonb_utils.h"
+#include "utils.h"
 
 static void ts_jsonb_add_pair(JsonbParseState *state, JsonbValue *key, JsonbValue *value);
 
@@ -54,6 +56,49 @@ ts_jsonb_add_str(JsonbParseState *state, const char *key, const char *value)
 	ts_jsonb_add_value(state, key, &json_value);
 }
 
+static void
+ts_jsonb_add_str_element(JsonbParseState *state, const char *elem)
+{
+	JsonbValue json_value;
+
+	Assert(elem != NULL);
+	/* If there is a null entry, don't add it to the JSON */
+	if (elem == NULL)
+		return;
+
+	json_value.type = jbvString;
+	json_value.val.string.val = (char *) elem;
+	json_value.val.string.len = strlen(elem);
+
+	pushJsonbValue(&state, WJB_ELEM, &json_value);
+}
+
+void
+ts_jsonb_add_str_array(JsonbParseState *state, const char *key, const char **values, int num_values)
+{
+	JsonbValue json_key;
+	Assert(key != NULL);
+	Assert(values != NULL);
+	Assert(num_values > 0);
+	Assert(key[0] != '\0');
+	if (key == NULL || values == NULL || num_values <= 0 || key[0] == '\0')
+		return;
+
+	json_key.type = jbvString;
+	json_key.val.string.val = (char *) key;
+	json_key.val.string.len = strlen(key);
+	pushJsonbValue(&state, WJB_KEY, &json_key);
+
+	pushJsonbValue(&state, WJB_BEGIN_ARRAY, NULL);
+	for (int i = 0; i < num_values; i++)
+	{
+		if (values[i] == NULL || values[i][0] == '\0')
+			continue;
+		ts_jsonb_add_str_element(state, values[i]);
+	}
+	pushJsonbValue(&state, WJB_END_ARRAY, NULL);
+}
+
 static PGFunction
 get_convert_func(Oid typeid)
 {
@@ -75,27 +120,24 @@ ts_jsonb_set_value_by_type(JsonbValue *value, Oid typeid, Datum datum)
 {
 	switch (typeid)
 	{
-		Oid typeOut;
-		bool isvarlena;
-		char *str;
-		PGFunction func;
-
 		case INT2OID:
 		case INT4OID:
 		case INT8OID:
 		case NUMERICOID:
-			func = get_convert_func(typeid);
+		{
+			PGFunction func = get_convert_func(typeid);
 			value->type = jbvNumeric;
 			value->val.numeric = DatumGetNumeric(func ? DirectFunctionCall1(func, datum) : datum);
 			break;
-
+		}
 		default:
-			getTypeOutputInfo(typeid, &typeOut, &isvarlena);
-			str = OidOutputFunctionCall(typeOut, datum);
+		{
+			char *str = ts_datum_to_string(datum, typeid);
 			value->type = jbvString;
 			value->val.string.val = str;
 			value->val.string.len = strlen(str);
 			break;
+		}
 	}
 }
 
@@ -244,4 +286,80 @@ ts_jsonb_get_interval_field(const Jsonb *json, const char *key)
 		DirectFunctionCall3(interval_in, CStringGetDatum(interval_str), InvalidOid, -1);
 
 	return DatumGetIntervalP(interval_datum);
+}
+
+bool
+ts_jsonb_equal(const Jsonb *left, const Jsonb *right)
+{
+	/* Quick exit if both are NULL or point to same thing. */
+	if (left == right)
+		return true;
+
+	if (left == NULL || right == NULL)
+		return false;
+
+	Assert(left != NULL && right != NULL);
+
+	Datum result = DirectFunctionCall2(jsonb_eq, PointerGetDatum(left), PointerGetDatum(right));
+
+	return DatumGetBool(result);
+}
+
+/*
+ * searches for any occurrences of a matching key value pair. compatible with nested and
+ * array jsonbs
+ */
+bool
+ts_jsonb_has_key_value_str_field(Jsonb *jb, const char *key, const char *value)
+{
+	JsonbIterator *it;
+	JsonbValue v;
+	JsonbIteratorToken r;
+
+	if (jb == NULL || JB_ROOT_COUNT(jb) == 0)
+		return false;
+
+	if (JB_ROOT_IS_SCALAR(jb))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("cannot find from scalar")));
+
+	it = JsonbIteratorInit(&jb->root);
+
+	while ((r = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+	{
+		if (r == WJB_KEY && v.type == jbvString && ((int) strlen(key) == v.val.string.len) &&
+			strncmp(key, v.val.string.val, v.val.string.len) == 0)
+		{
+			r = JsonbIteratorNext(&it, &v, false);
+			Assert(r == WJB_VALUE || r == WJB_BEGIN_ARRAY);
+
+			if (v.type == jbvArray)
+			{
+				/* iterate over the array members and consume them all as this function should only
+				 * match single values and not arrays */
+				int i = 0;
+				int n_elems = v.val.array.nElems;
+				while (i < n_elems && (r = JsonbIteratorNext(&it, &v, false)) == WJB_ELEM)
+				{
+					++i;
+				}
+				continue;
+			}
+			else if (v.type != jbvString)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("Jsonb value is of type \"%s\", but expected type \"string\"",
+								JsonbTypeName(&v))));
+			}
+
+			if (v.type == jbvString && ((int) strlen(value) == v.val.string.len) &&
+				strncmp(value, v.val.string.val, v.val.string.len) == 0)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
