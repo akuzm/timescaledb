@@ -500,8 +500,10 @@ SH_GROW(SH_TYPE * tb, uint64 newsize)
 	uint32		copyelem;
 
 	Assert(oldsize == pg_nextpower2_64(oldsize));
-	Assert(oldsize != SH_MAX_SIZE);
 	Assert(oldsize < newsize);
+
+	if (unlikely(oldsize == SH_MAX_SIZE))
+		sh_error("hash table size exceeded");
 
 	newsize = SH_COMPUTE_SIZE(newsize);
 
@@ -620,9 +622,6 @@ SH_INSERT_HASH_INTERNAL(SH_TYPE *restrict tb, SH_KEY_TYPE key, uint32 hash, bool
 	 */
 	if (unlikely(tb->members >= tb->grow_threshold))
 	{
-		if (unlikely(tb->size == SH_MAX_SIZE))
-			sh_error("hash table size exceeded");
-
 		/*
 		 * When optimizing, it can be very useful to print these out.
 		 */
@@ -1024,6 +1023,7 @@ SH_STAT(SH_TYPE * tb)
 #undef SH_GET_HASH
 #undef SH_STORE_HASH
 #undef SH_USE_NONDEFAULT_ALLOCATOR
+#undef SH_ENTRY_EMPTY
 #undef SH_EQUAL
 
 /* undefine locally declared macros */
@@ -1058,7 +1058,8 @@ SH_STAT(SH_TYPE * tb)
 #undef SH_STAT
 
 /* internal function names */
-#undef SH_COMPUTE_PARAMETERS
+#undef SH_COMPUTE_SIZE
+#undef SH_UPDATE_PARAMETERS
 #undef SH_COMPARE_KEYS
 #undef SH_INITIAL_BUCKET
 #undef SH_NEXT
