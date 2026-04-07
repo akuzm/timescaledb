@@ -30,7 +30,7 @@ static inline struct umash_fingerprint_key
 umash_fingerprint_get_key(struct umash_fp fp)
 {
 	const struct umash_fingerprint_key key = {
-		.hash = fp.hash[0] & (~(uint32) 0),
+		.hash = fp.hash[0],
 		.rest = fp.hash[1],
 	};
 	return key;
