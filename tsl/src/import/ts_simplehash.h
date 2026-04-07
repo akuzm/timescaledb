@@ -10,7 +10,7 @@
  * PostgreSQL License. Please see the NOTICE at the top level
  * directory for a copy of the PostgreSQL License.
  *
- * PostgreSQL 17.4 f8554dee417ffc4540c94cf357f7bf7d4b6e5d80
+ * PostgreSQL 19devel fba4233c832870c8363438419743c48fdcb2151c
  */
 
 /*
@@ -109,7 +109,6 @@
  * src/include/lib/simplehash.h
  */
 
-#include "port/pg_bitutils.h"
 
 /* helpers */
 #define SH_MAKE_PREFIX(a) CppConcat(a,_)
@@ -249,6 +248,8 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 
 /* generate implementation of the hash table */
 #ifdef SH_DEFINE
+
+#include "port/pg_bitutils.h"
 
 #ifndef SH_RAW_ALLOCATOR
 #include "utils/memutils.h"
